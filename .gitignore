@@ -163,6 +163,7 @@ cython_debug/
 #Environment
 /MESTRADO_PUBLICO/RAG_LLMS/Artigo_Final/The-Power-of-Noise/power_of_noise_env
 /MESTRADO_PUBLICO/RAG_LLMS/Artigo_Final/The-Power-of-Noise/data
+power_of_noise_env/
 
 # JSON, Arrow, and PKL files
 *.json
