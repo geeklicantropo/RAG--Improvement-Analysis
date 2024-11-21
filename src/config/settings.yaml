@@ -1,0 +1,200 @@
+# Core Configuration
+SEED: 42
+PROJECT_NAME: "power_of_noise"
+
+# Document ID Mapping Configuration
+INDEX_MAPPING:
+  cache_size: 10000
+  batch_size: 1000
+  validate_mappings: true
+  mapping_types:
+    - corpus_idx_to_search
+    - search_to_corpus_idx
+    - dataset_idx_to_corpus
+    - corpus_to_dataset_idx
+
+# Dataset Configuration
+DATASET:
+  sample_size: 10000  # -1 for full dataset
+  max_examples: -1
+  use_cache: true
+  cache_dir: "data/cache"
+  index_tracking: true  # New: enable index tracking
+
+# LLM Model Configuration
+LLM_MODEL_ID: 'meta-llama/Llama-2-7b-chat-hf'
+MODEL_MAX_LENGTH: 4096
+MAX_NEW_TOKENS: 50
+BATCH_SIZE: 8
+SAVE_EVERY: 100
+
+# Retriever Configuration
+RETRIEVERS:
+  contriever:
+    enabled: true
+    model_id: 'facebook/contriever'
+    max_length: 512
+    batch_size: 32
+    normalize_embeddings: false
+    cache_embeddings: true
+    index_type: corpus_idx  # New: specify index type
+    max_index_size: 25000000  # New: maximum number of indices to track
+
+  bm25:
+    enabled: true
+    use_stemming: true
+    lowercase: true
+    batch_size: 32
+    index_type: corpus_idx  # New: specify index type
+    max_index_size: 25000000  # New: maximum number of indices to track
+
+  adore:
+    enabled: true
+    model_id: 'facebook/dpr-question_encoder-single-nq-base'
+    max_length: 512
+    batch_size: 32
+    normalize_embeddings: true
+    cache_embeddings: true
+    index_type: corpus_idx  # New: specify index type
+    max_index_size: 25000000  # New: maximum number of indices to track
+
+# Document Loading Configuration
+DOCUMENT_LOADING:
+  batch_size: 1000
+  max_retries: 3
+  timeout: 30
+  cache_documents: true
+  prefetch_size: 2
+  index_batch_size: 10000  # New: batch size for index operations
+
+# KMeans Settings
+KMEANS_CLUSTERING:
+  n_clusters: 5
+  embedding_model: 'sentence-transformers/all-mpnet-base-v2'
+  random_state: 42
+  max_iter: 300
+  min_docs_per_cluster: 2
+  batch_size: 32
+  index_tracking: true
+  metrics:
+    compute_silhouette: true
+    compute_calinski_harabasz: true
+
+# RAG-Fusion Settings
+RAG_FUSION:
+  fusion_weights: [1.0, 0.8, 0.6, 0.4, 0.2]
+  fusion_strategy: 'reciprocal_rank'
+  top_k_per_cluster: 3
+  diversity_threshold: 0.3
+  batch_size: 32
+  index_tracking: true
+  metrics:
+    track_fusion_scores: true
+    track_diversity: true
+
+# Random Document Injection Settings
+RANDOM_INJECTION:
+  enabled: true
+  injection_ratio: 0.3
+  min_random_docs: 1
+  max_random_docs: 3
+  maintain_indices: true
+
+# Document Diversity Settings
+DIVERSITY:
+  enabled: true
+  min_similarity_threshold: 0.3
+  index_based_selection: true  # New: use indices for diversity selection
+
+# Category Settings for Experiment 3
+FUSION_CATEGORIES:
+  num_categories: 5
+  min_docs_per_category: 2
+  top_k_per_category: 3
+  track_category_indices: true  # New: track indices per category
+
+# Cache Configuration
+CACHE:
+  embeddings:
+    enabled: true
+    max_size: 100000
+    ttl: 3600
+    index_cache_enabled: true  # New: enable caching of index mappings
+  documents:
+    enabled: true
+    max_size: 50000
+    ttl: 1800
+    index_cache_enabled: true  # New: enable caching of index mappings
+  search_results:
+    enabled: true
+    max_size: 25000
+    ttl: 900
+    index_cache_enabled: true  # New: enable caching of index mappings
+
+# Resource Settings
+RESOURCES:
+  use_gpu: true
+  num_workers: 8
+  device: 'cuda'  # Will fall back to 'cpu' if CUDA not available
+  max_memory: null  # null means use all available
+  pin_memory: true
+
+# Logging Configuration
+LOGGING:
+  level: 'INFO'
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  handlers:
+    file:
+      enabled: true
+      level: 'DEBUG'
+      filename: 'logs/experiments.log'
+    console:
+      enabled: true
+      level: 'INFO'
+  experiment_tracking: true
+  save_checkpoints: true
+  index_logging: true  # New: enable logging of index operations
+
+# Evaluation Metrics
+METRICS:
+  accuracy_threshold: 0.7
+  similarity_threshold: 0.8
+  min_required_samples: 100
+  compute_rouge: true
+  compute_bleu: true
+  compute_meteor: false
+  track_index_metrics: true  # New: track index-based metrics
+
+# Experiment Modes
+EXPERIMENT_MODES:
+  - baseline
+  - kmeans
+  - fusion_kmeans
+  - fusion_categories
+
+# Index Tracking Configuration
+INDEX_TRACKING:  # New section for index tracking settings
+  enabled: true
+  validate_indices: true
+  batch_size: 500
+  track_unused_indices: false
+  max_index_memory: 10000000000  # 10GB limit for index tracking
+  cleanup_interval: 3600  # Cleanup unused indices every hour
+  persistence:
+    enabled: true
+    format: 'json'
+    compression: true
+  monitoring:
+    enabled: true
+    alert_threshold: 0.9  # Alert when 90% of indices are used
+    metrics_interval: 300  # Track metrics every 5 minutes
+
+# Default File Paths (can be overridden by environment variables)
+PATHS:
+  data_dir: 'data'
+  results_dir: 'results'
+  corpus_dir: 'data/corpus'
+  embeddings_dir: 'data/embeddings'
+  cache_dir: 'data/cache'
+  logs_dir: 'logs'
+  index_maps_dir: 'data/mappings'  # New: directory for index mapping files

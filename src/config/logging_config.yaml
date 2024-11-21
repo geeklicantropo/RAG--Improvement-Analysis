@@ -1,0 +1,189 @@
+# Logging configuration for all experiments
+version: 1
+disable_existing_loggers: False
+
+formatters:
+  standard:
+    format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    datefmt: '%Y-%m-%d %H:%M:%S'
+  
+  detailed:
+    format: '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+    datefmt: '%Y-%m-%d %H:%M:%S'
+
+  index_ops:  # New formatter for index operations
+    format: '%(asctime)s - %(name)s - %(levelname)s - [INDEX_OP] - %(message)s'
+    datefmt: '%Y-%m-%d %H:%M:%S'
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: standard
+    stream: ext://sys.stdout
+
+  file_handler_experiments:
+    class: logging.FileHandler
+    level: DEBUG
+    formatter: detailed
+    filename: logs/experiments/experiment.log
+    mode: 'a'
+    encoding: utf8
+
+  file_handler_retrieval:
+    class: logging.FileHandler
+    level: DEBUG
+    formatter: detailed
+    filename: logs/retrieval/retrieval.log
+    mode: 'a'
+    encoding: utf8
+
+  file_handler_llm:
+    class: logging.FileHandler
+    level: DEBUG
+    formatter: detailed
+    filename: logs/llm/llm.log
+    mode: 'a'
+    encoding: utf8
+
+  file_handler_fusion:
+    class: logging.FileHandler
+    level: DEBUG
+    formatter: detailed
+    filename: logs/fusion/fusion.log
+    mode: 'a'
+    encoding: utf8
+
+  file_handler_kmeans:
+    class: logging.FileHandler
+    level: DEBUG
+    formatter: detailed
+    filename: logs/clustering/kmeans.log
+    mode: 'a'
+    encoding: utf8
+
+  file_handler_setup:
+    class: logging.FileHandler
+    level: INFO
+    formatter: standard
+    filename: logs/setup/setup.log
+    mode: 'a'
+    encoding: utf8
+
+  file_handler_timing:
+    class: logging.FileHandler
+    level: INFO
+    formatter: standard
+    filename: logs/timing/timing.log
+    mode: 'a'
+    encoding: utf8
+
+  # New handlers for index operations
+  file_handler_index_ops:
+    class: logging.FileHandler
+    level: DEBUG
+    formatter: index_ops
+    filename: logs/indexing/index_operations.log
+    mode: 'a'
+    encoding: utf8
+
+  file_handler_index_errors:
+    class: logging.FileHandler
+    level: ERROR
+    formatter: index_ops
+    filename: logs/indexing/index_errors.log
+    mode: 'a'
+    encoding: utf8
+
+  file_handler_index_metrics:
+    class: logging.FileHandler
+    level: INFO
+    formatter: index_ops
+    filename: logs/indexing/index_metrics.log
+    mode: 'a'
+    encoding: utf8
+
+loggers:
+  src.experiments:
+    level: DEBUG
+    handlers: [console, file_handler_experiments]
+    propagate: no
+
+  src.utils.retriever:
+    level: DEBUG
+    handlers: [console, file_handler_retrieval]
+    propagate: no
+
+  src.utils.llm:
+    level: DEBUG
+    handlers: [console, file_handler_llm]
+    propagate: no
+
+  src.fusion:
+    level: DEBUG
+    handlers: [console, file_handler_fusion]
+    propagate: no
+
+  src.kmeans:
+    level: DEBUG
+    handlers: [console, file_handler_kmeans]
+    propagate: no
+
+  src.core:
+    level: INFO
+    handlers: [console, file_handler_setup]
+    propagate: no
+
+  src.utils:
+    level: INFO
+    handlers: [console, file_handler_timing]
+    propagate: no
+
+  src.utils.id_mapping:
+    level: DEBUG
+    handlers: [console, file_handler_index_ops, file_handler_index_errors]
+    propagate: no
+
+  src.indexing:
+    level: DEBUG
+    handlers: [console, file_handler_index_ops, file_handler_index_errors]
+    propagate: no
+
+  src.utils.index_metrics:
+    level: INFO
+    handlers: [console, file_handler_index_metrics]
+    propagate: no
+
+  src.data_handlers.index_validation:
+    level: DEBUG
+    handlers: [console, file_handler_index_ops, file_handler_index_errors]
+    propagate: no
+
+  src.experiments.kmeans:
+    level: DEBUG
+    handlers: [console, file_handler_clustering]
+    propagate: no
+
+  src.experiments.fusion:
+    level: DEBUG
+    handlers: [console, file_handler_fusion]
+    propagate: no
+
+  src.experiments.categories:
+    level: DEBUG
+    handlers: [console, file_handler_fusion]
+    propagate: no
+
+  src.data_handlers.retrieval:
+    level: DEBUG
+    handlers: [console, file_handler_retrieval]
+    propagate: no
+
+  src.utils.metrics:
+    level: INFO
+    handlers: [console, file_handler_index_metrics]
+    propagate: no
+
+root:
+  level: INFO
+  handlers: [console]
