@@ -95,6 +95,7 @@ monitor_memory() {
     fi
 }
 
+
 # Function to initialize indices for a retriever with batch processing
 initialize_indices() {
     local retriever=$1

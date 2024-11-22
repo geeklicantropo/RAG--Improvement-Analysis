@@ -44,13 +44,13 @@ class IDMapper:
         self.logger = logging.getLogger(f"{__name__}.{self.experiment_name}")
         self._setup_logging()
         
-        # Initialize SQLite database
+        # Initialize SQLite database with WAL mode for better concurrency
         self.db_path = db_path or f"data/mappings/{self.experiment_name}.db"
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_database()
         
-        # Initialize in-memory cache
-        self.cache = defaultdict(lambda: {})
+        # Initialize in-memory cache with LRU strategy
+        self.cache = {}
         self.cache_stats = defaultdict(int)
         
         # Track metadata
@@ -80,12 +80,17 @@ class IDMapper:
             self.logger.addHandler(fh)
 
     def _init_database(self):
-        """Initialize SQLite database with proper indices."""
+        """Initialize SQLite database with optimized settings."""
         try:
             with sqlite3.connect(self.db_path) as conn:
+                # Enable WAL mode for better write performance
+                conn.execute('PRAGMA journal_mode=WAL')
+                conn.execute('PRAGMA synchronous=NORMAL')
+                conn.execute('PRAGMA cache_size=-2000') # 2MB cache
+                
                 cursor = conn.cursor()
                 
-                # Create mappings table with indices
+                # Create mappings table with optimized indices
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS mappings (
                         mapping_type TEXT,
@@ -93,13 +98,13 @@ class IDMapper:
                         target_idx INTEGER,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         PRIMARY KEY (mapping_type, source_idx)
-                    )
+                    ) WITHOUT ROWID
                 """)
                 
-                # Create index on target_idx for reverse lookups
+                # Create efficient index for reverse lookups
                 cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_target 
-                    ON mappings(mapping_type, target_idx)
+                    CREATE INDEX IF NOT EXISTS idx_target_lookup 
+                    ON mappings(mapping_type, target_idx, source_idx)
                 """)
                 
                 # Create metadata table
@@ -112,7 +117,7 @@ class IDMapper:
                         creation_time TIMESTAMP,
                         batch_size INTEGER,
                         description TEXT
-                    )
+                    ) WITHOUT ROWID
                 """)
                 
                 conn.commit()
@@ -185,71 +190,112 @@ class IDMapper:
             self.logger.error(f"Error adding index mapping: {e}")
             raise
 
+    def _update_cache_from_batch(self, mappings: List[Tuple[int, int, str]]):
+        """Update cache from batch data with LRU policy."""
+        mapping_dict = defaultdict(dict)
+        
+        # Group mappings by type
+        for src, tgt, m_type in mappings:
+            mapping_dict[m_type][src] = tgt
+        
+        # Update cache for each mapping type
+        for m_type, type_mappings in mapping_dict.items():
+            if m_type in self.cache:
+                # Apply LRU policy if cache is full
+                available_space = self.cache_size - len(self.cache[m_type])
+                if available_space < len(type_mappings):
+                    # Remove oldest entries
+                    remove_count = len(type_mappings) - available_space
+                    for _ in range(remove_count):
+                        self.cache[m_type].popitem(last=False)
+                
+                # Update cache
+                self.cache[m_type].update(type_mappings)
+
     def add_mappings_batch(
         self,
-        mappings: List[Tuple[int, int]],
-        mapping_type: str
+        mappings: List[Tuple[int, int, str]],
+        validate: bool = True
     ):
-        """Add multiple mappings efficiently in a single transaction."""
+        """Add multiple mappings efficiently with validation."""
         try:
+            # Validate mappings if requested
+            if validate:
+                invalid_mappings = [
+                    m for m in mappings 
+                    if not isinstance(m[0], int) or not isinstance(m[1], int)
+                ]
+                if invalid_mappings:
+                    raise ValueError(f"Invalid mappings found: {invalid_mappings}")
+
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 
                 # Begin transaction
-                cursor.execute("BEGIN TRANSACTION")
+                cursor.execute("BEGIN IMMEDIATE")
                 
-                # Prepare batch data
-                batch_data = [(mapping_type, src, tgt) for src, tgt in mappings]
-                
-                # Insert batch
-                cursor.executemany("""
-                    INSERT OR REPLACE INTO mappings 
-                    (mapping_type, source_idx, target_idx)
-                    VALUES (?, ?, ?)
-                """, batch_data)
-                
-                # Update metadata
-                if mapping_type not in self.mapping_meta:
-                    self.mapping_meta[mapping_type] = IDMappingMeta(
-                        source_type='index',
-                        target_type='index',
-                        total_mappings=len(mappings),
-                        creation_time=datetime.now(),
-                        batch_size=self.batch_size
-                    )
+                try:
+                    # Process in sub-batches for memory efficiency
+                    for i in range(0, len(mappings), self.batch_size):
+                        batch = mappings[i:i + self.batch_size]
+                        
+                        # Prepare batch data
+                        batch_data = [
+                            (m_type, src, tgt, datetime.now().isoformat())
+                            for src, tgt, m_type in batch
+                        ]
+                        
+                        # Insert batch
+                        cursor.executemany("""
+                            INSERT OR REPLACE INTO mappings 
+                            (mapping_type, source_idx, target_idx, created_at)
+                            VALUES (?, ?, ?, ?)
+                        """, batch_data)
+                        
+                        # Update metadata
+                        mapping_types = set(m[2] for m in batch)
+                        for m_type in mapping_types:
+                            count = sum(1 for _, _, mt in batch if mt == m_type)
+                            
+                            if m_type not in self.mapping_meta:
+                                self.mapping_meta[m_type] = IDMappingMeta(
+                                    source_type='index',
+                                    target_type='index',
+                                    total_mappings=count,
+                                    creation_time=datetime.now(),
+                                    batch_size=self.batch_size
+                                )
+                                
+                                cursor.execute("""
+                                    INSERT OR REPLACE INTO mapping_meta
+                                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                                """, (
+                                    m_type, 'index', 'index', count,
+                                    datetime.now().isoformat(),
+                                    self.batch_size, None
+                                ))
+                            else:
+                                cursor.execute("""
+                                    UPDATE mapping_meta 
+                                    SET total_mappings = total_mappings + ?
+                                    WHERE mapping_type = ?
+                                """, (count, m_type))
+                                
+                                self.mapping_meta[m_type].total_mappings += count
+                        
+                        # Memory cleanup
+                        if self.enable_gc and i % (self.batch_size * 10) == 0:
+                            gc.collect()
                     
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO mapping_meta
-                        (mapping_type, source_type, target_type, total_mappings, 
-                         creation_time, batch_size, description)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        mapping_type,
-                        'index',
-                        'index',
-                        len(mappings),
-                        datetime.now().isoformat(),
-                        self.batch_size,
-                        None
-                    ))
-                else:
-                    cursor.execute("""
-                        UPDATE mapping_meta 
-                        SET total_mappings = total_mappings + ?
-                        WHERE mapping_type = ?
-                    """, (len(mappings), mapping_type))
+                    # Commit transaction
+                    conn.commit()
                     
-                    self.mapping_meta[mapping_type].total_mappings += len(mappings)
+                except Exception as e:
+                    conn.rollback()
+                    raise e
                 
-                # Commit transaction
-                conn.commit()
-                
-                # Update cache if applicable
-                if mapping_type in self.cache:
-                    for src, tgt in mappings:
-                        if len(self.cache[mapping_type]) >= self.cache_size:
-                            self.cache[mapping_type].pop(next(iter(self.cache[mapping_type])))
-                        self.cache[mapping_type][src] = tgt
+                # Update cache if needed
+                self._update_cache_from_batch(mappings)
                 
         except Exception as e:
             self.logger.error(f"Error adding mappings batch: {e}")
@@ -305,7 +351,7 @@ class IDMapper:
         mapping_type: str,
         use_cache: bool = True
     ) -> List[Optional[int]]:
-        """Get multiple mappings efficiently."""
+        """Get multiple mappings efficiently with cache optimization."""
         try:
             results = []
             cache_hits = []
@@ -324,30 +370,36 @@ class IDMapper:
                 db_queries = source_indices
             
             # Query database for missing indices
+            db_results = []
             if db_queries:
                 with sqlite3.connect(self.db_path) as conn:
                     cursor = conn.cursor()
                     
-                    # Use IN clause for batch query
-                    placeholders = ','.join('?' * len(db_queries))
-                    cursor.execute(f"""
-                        SELECT source_idx, target_idx FROM mappings
-                        WHERE mapping_type = ? AND source_idx IN ({placeholders})
-                    """, (mapping_type, *db_queries))
-                    
-                    db_results = cursor.fetchall()
-                    
-                    # Update cache
-                    if use_cache:
-                        if mapping_type not in self.cache:
-                            self.cache[mapping_type] = {}
-                        for src, tgt in db_results:
-                            if len(self.cache[mapping_type]) >= self.cache_size:
-                                self.cache[mapping_type].pop(next(iter(self.cache[mapping_type])))
-                            self.cache[mapping_type][src] = tgt
+                    # Process in batches
+                    for i in range(0, len(db_queries), self.batch_size):
+                        batch = db_queries[i:i + self.batch_size]
+                        placeholders = ','.join('?' * len(batch))
+                        
+                        cursor.execute(f"""
+                            SELECT source_idx, target_idx 
+                            FROM mappings
+                            WHERE mapping_type = ? 
+                            AND source_idx IN ({placeholders})
+                        """, (mapping_type, *batch))
+                        
+                        db_results.extend(cursor.fetchall())
+                        
+                        # Update cache
+                        if use_cache:
+                            if mapping_type not in self.cache:
+                                self.cache[mapping_type] = {}
+                            for src, tgt in cursor.fetchall():
+                                if len(self.cache[mapping_type]) >= self.cache_size:
+                                    self.cache[mapping_type].popitem(last=False)
+                                self.cache[mapping_type][src] = tgt
             
-            # Combine results in original order
-            mapping_dict = dict(cache_hits + (db_results if db_queries else []))
+            # Combine results maintaining order
+            mapping_dict = dict(cache_hits + db_results)
             results = [mapping_dict.get(idx) for idx in source_indices]
             
             return results
@@ -583,10 +635,15 @@ class IDMapper:
             raise
 
     def vacuum_database(self):
-        """Optimize database by removing unused space."""
+        """Optimize database with improved error handling."""
         try:
             with sqlite3.connect(self.db_path) as conn:
+                # Disable WAL mode temporarily
+                conn.execute('PRAGMA journal_mode=DELETE')
+                # Vacuum database
                 conn.execute("VACUUM")
+                # Re-enable WAL mode
+                conn.execute('PRAGMA journal_mode=WAL')
             self.logger.info("Database vacuumed successfully")
         except Exception as e:
             self.logger.error(f"Error vacuuming database: {e}")
