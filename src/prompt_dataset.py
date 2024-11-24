@@ -1,223 +1,766 @@
-from torch.utils.data import Dataset, IterableDataset
-from typing import List, Dict, Optional, Tuple, Iterator, Union
-import logging
-from pathlib import Path
 import json
-import ijson
-from tqdm import tqdm
-import gc
-import numpy as np
-from src.config import paths, settings
+import random
+import hashlib
+from typing import List, Tuple, Dict, Any, Optional
+from torch.utils.data import Dataset
+from transformers import AutoTokenizer
 
-class MemoryEfficientIterator:
-    """Memory efficient iterator for JSON files."""
-    def __init__(self, file_path: str, batch_size: int = 32):
-        self.file_path = file_path
-        self.batch_size = batch_size
+import normalize_text
+from normalize_answers import *
+from cluster_utils import DocumentClusterer
 
-    def __iter__(self) -> Iterator[Dict]:
-        with open(self.file_path, 'rb') as f:
-            parser = ijson.parse(f)
-            current_item = {}
-            batch = []
-            
-            for prefix, event, value in parser:
-                if event == 'end_map':
-                    if current_item:
-                        batch.append(current_item)
-                        current_item = {}
-                        
-                        if len(batch) >= self.batch_size:
-                            yield batch
-                            batch = []
-                            gc.collect()
-                elif prefix.endswith('.question'):
-                    current_item['question'] = value
-                elif prefix.endswith('.example_id'):
-                    current_item['example_id'] = value
-                elif prefix.endswith('.answers'):
-                    current_item['answers'] = value
-                elif prefix.endswith('.idx_gold_in_corpus'):
-                    current_item['idx_gold_in_corpus'] = value
-            
-            if batch:
-                yield batch
+class QueryDataset(Dataset):
+    """
+    A dataset class for managing queries data into structured prompts suitable for input to LLMS.
 
-class BaseStreamingDataset(IterableDataset):
-    """Base streaming dataset class with memory-efficient loading."""
+    Attributes:
+        data_path (str): Path to the dataset file containing the query and related information.
+        model_name (str): The name of the language model used for generating answers.
+        do_normalize_query (bool): Flag to determine if text normalization is applied to the query.
+    """
     def __init__(
-        self,
-        data_path: str,
-        tokenizer,
-        max_tokenized_length: int,
-        batch_size: int = 32,
-        do_normalize_query: bool = True,
-        experiment_mode: str = 'baseline'
+        self, 
+        data_path: str, 
+        model_name: str,
+        do_normalize_query: bool = False,
     ):
+        super().__init__()
+        self.data_path = data_path
+        self.model_name = model_name
+        self.do_normalize_query = do_normalize_query
+        self._load_data()
+
+    def _load_data(self):
+        """
+        Loads data from the specified path and processes it.
+        """
+        try:
+            with open(self.data_path, "r") as fin:
+                data = json.load(fin)
+            self.process_file_data(data)
+        except IOError as e:
+            print(f"Error reading file {self.data_path}: {e}")
+
+    def process_file_data(self, data: List[Dict]):
+        """ Processes each example in the dataset to prepare prompts for the LLM. """  
+        self.questions = []
+        self.example_ids = []
+
+        for example in data:
+            self.example_ids.append(example['example_id'])
+
+            if 'query' in example:
+                question = example['query']
+            elif 'question' in example:
+                question = example['question']
+            else:
+                raise ValueError("No 'query' or 'question' key in example")
+            
+            if self.do_normalize_query:
+                question = normalize_text.normalize(question)
+            self.questions.append(question)
+
+    def build_qa_prompt(
+        self,
+        query: str,
+        documents_str: str,
+        organization_type: str = "standard"
+    ) -> str:
+        """
+        Build a prompt with appropriate formatting based on document organization type.
+        
+        Args:
+            query: The question to be answered
+            documents_str: The context documents
+            organization_type: How documents are organized ('standard', 'clustered', 'categorized', or 'fused')
+            
+        Returns:
+            Formatted prompt string
+        """
+        # Base task instruction
+        base_instruction = "You are given a question and you MUST respond by EXTRACTING the answer (max 5 tokens) from one of the provided documents. If none of the documents contain the answer, respond with NO-RES."
+        
+        # Organization-specific instructions
+        organization_instructions = {
+            "standard": "",
+            "clustered": "The documents are grouped into clusters based on their semantic similarity. Consider the relationships between documents within each cluster when searching for the answer.",
+            "categorized": "The documents are organized into categories. Pay attention to the category labels as they indicate the type of information in each document.",
+            "fused": "The documents are ranked by multiple retrieval methods. Higher-ranked documents are more likely to contain relevant information."
+        }
+        
+        # Combine instructions
+        task_instruction = f"{base_instruction} {organization_instructions.get(organization_type, '')}"
+        
+        # Build full prompt
+        prompt = f"{task_instruction}\nDocuments:\n{documents_str}\nQuestion: {query}\nAnswer:"
+        
+        # Custom prompt format for MPT models
+        if 'mpt' in self.tokenizer.name_or_path:
+            INSTRUCTION_KEY = "### Instruction:"
+            RESPONSE_KEY = "### Response:"
+            INTRO_BLURB = "Below is an instruction that describes a task. Write a response that appropriately completes the request."
+            PROMPT_FOR_GENERATION_FORMAT = """{intro}\n{instruction_key}\n{instruction}\n{response_key}""".format(
+                intro=INTRO_BLURB,
+                instruction_key=INSTRUCTION_KEY,
+                instruction="{instruction}",
+                response_key=RESPONSE_KEY,
+            )
+            prompt = PROMPT_FOR_GENERATION_FORMAT.format(
+                instruction=prompt[:-8]
+            )
+            
+        return prompt
+
+    def __getitem__(self, idx: int):   
+        prompt = self.build_qa_prompt(self.questions[idx])
+
+        return {
+            "example_id": self.example_ids[idx],
+            "query": self.questions[idx],
+            "prompt": prompt,
+        }
+
+    def __len__(self):
+        return len(self.example_ids)
+
+def hash_document(text: str) -> str:
+    """
+    Generate a SHA-256 hash for a given text.
+    """
+    return hashlib.sha256(text.encode()).hexdigest()
+
+class PromptDataset(Dataset):
+    """
+    A dataset class for managing, preprocessing, and organizing document data into structured prompts suitable for input to LLMs.
+
+    Attributes:
+        corpus (List[Dict]): The list containing the document corpus.
+        data_path (str): Path to the dataset file containing the query and related information.
+        tokenizer (AutoTokenizer): The tokenizer used to tokenize the prompt.
+        max_tokenized_length (int): The maximum length of tokenized prompt.
+        search_results (List[Tuple[List[str], List[float]]]): A list of tuples containing document indices and their scores.
+        full_to_subset_idx_map (Dict[int, int]): Dictionary that maps the indices in the full corpus to the given subset.
+        do_normalize_query (bool): Flag to determine if text normalization is applied to the query.
+        num_documents_in_context (int): The total number of documents to consider in the context.
+        gold_position (int): The specific position (0-indexed) of the gold document in the context.
+        randomize_gold_position (bool): Flag to determine if the gold document position should be random.
+        get_documents_without_answer (bool): Flag to determine if documents without the answer should be included.
+        use_clustering (bool): Whether to use document clustering.
+        num_clusters (Optional[int]): Number of clusters when clustering is enabled.
+        cluster_seed (int): Random seed for clustering.
+        category_info (Optional[Dict[str, Any]]): Information for category-based organization.
+    """
+    def __init__(
+        self, 
+        corpus: List[Dict],
+        data_path: str,  
+        tokenizer: AutoTokenizer,
+        max_tokenized_length: int,
+        search_results: List[Tuple[List[int], List[float]]],
+        full_to_subset_idx_map: Dict[int, int] = None,
+        do_normalize_query: bool = False,
+        num_documents_in_context: int = 5,
+        gold_position: int = None,
+        randomize_gold_position: bool = False,
+        get_documents_without_answer: bool = False,
+        use_clustering: bool = False,
+        num_clusters: Optional[int] = None,
+        cluster_seed: int = 42,
+        category_info: Optional[Dict[str, Any]] = None
+    ):
+        super().__init__()
+        # Core parameters
+        self.corpus = corpus
         self.data_path = data_path
         self.tokenizer = tokenizer
         self.max_tokenized_length = max_tokenized_length
-        self.batch_size = batch_size
+        self.search_results = search_results
+        self.full_to_subset_idx_map = full_to_subset_idx_map
         self.do_normalize_query = do_normalize_query
-        self.experiment_mode = experiment_mode
-        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        self.num_documents_in_context = num_documents_in_context
+        self.gold_position = gold_position
+        self.randomize_gold_position = randomize_gold_position
+        self.get_documents_without_answer = get_documents_without_answer
 
-    def __iter__(self):
-        iterator = MemoryEfficientIterator(self.data_path, self.batch_size)
-        for batch in iterator:
-            for item in batch:
-                yield self.process_item(item)
+        # Clustering configuration
+        self.use_clustering = use_clustering
+        if use_clustering and num_clusters is None:
+            raise ValueError("num_clusters must be specified when use_clustering is True")
+        self.clusterer = DocumentClusterer(num_clusters, cluster_seed) if use_clustering else None
+        
+        # Category organization
+        self.category_info = category_info
+        
+        self._validate_initialization_parameters()
+        self._load_data()
 
-    def normalize_query(self, query: str) -> str:
-        return query.strip().lower() if self.do_normalize_query else query
+    def _validate_initialization_parameters(self):
+        """Validates initialization parameters for logical consistency and correctness."""
+        if self.num_documents_in_context <= 0:
+            raise ValueError("num_documents_in_context must be positive.")
+        
+        if self.max_tokenized_length <= 0:
+            raise ValueError("max_tokenized_length must be positive.")
 
-    def process_item(self, item: Dict) -> Dict:
-        raise NotImplementedError
+        if self.gold_position is not None:
+            if self.gold_position < 0 or (self.gold_position >= self.num_documents_in_context):
+                raise ValueError(f"Invalid gold position: {self.gold_position}")
+        
+        if self.gold_position is not None and self.randomize_gold_position:
+            raise ValueError("Both 'gold_position' and 'randomize_gold_position' cannot be set at the same time.")
 
-class MixedDocumentsDataset(BaseStreamingDataset):
-    """Memory-efficient dataset for mixed document experiments."""
+    def _load_data(self):
+        """
+        Loads data from the specified path and processes it.
+        """
+        try:
+            with open(self.data_path, "r") as fin:
+                data = json.load(fin)
+            self.process_file_data(data)
+        except IOError as e:
+            print(f"Error reading file {self.data_path}: {e}")
+
+    def process_file_data(self, data: List[Dict]):  
+        """
+        Processes each example in the dataset to prepare prompts for the LLM.
+        """
+        self.example_ids = []
+        self.queries = []
+        self.prompts = []
+        self.gold_document_idxs = []
+        self.excluded_samples_ids = []
+        self.preprocessed_data = []
+        self.prompt_tokens_lengths = []
+        self.cluster_assignments = {} if self.use_clustering else None
+
+        for idx, example in enumerate(data):
+            example_id = str(example['example_id'])
+            gold_document_idx = str(example['idx_gold_in_corpus'])
+            answers = example['answers']
+
+            formatted_documents, document_indices = self.prepare_documents_for_prompt(
+                idx, gold_document_idx, answers
+            )
+
+            if len(formatted_documents) != self.num_documents_in_context:
+                print(f"Warning: Not enough documents for example {idx}.")
+                continue
+
+            # Build the prompt with appropriate structure
+            documents_str = self._format_documents_for_prompt(formatted_documents, document_indices)
+            
+            query = example['question']
+            if self.do_normalize_query:
+                query = normalize_text.normalize(query)
+            prompt = self.build_qa_prompt(query, documents_str)
+
+            # Check token length
+            tokens = self.tokenizer.tokenize(prompt)
+            tokens_len = len(tokens)
+            if tokens_len >= self.max_tokenized_length:
+                self.excluded_samples_ids.append((idx, example_id))
+                print(f"Skipping example {idx} due to prompt length.")
+                continue
+
+            self.preprocessed_data.append((formatted_documents, document_indices))
+            self.example_ids.append(example_id)
+            self.queries.append(query)
+            self.prompts.append(prompt)
+            self.gold_document_idxs.append(gold_document_idx)
+            self.prompt_tokens_lengths.append(tokens_len)
+
+    def _format_documents_for_prompt(
+        self,
+        formatted_documents: List[str],
+        document_indices: List[int]
+    ) -> str:
+        """Format documents based on clustering or categories if enabled."""
+        if self.use_clustering and self.cluster_assignments:
+            return self._format_clustered_documents(formatted_documents, document_indices)
+        elif self.category_info:
+            return self._format_categorized_documents(formatted_documents, document_indices)
+        else:
+            return '\n'.join(formatted_documents)
+
+    def _format_clustered_documents(
+        self,
+        formatted_documents: List[str],
+        document_indices: List[int]
+    ) -> str:
+        """Format documents grouped by their clusters."""
+        clusters = {}
+        for doc, idx in zip(formatted_documents, document_indices):
+            cluster_id = self.cluster_assignments.get(str(idx), 0)
+            if cluster_id not in clusters:
+                clusters[cluster_id] = []
+            clusters[cluster_id].append(doc)
+        
+        result = []
+        for cluster_id in sorted(clusters.keys()):
+            result.append(f"\nCluster {cluster_id}:")
+            result.extend(clusters[cluster_id])
+        
+        return '\n'.join(result)
+
+    def _format_categorized_documents(
+        self,
+        formatted_documents: List[str],
+        document_indices: List[int]
+    ) -> str:
+        """Format documents grouped by their categories."""
+        if not self.category_info:
+            return '\n'.join(formatted_documents)
+            
+        categories = {}
+        for doc, idx in zip(formatted_documents, document_indices):
+            category = self.category_info.get(str(idx), "Uncategorized")
+            if category not in categories:
+                categories[category] = []
+            categories[category].append(doc)
+        
+        result = []
+        for category in sorted(categories.keys()):
+            result.append(f"\nCategory: {category}")
+            result.extend(categories[category])
+        
+        return '\n'.join(result)
+    
+    def _format_fused_documents(
+        self,
+        formatted_documents: List[str],
+        document_indices: List[int],
+        fusion_scores: Dict[str, float]
+    ) -> str:
+        """Format documents with fusion information."""
+        documents_with_scores = []
+        for doc, idx in zip(formatted_documents, document_indices):
+            score = fusion_scores.get(str(idx), 0.0)
+            documents_with_scores.append((doc, score))
+        
+        # Sort by fusion score
+        documents_with_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        result = []
+        for doc, score in documents_with_scores:
+            confidence_level = "High" if score > 0.7 else "Medium" if score > 0.3 else "Low"
+            result.append(f"[Confidence: {confidence_level}]\n{doc}")
+        
+        return '\n'.join(result)
+
+    def prepare_documents_for_prompt(
+        self, 
+        example_idx: int, 
+        gold_document_idx: int, 
+        answers: List[str]
+    ) -> Tuple[List[str], List[int]]:
+        """
+        Prepares and formats a set of documents for inclusion in a prompt, including the insertion
+        of a gold document at the appropriate position.
+        """
+        indices = self._get_indices(example_idx)
+        updated_indices, gold_position = self._insert_gold_document_idx(
+            indices, gold_document_idx
+        )
+
+        # Get the documents and their indices
+        formatted_documents, document_indices = self._get_documents(
+            updated_indices, answers, gold_document_idx, gold_position
+        )
+
+        # Apply clustering if enabled
+        if self.use_clustering and formatted_documents:
+            self._update_cluster_assignments(formatted_documents, document_indices)
+
+        return formatted_documents, document_indices
+
+    def _update_cluster_assignments(
+        self,
+        formatted_documents: List[str],
+        document_indices: List[int]
+    ):
+        """Update cluster assignments for the current batch of documents."""
+        # Extract text content for clustering
+        texts = [doc.split(') ', 1)[1] if ') ' in doc else doc for doc in formatted_documents]
+        
+        # Compute clusters for documents
+        new_assignments = self.clusterer.fit_predict(texts, document_indices)
+        self.cluster_assignments.update(new_assignments)
+
+    def _get_indices(self, example_idx: int) -> List[int]:
+        """ Get indices in the corpus of the documents retrieved by a retriever. """
+        indices, scores = self.search_results[example_idx]
+        return indices
+
+    def _insert_gold_document_idx(
+        self, 
+        indices: List[int], 
+        gold_document_idx: int
+    ) -> Tuple[List[int], int]:
+        """
+        Inserts the index of a gold document into the provided list of indices
+        at a specified or random position.
+        """
+        gold_position = None
+        
+        if self.gold_position is not None:
+            # Direct insertion
+            gold_position = self.gold_position
+            indices = indices[:gold_position] + [gold_document_idx] + indices[gold_position:]
+        elif self.randomize_gold_position:
+            # Insert at a random position
+            gold_position = random.randint(0, self.num_documents_in_context - 1)
+            indices = indices[:gold_position] + [gold_document_idx] + indices[gold_position:]
+        return indices, gold_position
+
+    def _get_documents(    
+        self,
+        indices: List[int],
+        answers: List[str],
+        gold_document_idx: Optional[int],
+        gold_position: Optional[int]
+    ) -> Tuple[List[str], List[int]]:
+        """ Choose the appropriate method based on the flag """
+        if self.get_documents_without_answer:
+            return self._get_answerless_documents_from_indices(
+                indices, answers, gold_document_idx, gold_position
+            )
+        else:
+            return self._get_documents_from_indices(indices)
+
+    def _get_documents_from_indices(self, indices: List[int]) -> Tuple[List[str], List[int]]:
+        """
+        Selects documents from the corpus based on provided indices and formats them.
+        Handles both full corpus and subsets by mapping indices if necessary.
+        """
+        formatted_documents = []
+        
+        # Full corpus
+        if self.full_to_subset_idx_map is None:
+            documents_info = [self.corpus[i] for i in map(int, indices)]
+        else: 
+            documents_info: List[Dict] = []
+            # 'indices' are from the full corpus, so we need to map them to the subset
+            for i in map(int, indices):
+                documents_info.append(self.corpus[self.full_to_subset_idx_map[i]])
+        
+        seen_hashes = set()
+        # List to store the indices of documents actually added
+        document_indices = []  
+        for doc_info in documents_info:
+            if len(formatted_documents) == self.num_documents_in_context:
+                break
+            
+            doc_idx = doc_info['full_corpus_idx']
+            title = doc_info['title']
+            text = doc_info['text']
+
+            doc_hash = hash_document(text)
+            # Skip the document if it is a duplicate
+            if doc_hash in seen_hashes:
+                continue
+            seen_hashes.add(doc_hash)
+            
+            doc_str = f"Document [{doc_idx}](Title: {title}) {text}"
+            formatted_documents.append(doc_str)
+            document_indices.append(doc_idx)
+
+        return formatted_documents, document_indices
+
+    def _get_answerless_documents_from_indices(
+        self,
+        indices: List[int],
+        answers: List[str],
+        gold_document_idx: Optional[int],
+        gold_position: Optional[int]
+    ) -> Tuple[List[str], List[int]]:
+        """
+        Selects documents from the corpus that do not contain any of the given answers,
+        optionally including a specific 'gold' document at a designated position.
+        """
+        # Full corpus
+        if self.full_to_subset_idx_map is None:
+            documents_info = [self.corpus[i] for i in map(int, indices)]
+        else: 
+            documents_info: List[Dict] = []
+            # 'indices' are from the full corpus, so we need to map them to the subset
+            for i in map(int, indices):
+                documents_info.append(self.corpus[self.full_to_subset_idx_map[i]])
+
+        answerless_documents = []
+        gold_document = None
+        seen_hashes = set()
+        # List to store the indices of documents actually added
+        document_indices = [] 
+
+        for doc_info in documents_info:
+            doc_idx = doc_info['full_corpus_idx']
+            title = doc_info['title']
+            text = doc_info['text']
+
+            doc_hash = hash_document(text)
+            # Skip the document if it's a duplicate
+            if doc_hash in seen_hashes:
+                continue
+            seen_hashes.add(doc_hash)
+
+            if str(doc_idx) == gold_document_idx:
+                gold_document = f"Document [{doc_idx}](Title: {title}) {text}"
+                continue
+            
+            if not is_answer_in_text(text, answers):
+                answerless_doc = f"Document [{doc_idx}](Title: {title}) {text}"
+                answerless_documents.append(answerless_doc)
+                document_indices.append(doc_idx)
+
+        # Insert gold document at the specified/random position
+        if gold_position is not None and gold_document is not None:
+            gold_position = min(gold_position, len(answerless_documents))
+            answerless_documents.insert(gold_position, gold_document)
+            document_indices.insert(gold_position, gold_document_idx)
+
+        # Limit the number of documents to the specified context size
+        docs = answerless_documents[:self.num_documents_in_context]
+        indices = document_indices[:self.num_documents_in_context]
+        return docs, indices
+
+    def build_qa_prompt(self, query: str, documents_str: str) -> str:
+        task_instruction = "You are given a question and you MUST respond by EXTRACTING the answer (max 5 tokens) from one of the provided documents. If none of the documents contain the answer, respond with NO-RES."
+        prompt = f"""{task_instruction}\nDocuments:\n{documents_str}\nQuestion: {query}\nAnswer:"""
+
+        # Custom prompt format for mpt models
+        if 'mpt' in self.tokenizer.name_or_path:
+            INSTRUCTION_KEY = "### Instruction:"
+            RESPONSE_KEY = "### Response:"
+            INTRO_BLURB = "Below is an instruction that describes a task. Write a response that appropriately completes the request."
+            PROMPT_FOR_GENERATION_FORMAT = """{intro}\n{instruction_key}\n{instruction}\n{response_key}""".format(
+                intro=INTRO_BLURB,
+                instruction_key=INSTRUCTION_KEY,
+                instruction="{instruction}",
+                response_key=RESPONSE_KEY,
+            )
+            prompt = PROMPT_FOR_GENERATION_FORMAT.format(
+                instruction=prompt[:-8]
+            )
+
+        return prompt
+
+    def __getitem__(self, idx: int):
+        """Get a specific item from the dataset."""
+        _, document_indices = self.preprocessed_data[idx]
+        
+        item = {
+            "example_id": self.example_ids[idx],
+            "query": self.queries[idx],
+            "prompt": self.prompts[idx],
+            "document_indices": document_indices,
+            "gold_document_idx": self.gold_document_idxs[idx],
+            "prompt_tokens_len": self.prompt_tokens_lengths[idx]
+        }
+        
+        # Add clustering information if available
+        if self.use_clustering and self.cluster_assignments:
+            item["cluster_assignments"] = {
+                str(doc_idx): self.cluster_assignments.get(str(doc_idx))
+                for doc_idx in document_indices
+            }
+            
+        return item
+
+    def __len__(self):
+        return len(self.example_ids)
+
+
+class MixedDocumentsDataset(PromptDataset):
+    """
+    Extends the prompt dataset for creating prompts containing a mixed of retrieved and randomly selected documents.
+    """
+    def __init__(
+        self, 
+        corpus: List[Dict],
+        data_path: str,  
+        tokenizer: AutoTokenizer,
+        max_tokenized_length: int,
+        retriever_search_results: List[Tuple[List[int], List[float]]],
+        random_search_results: List[Tuple[List[int], List[float]]],
+        documents_disposition_info: Dict[str, Any],
+        full_to_subset_idx_map: Optional[Dict[int, int]] = None,
+        do_normalize_query: bool = False,
+        gold_position: Optional[int] = None,
+        randomize_gold_position: bool = False,
+        get_documents_without_answer: bool = False,
+    ):
+        self.retriever_search_results = retriever_search_results
+        self.random_search_results = random_search_results
+        self.documents_disposition_info = documents_disposition_info
+
+        # Validate 'documents_disposition_info' contains all necessary keys
+        required_keys = ['num_retrieved_documents', 'num_random_documents', 'put_retrieved_first']
+        if not all(key in documents_disposition_info for key in required_keys):
+            raise ValueError("Missing keys in 'documents_disposition_info'.")
+
+        num_documents_in_context = documents_disposition_info['num_retrieved_documents'] + \
+                                   documents_disposition_info['num_random_documents']
+
+        super().__init__(
+            corpus=corpus,
+            data_path=data_path,
+            tokenizer=tokenizer,
+            max_tokenized_length=max_tokenized_length,
+            search_results=None, # Handled separately in this subclass.
+            full_to_subset_idx_map=full_to_subset_idx_map,
+            do_normalize_query=do_normalize_query,
+            num_documents_in_context=num_documents_in_context,
+            gold_position=gold_position,
+            randomize_gold_position=randomize_gold_position,
+            get_documents_without_answer=get_documents_without_answer,
+        )
+
+    def _get_indices(self, example_idx: int) -> List[int]:
+        """ Overridden method that selects and properly mixes the indices from the retrieved and random search results. """
+        retrieved_indices, _ = self.retriever_search_results[example_idx]
+        random_indices, _ = self.random_search_results[example_idx]
+        indices = self._mix_documents(retrieved_indices, random_indices)
+        return indices
+
+    def _mix_documents(
+        self, 
+        retrieved_indices: List[int], 
+        random_indices: List[int]
+    ) -> List[int]:
+        """ Mixes retrieved and random document indices according to the documents disposition configuration. """
+        num_retrieved_documents = self.documents_disposition_info['num_retrieved_documents']    
+        num_random_documents = self.documents_disposition_info['num_random_documents']
+        put_retrieved_first = self.documents_disposition_info['put_retrieved_first']
+
+        indices = []
+        if put_retrieved_first:
+            indices = retrieved_indices[:num_retrieved_documents] + random_indices[:num_random_documents]
+        else:
+            # Retrieved documents are reversed ([::-1]), so that the documents with higher scores are at the end
+            indices = random_indices[:num_random_documents] + retrieved_indices[:num_retrieved_documents][::-1]
+        return indices
+
+
+class MultiCorpusDataset(PromptDataset):
+    """
+    Extends PromptDataset to handle multiple corpora, merging documents from the main and another corpus
+    based on specified disposition info to create prompts for LLMs.
+    """
     def __init__(
         self,
         corpus: List[Dict],
         data_path: str,
-        tokenizer,
+        tokenizer: AutoTokenizer,
         max_tokenized_length: int,
-        retriever_search_results: List[Tuple[List[int], List[float]]],
-        random_search_results: List[Tuple[List[int], List[float]]],
-        documents_disposition_info: Dict,
+        search_results: List[Tuple[List[str], List[float]]],
+        documents_other_corpus: List[str],
+        search_results_other_corpus: List[Tuple[List[int], List[float]]],
+        documents_disposition_info: Dict[str, Any],
         full_to_subset_idx_map: Optional[Dict[int, int]] = None,
-        batch_size: int = 32,
-        do_normalize_query: bool = True,
-        experiment_mode: str = 'baseline'
+        do_normalize_query: bool = False,
+        gold_position: Optional[int] = None,
+        randomize_gold_position: bool = False,
+        get_documents_without_answer: bool = False,
     ):
-        super().__init__(
-            data_path,
-            tokenizer,
-            max_tokenized_length,
-            batch_size,
-            do_normalize_query,
-            experiment_mode
-        )
-        
-        # Store search results references (not loading full content)
-        self.retriever_search_results = retriever_search_results
-        self.random_search_results = random_search_results
+        self.documents_other_corpus = documents_other_corpus
+        self.search_results_other_corpus = search_results_other_corpus
         self.documents_disposition_info = documents_disposition_info
-        self.full_to_subset_idx_map = full_to_subset_idx_map
 
-        # Create memory-mapped corpus access
-        self._setup_corpus_access(corpus)
+        # Validate 'documents_disposition_info' contains all necessary keys
+        required_keys = ['num_main_documents', 'num_other_documents', 'put_main_first']
+        if not all(key in documents_disposition_info for key in required_keys):
+            raise ValueError("Missing keys in 'documents_disposition_info'.")
 
-        self.logger.info(
-            f"Initialized MixedDocumentsDataset with streaming access to "
-            f"{len(corpus)} documents"
-        )
+        num_documents_in_context = documents_disposition_info['num_main_documents'] + \
+                                   documents_disposition_info['num_other_documents']
 
-    def _setup_corpus_access(self, corpus: List[Dict]):
-        """Setup memory-efficient corpus access."""
-        self.corpus_path = paths.CORPUS_DIR / "corpus_mapped.npy"
-        if not self.corpus_path.exists():
-            # Create memory-mapped array for corpus
-            corpus_array = np.array([(doc['text'], doc.get('title', '')) for doc in corpus],
-                                 dtype=[('text', 'U1000'), ('title', 'U100')])
-            np.save(self.corpus_path, corpus_array)
-        self.corpus = np.load(self.corpus_path, mmap_mode='r')
-
-    def retrieve_documents(self, idx: int, doc_type: str) -> List[str]:
-        """Memory-efficient document retrieval."""
-        if doc_type == 'retriever':
-            doc_indices = self.retriever_search_results[idx][0]
-        else:  # random
-            doc_indices = self.random_search_results[idx][0]
-            
-        # Access documents through memory mapping
-        return [self.corpus[i]['text'] for i in doc_indices]
-
-    def process_item(self, item: Dict) -> Dict:
-        """Process a single item with memory efficiency."""
-        query = self.normalize_query(item['question'])
-        
-        # Get required documents based on experiment mode
-        if self.experiment_mode == 'baseline':
-            retrieved_docs = self.retrieve_documents(item['example_id'], 'retriever')
-            random_docs = self.retrieve_documents(item['example_id'], 'random')
-        else:
-            retrieved_docs = self.retrieve_documents(item['example_id'], 'retriever')
-            random_docs = self.retrieve_documents(item['example_id'], 'random')
-
-        # Build context efficiently
-        if self.documents_disposition_info['put_retrieved_first']:
-            context_parts = (
-                retrieved_docs[:self.documents_disposition_info['num_retrieved_documents']] +
-                random_docs[:self.documents_disposition_info['num_random_documents']]
-            )
-        else:
-            context_parts = (
-                random_docs[:self.documents_disposition_info['num_random_documents']] +
-                retrieved_docs[:self.documents_disposition_info['num_retrieved_documents']]
-            )
-        
-        context = " ".join(context_parts)
-
-        # Tokenize efficiently
-        inputs = self.tokenizer(
-            query,
-            context,
-            max_length=self.max_tokenized_length,
-            truncation=True,
-            padding='max_length',
-            return_tensors='pt'
-        )
-
-        return {
-            'example_id': item.get('example_id', -1),
-            'input_ids': inputs['input_ids'].squeeze(),
-            'attention_mask': inputs['attention_mask'].squeeze(),
-            'query': query,
-            'prompt': f"Question: {query}\nContext: {context}\nAnswer:",
-            'document_indices': list(range(len(context_parts))),
-            'gold_document_idx': item.get('idx_gold_in_corpus', -1),
-            'prompt_tokens_len': len(inputs['input_ids'].squeeze())
-        }
-
-class QueryDataset(BaseStreamingDataset):
-    """Memory-efficient dataset for query-only generation."""
-    def __init__(
-        self,
-        data_path: str,
-        tokenizer,
-        model_name: str,
-        batch_size: int = 32,
-        do_normalize_query: bool = True
-    ):
+        # Initialize inherited attributes from the PromptDataset class
         super().__init__(
-            data_path,
-            tokenizer,
-            tokenizer.model_max_length - 2,
-            batch_size,
-            do_normalize_query,
-            'query_only'
-        )
-        self.model_name = model_name
-        self.logger.info("Initialized streaming QueryDataset")
-
-    def process_item(self, item: Dict) -> Dict:
-        query = self.normalize_query(item['question'])
-        prompt = f"Question: {query}\nAnswer:"
-
-        inputs = self.tokenizer(
-            prompt,
-            max_length=self.max_tokenized_length,
-            truncation=True,
-            padding='max_length',
-            return_tensors='pt'
+            corpus=corpus,
+            data_path=data_path,
+            search_results=search_results,
+            tokenizer=tokenizer,
+            max_tokenized_length=max_tokenized_length,
+            full_to_subset_idx_map=full_to_subset_idx_map,
+            do_normalize_query=do_normalize_query,
+            num_documents_in_context=num_documents_in_context,
+            gold_position=gold_position,
+            randomize_gold_position=randomize_gold_position,
+            get_documents_without_answer=get_documents_without_answer,
         )
 
-        return {
-            'example_id': item.get('example_id', -1),
-            'input_ids': inputs['input_ids'].squeeze(),
-            'attention_mask': inputs['attention_mask'].squeeze(),
-            'query': query,
-            'prompt': prompt,
-            'prompt_tokens_len': len(inputs['input_ids'].squeeze())
-        }
+    def prepare_documents_for_prompt(
+        self, 
+        example_idx: int, 
+        gold_document_idx: int, 
+        answers: List[str]
+    ) -> Tuple[List[str], List[int]]:
+        """ Overridden method to prepare and merge documents from both the main and additional corpora for prompt creation. """
+        indices_main_corpus = self._get_indices(example_idx)
+        indices_main_corpus, gold_position = self._insert_gold_document_idx(
+            indices_main_corpus, gold_document_idx
+        )
+        documents_main_corpus, document_indices_main_corpus = self._get_documents(
+            indices_main_corpus, answers, gold_document_idx, gold_position
+        )
+
+        indices_other_corpus, _ = self.search_results_other_corpus[example_idx]
+        documents_other_corpus, document_indices_other_corpus = self._get_documents_from_indices_other_corpus(
+            indices_other_corpus
+        )
+
+        merged_documents, merged_document_indices = self._merge_documents(
+            documents_main_corpus, documents_other_corpus,
+            document_indices_main_corpus, document_indices_other_corpus
+        )
+        return merged_documents, merged_document_indices
+
+    def _merge_documents(
+        self, 
+        documents_main: List[str], 
+        documents_other: List[str], 
+        indices_main: List[int], 
+        indices_other: List[int]
+    ) -> Tuple[List[str], List[int]]:
+        """
+        Merges documents from the main and additional corpora based on the criteria specified in documents_disposition_info.
+        """
+        num_main_documents = self.documents_disposition_info['num_main_documents']    
+        num_other_documents = self.documents_disposition_info['num_other_documents']
+        put_main_first = self.documents_disposition_info['put_main_first']
+
+        if put_main_first:
+            merged_documents = documents_main[:num_main_documents] + documents_other[:num_other_documents]
+            merged_document_indices = indices_main[:num_main_documents] + indices_other[:num_other_documents]
+        else:
+            # Retrieved documents are reversed ([::-1]), so that the documents with higher scores are at the end
+            merged_documents = documents_other[:num_other_documents] + documents_main[:num_main_documents][::-1]
+            merged_document_indices = indices_other[:num_other_documents] + indices_main[:num_main_documents][::-1]
+        return merged_documents, merged_document_indices
+
+    def _get_documents_from_indices_other_corpus(self, indices):
+        """
+        Selects and formats documents from the additional corpus based on provided indices.
+        """
+        formatted_documents = []
+        seen_hashes = set()
+        num_other_documents = self.documents_disposition_info['num_other_documents']
+
+        # List to store the indices of documents actually added
+        document_indices = []  
+        for doc_idx in map(int, indices):
+            if len(formatted_documents) == num_other_documents:
+                break
+            
+            text = self.documents_other_corpus[doc_idx].strip()
+            doc_hash = hash_document(text)
+            # Skip the document if it is a duplicate
+            if doc_hash in seen_hashes:
+                continue
+            seen_hashes.add(doc_hash)
+            
+            doc_str = f"Document [{doc_idx}] {text}"
+            formatted_documents.append(doc_str)
+            document_indices.append(doc_idx)
+
+        return formatted_documents, document_indices

@@ -1,10 +1,22 @@
-# **Expanding "The Power of Noise: Redefining Retrieval for RAG Systems"*
+# **Expanding "The Power of Noise: Redefining Retrieval for RAG Systems"**
 
 **This is a repository that expands on the studies initiated by Florin in his git repository called The-Power-of-Noise down below.**
 
 * Link for his original work: https://github.com/florin-git/The-Power-of-Noise
 
 * Link for his paper: [The Power of Noise: Redefining Retrieval for RAG Systems](https://dl.acm.org/doi/10.1145/3626772.3657834)
+
+# **How to Download the data**
+Since most of data is from the previous experiment in the Power of Noise paper, most of data is downloaded directly from there. But some files are downloaded from the Driver provided by Florin in his work
+
+* **Command to download the data:** Just run the command python3 src/data_handlers/download_datasets.py
+
+**What this command is going to do:** 
+* This command will download all required files into a folder called data/downloaded_files.
+* Then this command will automatically create a bunch of folders used with the main code
+* Then, this command will also automatically move all the downloaded files to their correct folder newlly created.
+
+**Command to run the whole application:** ./src/run_experiments.sh --all all
 
 # **Overview**
 
