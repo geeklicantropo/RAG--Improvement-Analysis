@@ -12,9 +12,9 @@ class BaselineConfig:
     batch_size: int = 16
     max_new_tokens: int = 15
     
-    # Retrieval Configuration
-    use_bm25: bool = False  # If False, uses Contriever
-    top_k_docs: int = 100
+    # Retrieval Configuration 
+    use_bm25: bool = False
+    use_adore: bool = False
     normalize_embeddings: bool = False
     
     # Document Configuration
@@ -24,14 +24,37 @@ class BaselineConfig:
     
     # Random Document Configuration
     use_random: bool = False
-    random_doc_percentage: float = 0.3  # Percentage of random documents to include
-    random_doc_source: str = "wikipedia"  # Options: "wikipedia", "reddit", "synthetic"
     
     # Data Paths
     base_data_dir: Path = Path("data")
-    corpus_path: Path = base_data_dir / "corpus.json"
-    train_dataset_path: Path = base_data_dir / "10k_train_dataset.json"
-    test_dataset_path: Path = base_data_dir / "test_dataset.json"
+    processed_dir: Path = base_data_dir / "processed"
+    
+    @property
+    def corpus_path(self) -> Path:
+        """Get appropriate corpus path based on configuration."""
+        if self.use_random:
+            return self.processed_dir / "corpus_with_random_at60.json"
+        elif self.use_adore:
+            return self.processed_dir / "corpus_with_adore_at200.json"
+        else:
+            return self.processed_dir / "corpus_with_contriever_at150.json"
+    
+    @property
+    def train_dataset_path(self) -> Path:
+        return self.base_data_dir / "10k_train_dataset.json"
+    
+    @property
+    def test_dataset_path(self) -> Path:
+        return self.base_data_dir / "test_dataset.json"
+    
+    @property
+    def search_results_path(self) -> Path:
+        if self.use_random:
+            return self.base_data_dir / "10k_random_results_at60.pkl"
+        elif self.use_adore:
+            return self.base_data_dir / "adore_search_results_at200.pkl"
+        else:
+            return self.base_data_dir / "contriever_search_results_at150.pkl"
     
     # Output Configuration
     output_dir: Path = Path("experiments/experiment0_baseline/results")
@@ -43,19 +66,19 @@ class BaselineConfig:
         self._create_directories()
     
     def _validate_parameters(self):
-        """Validate configuration parameters."""
         if self.num_documents_in_context <= 0:
             raise ValueError("num_documents_in_context must be positive")
-        
+            
         if self.gold_position is not None:
             if self.gold_position < 0 or self.gold_position >= self.num_documents_in_context:
                 raise ValueError("gold_position must be within document context range")
-        
-        if not (0 <= self.random_doc_percentage <= 1):
-            raise ValueError("random_doc_percentage must be between 0 and 1")
-        
-        if self.random_doc_source not in ["wikipedia", "reddit", "synthetic"]:
-            raise ValueError("Invalid random_doc_source")
+                
+        # Validate file existence
+        if not self.corpus_path.exists():
+            raise ValueError(f"Corpus file not found: {self.corpus_path}")
+            
+        if not self.search_results_path.exists():
+            raise ValueError(f"Search results file not found: {self.search_results_path}")
     
     def _create_directories(self):
         """Create necessary directories."""
