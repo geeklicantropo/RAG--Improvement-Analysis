@@ -15,7 +15,7 @@ sys.path.append(project_root)
 from src.experiment_logger import ExperimentLogger
 from src.utils import seed_everything
 from src.cluster_utils import DocumentClusterer
-from config import ClusteringConfig
+from experiments.experiment1_clustering.config import ClusteringConfig
 
 import time
 from collections import defaultdict

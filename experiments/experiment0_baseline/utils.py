@@ -1,5 +1,4 @@
-# experiments/experiment0_baseline/utils.py
-
+import os
 import random
 from typing import List, Dict, Tuple, Optional, Set
 import numpy as np
@@ -7,6 +6,14 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 from collections import defaultdict
+
+def save_metrics(metrics: Dict[str, float], output_dir: str) -> None:
+    """Save experiment metrics to JSON file."""
+    import json
+    metrics_path = Path(output_dir) / "metrics.json"
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+
 
 class BaselineExperimentUtils:
     """Utilities for baseline RAG experiments."""
@@ -18,6 +25,7 @@ class BaselineExperimentUtils:
         exclude_indices: Optional[List[int]] = None,
         seed: int = 42
     ) -> Tuple[List[Dict], List[int]]:
+        
         """
         Prepare random documents for injection into the context.
         
@@ -31,16 +39,11 @@ class BaselineExperimentUtils:
             Tuple of (selected documents, their indices)
         """
         random.seed(seed)
-        
-        # Create pool of available indices
         available_indices = list(range(len(corpus)))
         if exclude_indices:
             available_indices = [i for i in available_indices if i not in exclude_indices]
-            
-        # Select random documents
         selected_indices = random.sample(available_indices, num_random_docs)
         selected_docs = [corpus[i] for i in selected_indices]
-        
         return selected_docs, selected_indices
 
     @staticmethod
@@ -70,7 +73,6 @@ class BaselineExperimentUtils:
         else:
             merged_docs = random_docs + retrieved_docs
             merged_indices = random_indices + retrieved_indices
-            
         return merged_docs, merged_indices
 
     @staticmethod
@@ -95,12 +97,10 @@ class BaselineExperimentUtils:
         current_length = 0
         
         for idx, doc in enumerate(documents):
-            # Calculate document length
             doc_text = doc.get('text', '')
             doc_tokens = tokenizer.encode(doc_text, add_special_tokens=True)
             doc_length = len(doc_tokens)
             
-            # Check if adding document exceeds max length
             if current_length + doc_length <= max_length:
                 valid_docs.append(doc)
                 valid_indices.append(idx)
@@ -126,7 +126,6 @@ class BaselineExperimentUtils:
         stats = defaultdict(lambda: {"total": 0, "correct": 0})
         
         for result in results:
-            # Analyze position effectiveness
             doc_positions = result.get('document_indices', [])
             is_correct = result.get('ans_match_after_norm', False)
             
@@ -136,7 +135,6 @@ class BaselineExperimentUtils:
                 if is_correct:
                     stats[key]["correct"] += 1
                     
-            # Analyze gold document effectiveness
             gold_pos = result.get('gold_position')
             if gold_pos is not None:
                 key = f"gold_position_{gold_pos}"
@@ -144,7 +142,6 @@ class BaselineExperimentUtils:
                 if is_correct:
                     stats[key]["correct"] += 1
         
-        # Calculate percentages
         analysis = {}
         for key, counts in stats.items():
             if counts["total"] > 0:

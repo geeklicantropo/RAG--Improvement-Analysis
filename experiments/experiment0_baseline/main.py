@@ -3,30 +3,36 @@ import sys
 import torch
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 from datetime import datetime
 from tqdm import tqdm
-from torch.utils.data import DataLoader
+import argparse
 
 # Add project root to system path
 project_root = str(Path(__file__).parent.parent.parent)
 sys.path.append(project_root)
 
+from src.experiment_logger import ExperimentLogger
 from src.utils import seed_everything
 from src.llm import LLM
-from src.retriever import Retriever
+from src.prompt_dataset import PromptDataset
+from src.utils import read_corpus_json, read_pickle, write_pickle
+from src.cluster_utils import DocumentClusterer
 from src.experiment_logger import ExperimentLogger
-from config import BaselineConfig, BaselineConfigFactory
+from .config import BaselineConfig, BaselineConfigFactory
+from collections import defaultdict
 
 class BaselineExperiment:
     def __init__(
         self,
         config: BaselineConfig,
         experiment_name: str,
+        retriever_type: str = None,
         logger: Optional[ExperimentLogger] = None
     ):
         self.config = config
         self.experiment_name = experiment_name
+        self.retriever_type = retriever_type or ('bm25' if config.use_bm25 else 'contriever')
         self.logger = logger or ExperimentLogger(
             experiment_name=experiment_name,
             base_log_dir=str(Path(project_root) / "logs")
@@ -34,7 +40,6 @@ class BaselineExperiment:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
     def setup(self):
-        """Set up experiment components without re-downloading files."""
         try:
             self.logger.log_step_start("Setup")
             
@@ -46,73 +51,67 @@ class BaselineExperiment:
                 model_max_length=self.config.model_max_length
             )
             
-            # Initialize retriever based on config
-            if not self.config.use_bm25:
-                self.retriever = self._setup_contriever()
-            else:
-                self.retriever = self._setup_bm25()
-                
             # Load dataset
             self.dataset = self._load_dataset()
+            
+            # Initialize clusterer if needed
+            if self.config.use_clustering:
+                self.clusterer = DocumentClusterer(
+                    num_clusters=self.config.num_clusters,
+                    random_seed=self.config.cluster_seed,
+                    use_scaler=True,
+                    logger=self.logger
+                )
             
             self.logger.log_step_end("Setup")
             
         except Exception as e:
             self.logger.log_error(e, "Error in experiment setup")
             raise
-            
-    def _setup_contriever(self) -> Retriever:
-        """Set up Contriever retriever using existing files."""
-        from transformers import AutoConfig, AutoTokenizer
-        from src.retriever import Encoder
+
+    def _load_search_results(self):
+        """Load appropriate search results based on config."""
+        if self.config.use_random:
+            return read_pickle(str(self.config.random_results_path))
+        elif self.config.use_bm25:
+            return read_pickle(str(self.config.bm25_results_path))
+        else:
+            return read_pickle(str(self.config.contriever_results_path))
+
+    def _load_dataset(self) -> PromptDataset:
+        """Load and prepare dataset with proper configuration."""
+        # Load corpus
+        from src.utils import read_corpus_json
+        corpus = read_corpus_json(str(self.config.corpus_path))
         
-        config = AutoConfig.from_pretrained('facebook/contriever')
-        encoder = Encoder(config).eval()
-        tokenizer = AutoTokenizer.from_pretrained('facebook/contriever')
-        
-        return Retriever(
-            device=self.device,
-            tokenizer=tokenizer,
-            query_encoder=encoder,
-            norm_doc_emb=self.config.normalize_embeddings
-        )
-    
-    def _setup_bm25(self) -> Any:
-        """Set up BM25 retriever using existing index."""
-        from pyserini.search.lucene import LuceneSearcher
-        return LuceneSearcher.from_prebuilt_index('wikipedia-dpr')
-    
-    def _load_dataset(self):
-        """Load dataset using existing files."""
-        from src.prompt_dataset import PromptDataset
-        
-        # Load corpus and search results from existing files
-        corpus = self._load_corpus()
+        # Load search results
         search_results = self._load_search_results()
         
-        return PromptDataset(
-            corpus=corpus,
-            data_path=str(self.config.train_dataset_path),
-            tokenizer=self.llm.tokenizer,
-            max_tokenized_length=self.config.model_max_length - 2,
-            search_results=search_results,
-            num_documents_in_context=self.config.num_documents_in_context,
-            gold_position=self.config.gold_position,
-            get_documents_without_answer=self.config.get_documents_without_answer
-        )
-    
-    def _load_corpus(self):
-        """Load corpus from existing file."""
-        from src.utils import read_corpus_json
-        return read_corpus_json(str(self.config.corpus_path))
-    
-    def _load_search_results(self):
-        """Load search results from existing file."""
-        from src.utils import read_pickle
-        return read_pickle(str(self.config.search_results_path))
-    
+        # Prepare dataset arguments
+        dataset_kwargs = {
+            'corpus': corpus,
+            'data_path': str(self.config.train_dataset_path),
+            'tokenizer': self.llm.tokenizer,
+            'max_tokenized_length': self.config.model_max_length - 2,
+            'search_results': search_results,
+            'num_documents_in_context': self.config.num_documents_in_context,
+            'gold_position': self.config.gold_position,
+            'get_documents_without_answer': self.config.get_documents_without_answer,
+            'full_to_subset_idx_map': None  # Add if needed
+        }
+        
+        # Add clustering configuration if enabled
+        if getattr(self.config, 'use_clustering', False):
+            dataset_kwargs.update({
+                'use_clustering': True,
+                'num_clusters': self.config.num_clusters,
+                'cluster_seed': self.config.cluster_seed
+            })
+            
+        # Create and return dataset
+        return PromptDataset(**dataset_kwargs)
+
     def run(self):
-        """Run experiment generating new output files."""
         try:
             self.logger.log_step_start("Experiment execution")
             
@@ -120,7 +119,7 @@ class BaselineExperiment:
             self.logger.log_experiment_params(self.config.to_dict())
             
             # Create data loader
-            dataloader = DataLoader(
+            dataloader = torch.utils.data.DataLoader(
                 self.dataset,
                 batch_size=self.config.batch_size,
                 shuffle=False,
@@ -128,168 +127,218 @@ class BaselineExperiment:
                 pin_memory=True
             )
             
-            # Generate timestamp for new results
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_dir = self.config.output_dir / f"run_{timestamp}"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            
             # Run generation
             results = self._run_generation(dataloader)
             
-            # Save results with timestamp
-            self._save_results(results, output_dir)
+            # Process clustering if used
+            if self.config.use_clustering:
+                results = self._process_clustering_results(results)
             
-            # Compute and log metrics
+            # Analyze results
             metrics = self._compute_metrics(results)
-            self._save_metrics(metrics, output_dir)
+            
+            # Save results
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path(self.config.output_dir) / f"run_{timestamp}"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            self._save_results(results, metrics, output_dir)
             
             self.logger.log_step_end("Experiment execution")
+            return results, metrics
             
         except Exception as e:
             self.logger.log_error(e, "Error during experiment execution")
             raise
 
-    def _run_generation(self, dataloader: DataLoader) -> List[Dict]:
-        """Run generation on batches."""
-        all_results = []
+    def _run_generation(self, dataloader) -> List[Dict]:
+        results = []
         
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
+        for batch in tqdm(dataloader, desc="Generating answers"):
             # Generate answers
-            prompts = batch['prompt']
-            generated_outputs = self.llm.generate(
-                prompts,
+            outputs = self.llm.generate(
+                batch['prompt'],
                 max_new_tokens=self.config.max_new_tokens
             )
             
             # Process outputs
-            processed_results = self._process_batch_outputs(batch, generated_outputs)
-            all_results.extend(processed_results)
+            batch_results = self._process_batch_outputs(batch, outputs)
+            results.extend(batch_results)
             
-            # Periodic saving
-            if (batch_idx + 1) % self.config.save_every == 0:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                self._save_checkpoint(all_results, batch_idx + 1, timestamp)
+            # Save checkpoint if needed
+            if self.config.save_intermediates and len(results) % self.config.save_every == 0:
+                self._save_checkpoint(results)
                 
-        return all_results
-    
+        return results
+
     def _process_batch_outputs(
         self,
         batch: Dict[str, Any],
-        generated_outputs: List[str]
-    ) -> List[Dict]:
-        """Process batch outputs into structured results."""
+        outputs: List[str]
+    ) -> List[Dict[str, Any]]:
         processed_results = []
         answer_string = "### Response:" if 'mpt' in self.config.llm_id else "Answer:"
         
-        for idx, output in enumerate(generated_outputs):
-            # Extract answer from generated output
+        for idx, output in enumerate(outputs):
             start_idx = output.find(answer_string) + len(answer_string)
             answer = output[start_idx:].strip()
             
-            # Create result dictionary
             result = {
-                'example_id': batch['example_id'][idx],
                 'query': batch['query'][idx],
                 'generated_answer': answer,
-                'prompt': batch['prompt'][idx],
                 'document_indices': batch['document_indices'][idx],
                 'gold_document_idx': batch['gold_document_idx'][idx],
-                'prompt_tokens_len': batch['prompt_tokens_len'][idx],
-                'ans_match_after_norm': False,  # Will be updated in metrics computation
-                'gold_in_retrieved': str(batch['gold_document_idx'][idx]) in batch['document_indices'][idx]
+                'prompt_tokens_len': batch['prompt_tokens_len'][idx]
             }
+            
+            if self.config.use_clustering:
+                result['cluster_assignments'] = batch.get('cluster_assignments', {})[idx]
+                
             processed_results.append(result)
             
         return processed_results
-    
-    def _save_checkpoint(
-        self,
-        results: List[Dict],
-        batch_idx: int,
-        timestamp: str
-    ):
-        """Save intermediate results."""
-        from src.utils import write_pickle
-        
-        checkpoint_dir = self.config.output_dir / "checkpoints"
-        checkpoint_dir.mkdir(exist_ok=True)
-        
-        checkpoint_path = checkpoint_dir / f"checkpoint_{batch_idx}_{timestamp}.pkl"
-        write_pickle(results, str(checkpoint_path))
-        self.logger.experiment_logger.info(f"Saved checkpoint at batch {batch_idx}")
-    
-    def _save_results(self, results: List[Dict], output_dir: Path):
-        """Save final results."""
-        import json
-        
-        results_path = output_dir / "results.json"
-        with open(results_path, 'w') as f:
-            json.dump(results, f, indent=2)
-        self.logger.experiment_logger.info(f"Saved results to {results_path}")
-        
-    def _compute_metrics(self, results: List[Dict]) -> Dict[str, Any]:
-        """Compute comprehensive experiment metrics."""
-        metrics = {
-            'total_examples': len(results),
-            'avg_prompt_length': sum(r['prompt_tokens_len'] for r in results) / len(results),
-            'gold_retrieval_rate': sum(1 for r in results if r['gold_in_retrieved']) / len(results)
+
+    def _process_clustering_results(self, results: List[Dict]) -> List[Dict]:
+        """Add clustering-specific metrics to results if clustering was used."""
+        if not self.config.use_clustering:
+            return results
+            
+        for result in results:
+            if 'cluster_assignments' in result:
+                cluster_stats = self._compute_cluster_stats(result['cluster_assignments'])
+                result['cluster_metrics'] = cluster_stats
+                
+        return results
+
+    def _compute_cluster_stats(self, cluster_assignments: Dict) -> Dict:
+        """Compute statistics for document clusters."""
+        stats = {
+            'num_clusters': len(set(cluster_assignments.values())),
+            'cluster_sizes': {},
+            'cluster_distribution': {}
         }
         
-        # Compute accuracy and gold document metrics
-        correct_answers = 0
-        gold_helpful = 0
+        # Count documents per cluster
+        for cluster_id in set(cluster_assignments.values()):
+            size = sum(1 for v in cluster_assignments.values() if v == cluster_id)
+            stats['cluster_sizes'][str(cluster_id)] = size
+            stats['cluster_distribution'][str(cluster_id)] = size / len(cluster_assignments)
+            
+        return stats
+
+    def _compute_metrics(self, results: List[Dict]) -> Dict[str, float]:
+        metrics = {
+            'total_examples': len(results),
+            'correct_answers': sum(1 for r in results if r.get('ans_match_after_norm', False)),
+            'avg_context_length': sum(len(r['document_indices']) for r in results) / len(results),
+            'retriever_type': self.retriever_type
+        }
         
-        for result in results:
-            if result['ans_match_after_norm']:
-                correct_answers += 1
-                if result['gold_in_retrieved']:
-                    gold_helpful += 1
-                    
-        metrics['accuracy'] = correct_answers / len(results)
-        metrics['gold_helpfulness'] = gold_helpful / sum(1 for r in results if r['gold_in_retrieved']) if sum(1 for r in results if r['gold_in_retrieved']) > 0 else 0
+        metrics['accuracy'] = metrics['correct_answers'] / metrics['total_examples']
         
-        # Log metrics
-        for name, value in metrics.items():
-            self.logger.log_metric(name, value)
+        # Add clustering metrics if used
+        if self.config.use_clustering:
+            cluster_metrics = self._compute_clustering_metrics(results)
+            metrics.update(cluster_metrics)
             
         return metrics
-    
-    def _save_metrics(self, metrics: Dict[str, Any], output_dir: Path):
-        """Save metrics to file."""
+
+    def _compute_clustering_metrics(self, results: List[Dict]) -> Dict[str, float]:
+        """Compute clustering-specific metrics."""
+        cluster_metrics = defaultdict(lambda: {'total': 0, 'correct': 0})
+        
+        for result in results:
+            if 'cluster_assignments' in result:
+                for cluster_id in set(result['cluster_assignments'].values()):
+                    metrics = cluster_metrics[str(cluster_id)]
+                    metrics['total'] += 1
+                    if result.get('ans_match_after_norm'):
+                        metrics['correct'] += 1
+        
+        return {
+            f'cluster_{k}_accuracy': v['correct']/v['total'] if v['total'] > 0 else 0
+            for k, v in cluster_metrics.items()
+        }
+
+    def _save_checkpoint(self, results: List[Dict]):
+        """Save intermediate results checkpoint."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        checkpoint_dir = Path(self.config.output_dir) / "checkpoints"
+        checkpoint_dir.mkdir(exist_ok=True)
+        
+        checkpoint_path = checkpoint_dir / f"checkpoint_{len(results)}_{timestamp}.pkl"
+        write_pickle(results, str(checkpoint_path))
+        
+        self.logger.experiment_logger.info(f"Saved checkpoint with {len(results)} results")
+
+    def _save_results(
+        self,
+        results: List[Dict],
+        metrics: Dict[str, Any],
+        output_dir: Path
+    ):
+        """Save experiment results and metrics."""
         import json
         
-        metrics_path = output_dir / "metrics.json"
+        # Save results
+        results_path = output_dir / 'results.json'
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+            
+        # Save metrics
+        metrics_path = output_dir / 'metrics.json'
         with open(metrics_path, 'w') as f:
             json.dump(metrics, f, indent=2)
-        self.logger.experiment_logger.info(f"Saved metrics to {metrics_path}")
-
-def main():
-    # Set random seed
-    seed_everything(42)
-    
-    # Create experiment configurations
-    configs = {
-        'contriever': BaselineConfigFactory.get_contriever_config(),
-        'bm25': BaselineConfigFactory.get_bm25_config(),
-        'random': BaselineConfigFactory.get_random_config()
-    }
-    
-    # Run experiments
-    for exp_name, config in configs.items():
-        try:
-            # Initialize experiment
-            experiment = BaselineExperiment(
-                config=config,
-                experiment_name=f"baseline_{exp_name}"
-            )
             
-            # Run experiment phases
-            with experiment.logger:
-                experiment.setup()
-                experiment.run()
-                
-        except Exception as e:
-            logging.error(f"Error in {exp_name} experiment: {str(e)}", exc_info=True)
+        self.logger.experiment_logger.info(f"Saved results to {output_dir}")
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Run baseline experiments")
+    parser.add_argument(
+        "--retriever",
+        type=str,
+        choices=['contriever', 'bm25', 'random'],
+        required=True,
+        help="Type of retriever to use"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="experiments/experiment0_baseline/results",
+        help="Output directory"
+    )
+    return parser.parse_args()
+
+def main(args=None):
+    try:
+        if isinstance(args, dict):
+            parser = argparse.ArgumentParser()
+            parser.add_argument('--retriever', type=str)
+            parser.add_argument('--gold_position', type=int)
+            parser.add_argument('--num_documents', type=int)
+            parser.add_argument('--use_random', type=bool, default=False)
+            namespace = parser.parse_args([])
+            for k, v in args.items():
+                setattr(namespace, k, v)
+            args = namespace
+        else:
+            args = parse_arguments()
+
+        config = BaselineConfigFactory.get_config_for_retriever(args.retriever)
+        experiment = BaselineExperiment(
+            config=config,
+            experiment_name=f"baseline_{args.retriever}",
+            retriever_type=args.retriever
+        )
+        experiment.setup()
+        return experiment.run()
+        
+    except Exception as e:
+        logging.error(f"Error in baseline experiment: {str(e)}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
-    main()
+    args = parse_arguments()
+    config = BaselineConfigFactory.get_config_for_retriever(args.retriever)
+    config.output_dir = Path(args.output_dir)
+    main(config)

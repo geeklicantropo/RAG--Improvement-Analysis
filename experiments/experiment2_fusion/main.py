@@ -16,8 +16,12 @@ from src.utils import seed_everything
 from src.llm import LLM
 from src.prompt_dataset import PromptDataset
 from src.rag_fusion_utils import RAGFusionRanker
-from config import FusionConfig, FusionConfigFactory
-from utils import FusionExperimentUtils
+#from config import FusionConfig, FusionConfigFactory
+#from utils import FusionExperimentUtils
+
+from experiments.experiment2_fusion.config import FusionConfig, FusionConfigFactory
+from experiments.experiment2_fusion.utils import FusionExperimentUtils
+
 
 class FusionExperiment:
     """

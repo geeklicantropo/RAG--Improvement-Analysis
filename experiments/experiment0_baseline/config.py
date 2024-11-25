@@ -24,6 +24,15 @@ class BaselineConfig:
     
     # Random Document Configuration
     use_random: bool = False
+
+    # Clustering Configuration (New)
+    use_clustering: bool = False
+    num_clusters: Optional[int] = None
+    cluster_seed: int = 42
+
+    # Experimental Features
+    use_fusion: bool = False
+    use_categories: bool = False
     
     # Data Paths
     base_data_dir: Path = Path("data")
@@ -55,6 +64,18 @@ class BaselineConfig:
             return self.base_data_dir / "adore_search_results_at200.pkl"
         else:
             return self.base_data_dir / "contriever_search_results_at150.pkl"
+        
+    @property
+    def contriever_results_path(self) -> Path:
+        return self.base_data_dir / "contriever_search_results_at150.pkl"
+        
+    @property  
+    def bm25_results_path(self) -> Path:
+        return self.base_data_dir / "bm25_test_search_results_at250.pkl"
+
+    @property
+    def random_results_path(self) -> Path:
+        return self.base_data_dir / "10k_random_results_at60.pkl"
     
     # Output Configuration
     output_dir: Path = Path("experiments/experiment0_baseline/results")
@@ -98,10 +119,22 @@ class BaselineConfig:
         for key, value in config_dict.items():
             if isinstance(value, str) and key.endswith('_path') or key.endswith('_dir'):
                 config_dict[key] = Path(value)
-        return cls(**config_dict)
+        return cls(**config_dict)   
 
 # Default configurations for different scenarios
 class BaselineConfigFactory:
+    @staticmethod 
+    def get_config_for_retriever(retriever_type: str) -> BaselineConfig:
+        """Get configuration for specified retriever type."""
+        if retriever_type == 'contriever':
+            return BaselineConfigFactory.get_contriever_config()
+        elif retriever_type == 'bm25':
+            return BaselineConfigFactory.get_bm25_config() 
+        elif retriever_type == 'random':
+            return BaselineConfigFactory.get_random_config()
+        else:
+            raise ValueError(f"Unknown retriever type: {retriever_type}")
+        
     @staticmethod
     def get_contriever_config() -> BaselineConfig:
         """Get configuration for Contriever experiment."""

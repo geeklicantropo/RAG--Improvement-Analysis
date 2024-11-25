@@ -24,6 +24,7 @@ filelock>=3.12.0
 rank-bm25
 sentence-transformers
 # faiss-gpu removed
+#pyserini>=0.16.0
 
 # RAG-Fusion specific requirements
 rank_bm25>=0.2.2
@@ -33,4 +34,5 @@ sentence-transformers>=2.2.2
 openai>=0.27.0
 loguru>=0.6.0
 datasets
+argparse
 
