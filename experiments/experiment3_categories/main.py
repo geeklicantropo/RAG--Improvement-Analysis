@@ -6,6 +6,9 @@ from typing import Dict, List, Any, Tuple, Optional
 from datetime import datetime
 from tqdm import tqdm
 import argparse
+import logging
+import warnings
+import json
 
 # Add project root to system path
 project_root = str(Path(__file__).parent.parent.parent)
@@ -16,7 +19,7 @@ from src.utils import seed_everything
 from src.llm import LLM
 from src.prompt_dataset import PromptDataset
 from src.rag_fusion_utils import RAGFusionRanker
-from config import CategoriesConfig, CategoriesConfigFactory
+from .config import CategoriesConfig, CategoriesConfigFactory
 from utils import CategoriesExperimentUtils
 
 class CategoriesExperiment:
@@ -248,46 +251,53 @@ class CategoriesExperiment:
             
         self.logger.experiment_logger.info(f"Saved checkpoint at batch {batch_idx}")
 
-def main():
+def parse_arguments():
+    """Parse command line arguments for categories experiment."""
     parser = argparse.ArgumentParser(description="Run categories experiment")
+    
     parser.add_argument(
-        "--config_type",
+        '--config_type',
         type=str,
         choices=['confidence', 'fusion', 'random'],
         default='confidence',
-        help="Type of configuration to use"
+        help='Type of categorization to use'
     )
-    args = parser.parse_args()
-    
-    # Set random seed
-    seed_everything(42)
-    
-    # Create appropriate configuration
-    if args.config_type == 'confidence':
-        config = CategoriesConfigFactory.get_confidence_based_config()
-    elif args.config_type == 'fusion':
-        config = CategoriesConfigFactory.get_fusion_based_config()
-    else:
-        config = CategoriesConfigFactory.get_random_augmented_config()
-    
-    # Initialize logger
-    logger = ExperimentLogger(
-        experiment_name=f"categories_{args.config_type}",
-        base_log_dir="logs"
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default='experiments/experiment3_categories/results',
+        help='Output directory for results'
     )
     
+    return parser.parse_args()
+
+def main(args=None):
+    """Main entry point with silent execution for categories experiment."""
     try:
-        # Run experiment
-        with logger:
+        if isinstance(args, dict):
+            parser = argparse.ArgumentParser()
+            parser.add_argument('--config_type', type=str)
+            namespace = parser.parse_args([])
+            for k, v in args.items():
+                setattr(namespace, k, v)
+            args = namespace
+        else:
+            args = parse_arguments()
+
+        # Use existing CategoriesConfigFactory from config.py
+        config = CategoriesConfigFactory.get_config_for_type(args.config_type)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
             experiment = CategoriesExperiment(
                 config=config,
-                experiment_name=f"categories_{args.config_type}"
+                experiment_name=f"categories_{args.config_type}",
+                logger=ExperimentLogger(f"categories_{args.config_type}")
             )
             experiment.setup()
-            results, metrics = experiment.run()
+            return experiment.run()
             
     except Exception as e:
-        logger.log_error(e, "Error in main execution")
+        logging.error(f"Error in categories experiment: {str(e)}", exc_info=True)
         raise
 
 if __name__ == "__main__":

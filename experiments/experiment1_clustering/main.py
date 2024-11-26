@@ -7,6 +7,7 @@ from tqdm import tqdm
 from datetime import datetime
 from pathlib import Path
 import sys
+import logging
 
 # Add project root to system path
 project_root = str(Path(__file__).parent.parent.parent)
@@ -338,32 +339,67 @@ class ClusteringExperiment:
             
         self.logger.experiment_logger.info(f"Saved checkpoint at batch {batch_idx}")
 
-def main():
+def parse_arguments():
+    """Parse command line arguments for clustering experiment."""
     parser = argparse.ArgumentParser(description="Run clustering experiment")
-    parser.add_argument("--config_path", type=str, required=True,
-                       help="Path to experiment configuration file")
-    args = parser.parse_args()
     
-    # Set random seed
-    seed_everything(10)
-    
-    # Load configuration
-    config = ClusteringConfig.load(args.config_path)
-    
-    # Initialize logger
-    logger = ExperimentLogger(
-        experiment_name="clustering_experiment",
-        base_log_dir="logs"
+    parser.add_argument(
+        '--num_clusters',
+        type=int,
+        default=5,
+        help='Number of clusters'
+    )
+    parser.add_argument(
+        '--use_random',
+        action='store_true',
+        help='Whether to use random documents'
+    )
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default='experiments/experiment1_clustering/results',
+        help='Output directory for results'
     )
     
+    return parser.parse_args()
+
+
+class ClusteringConfigFactory:
+    """Factory class for creating clustering configurations."""
+    @staticmethod
+    def get_config(num_clusters: int, use_random: bool) -> ClusteringConfig:
+        """Create clustering configuration."""
+        return ClusteringConfig(
+            num_clusters=num_clusters,
+            use_random=use_random
+        )
+
+def main(args=None):
     try:
-        with logger:
-            # Run experiment
-            experiment = ClusteringExperiment(config, logger)
-            results, metrics = experiment.run_experiment()
+        if isinstance(args, dict):
+            parser = argparse.ArgumentParser()
+            parser.add_argument('--num_clusters', type=int)
+            parser.add_argument('--use_random', type=bool, default=False)
+            namespace = parser.parse_args([])
+            for k, v in args.items():
+                setattr(namespace, k, v)
+            args = namespace
+        else:
+            args = parse_arguments()
+
+        config = ClusteringConfigFactory.get_config(args.num_clusters, args.use_random)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            experiment = ClusteringExperiment(
+                config=config,
+                experiment_name=f"clustering_{args.num_clusters}",
+                logger=ExperimentLogger(f"clustering_{args.num_clusters}")
+            )
+            experiment.setup()
+            return experiment.run()
             
     except Exception as e:
-        logger.log_error(e, "Error in main execution")
+        logging.error(f"Error in clustering experiment: {str(e)}", exc_info=True)
         raise
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from typing import Dict, List, Any, Tuple, Optional
 from datetime import datetime
 from tqdm import tqdm
 import argparse
+import warnings
 
 # Add project root to system path
 project_root = str(Path(__file__).parent.parent.parent)
@@ -352,6 +353,7 @@ def parse_arguments():
     return parser.parse_args()
 
 def main(args=None):
+    """Main entry point with silent execution."""
     try:
         if isinstance(args, dict):
             parser = argparse.ArgumentParser()
@@ -367,14 +369,16 @@ def main(args=None):
             args = parse_arguments()
 
         config = BaselineConfigFactory.get_config_for_retriever(args.retriever)
-        experiment = BaselineExperiment(
-            config=config,
-            experiment_name=f"baseline_{args.retriever}",
-            retriever_type=args.retriever
-        )
-        experiment.setup()
-        return experiment.run()
-        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            experiment = BaselineExperiment(
+                config=config,
+                experiment_name=f"baseline_{args.retriever}",
+                retriever_type=args.retriever
+            )
+            experiment.setup()
+            return experiment.run()
+            
     except Exception as e:
         logging.error(f"Error in baseline experiment: {str(e)}", exc_info=True)
         raise

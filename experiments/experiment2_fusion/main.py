@@ -6,6 +6,9 @@ from typing import Dict, List, Any, Tuple, Optional
 from datetime import datetime
 from tqdm import tqdm
 import argparse
+import json
+import warnings
+import logging
 
 # Add project root to system path
 project_root = str(Path(__file__).parent.parent.parent)
@@ -232,51 +235,58 @@ class FusionExperiment:
             
         self.logger.experiment_logger.info(f"Saved checkpoint at batch {batch_idx}")
 
-def main():
-    parser = argparse.ArgumentParser(description="Run RAG-Fusion experiment")
+def parse_arguments():
+    """Parse command line arguments for fusion experiment."""
+    parser = argparse.ArgumentParser(description="Run fusion experiment")
+    
     parser.add_argument(
-        "--strategy",
+        '--strategy',
         type=str,
         choices=['rrf', 'linear'],
         default='rrf',
-        help="Fusion strategy to use"
+        help='Fusion strategy to use'
     )
     parser.add_argument(
-        "--use_random",
-        action="store_true",
-        help="Whether to include random documents"
+        '--use_random',
+        action='store_true',
+        help='Whether to use random documents'
     )
-    args = parser.parse_args()
-    
-    # Set random seed
-    seed_everything(42)
-    
-    # Create appropriate configuration
-    if args.use_random:
-        config = FusionConfigFactory.get_random_config()
-    elif args.strategy == 'rrf':
-        config = FusionConfigFactory.get_rrf_config()
-    else:
-        config = FusionConfigFactory.get_linear_config()
-    
-    # Initialize logger
-    logger = ExperimentLogger(
-        experiment_name=f"fusion_{args.strategy}",
-        base_log_dir="logs"
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default='experiments/experiment2_fusion/results',
+        help='Output directory for results'
     )
     
+    return parser.parse_args()
+
+def main(args=None):
+    """Main entry point with silent execution for fusion experiment."""
     try:
-        # Run experiment
-        with logger:
+        if isinstance(args, dict):
+            parser = argparse.ArgumentParser()
+            parser.add_argument('--strategy', type=str)
+            parser.add_argument('--use_random', type=bool, default=False)
+            namespace = parser.parse_args([])
+            for k, v in args.items():
+                setattr(namespace, k, v)
+            args = namespace
+        else:
+            args = parse_arguments()
+
+        config = FusionConfigFactory.get_config_for_strategy(args.strategy, args.use_random)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
             experiment = FusionExperiment(
                 config=config,
-                experiment_name=f"fusion_{args.strategy}"
+                experiment_name=f"fusion_{args.strategy}",
+                logger=ExperimentLogger(f"fusion_{args.strategy}")
             )
             experiment.setup()
-            results, metrics = experiment.run()
+            return experiment.run()
             
     except Exception as e:
-        logger.log_error(e, "Error in main execution")
+        logging.error(f"Error in fusion experiment: {str(e)}", exc_info=True)
         raise
 
 if __name__ == "__main__":

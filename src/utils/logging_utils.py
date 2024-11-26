@@ -7,7 +7,7 @@ def setup_experiment_logging(output_dir: Path, experiment_name: str) -> logging.
     log_dir.mkdir(parents=True, exist_ok=True)
     
     logger = logging.getLogger(experiment_name)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     

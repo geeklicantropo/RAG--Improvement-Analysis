@@ -1,4 +1,5 @@
 import torch
+import warnings
 from transformers import (
     AutoConfig, AutoTokenizer, AutoModelForCausalLM, 
     BitsAndBytesConfig, StoppingCriteriaList, StoppingCriteria
@@ -108,22 +109,27 @@ class LLM:
         Returns:
             List[str]: The generated text responses.
         """
-        inputs = self.tokenizer(
-            prompt, 
-            padding=True, 
-            truncation=True, 
-            max_length=self.model_max_length, 
-            return_tensors="pt"
-        ).to(self.device)
-        
-        generated_ids = self.model.generate(
-            **inputs,
-            do_sample=False,
-            max_new_tokens=max_new_tokens,
-            repetition_penalty=1.1,
-            stopping_criteria=self.stopping_criteria,
-            pad_token_id=self.tokenizer.eos_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
-        )
-        return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            
+            inputs = self.tokenizer(
+                prompt, 
+                padding=True, 
+                truncation=True, 
+                max_length=self.model_max_length, 
+                return_tensors="pt"
+            ).to(self.device)
+            
+            with torch.no_grad():
+                generated_ids = self.model.generate(
+                    **inputs,
+                    do_sample=False,
+                    max_new_tokens=max_new_tokens,
+                    repetition_penalty=1.1,
+                    stopping_criteria=self.stopping_criteria,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+                
+            return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 

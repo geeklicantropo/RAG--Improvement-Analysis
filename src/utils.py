@@ -7,6 +7,7 @@ import random
 import argparse
 import numpy as np
 from typing import Dict, List, Optional, Tuple
+import logging
 
 def seed_everything(seed=10):
     random.seed(seed)
@@ -54,28 +55,35 @@ def write_json(data, file_path: str):
 
 def read_corpus_json(data_path: str, subset_to_full_idx_map: Optional[Dict[int, int]] = None) -> List[Dict]:
     """
-    Reads documents from a JSON file, optionally applying a mapping to adjust the indices from a subset to those in the full corpus.
-
+    Reads documents from a JSON file silently, without debug output.
+    
     Args:
         data_path (str): Path to the JSON file containing the corpus documents.
-        subset_to_full_idx_map (Optional[Dict[int, int]]): A mapping from indices in a subset of the corpus
-        to their corresponding indices in the full corpus. This is used to adjust document indices when the dataset 
-        represents a subset of the original corpus. None implies direct reading without adjustments to indices.
-
+        subset_to_full_idx_map (Optional[Dict[int, int]]): Mapping from subset to full corpus indices.
+        
     Returns:
-        List[Dict]: A list of dictionaries, each representing a document in the corpus with an adjusted 'full_corpus_idx' key.
+        List[Dict]: List of corpus documents with adjusted indices.
     """
     corpus = []
-    with open(data_path, "rb") as f:
-        for idx, record in enumerate(ijson.items(f, "item")):
-            # 'full_corpus_idx' is the original position of the document in the corpus
-            if subset_to_full_idx_map and len(subset_to_full_idx_map) != 0:
-                record['full_corpus_idx'] = subset_to_full_idx_map[idx]
-            else:
-                record['full_corpus_idx'] = idx
-            corpus.append(record)
-
-    return corpus
+    try:
+        with open(data_path, "rb") as f:
+            # Use a list comprehension instead of iterative appending to reduce output
+            data = list(ijson.items(f, "item"))
+            
+        # Process all documents at once silently
+        corpus = [
+            {
+                **record,
+                'full_corpus_idx': (subset_to_full_idx_map[idx] if subset_to_full_idx_map 
+                                  else idx)
+            }
+            for idx, record in enumerate(data)
+        ]
+        return corpus
+        
+    except Exception as e:
+        logging.error(f"Error reading corpus from {data_path}: {str(e)}")
+        raise
 
 
 def read_subset_corupus_with_map(

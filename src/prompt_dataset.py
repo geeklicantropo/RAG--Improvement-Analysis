@@ -5,6 +5,7 @@ from typing import List, Tuple, Dict, Any, Optional
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 import logging
+import warnings
 
 import normalize_text
 from normalize_answers import *
@@ -40,26 +41,50 @@ class QueryDataset(Dataset):
                 data = json.load(fin)
             self.process_file_data(data)
         except IOError as e:
-            print(f"Error reading file {self.data_path}: {e}")
+            # Replace print with logging.error
+            logging.error(f"Error reading file {self.data_path}: {e}")
 
     def process_file_data(self, data: List[Dict]):
-        """ Processes each example in the dataset to prepare prompts for the LLM. """  
+        """
+        Processes each example in the dataset to prepare prompts for the LLM.
+        Silent processing with logging at appropriate levels.
+        """
         self.questions = []
         self.example_ids = []
 
-        for example in data:
-            self.example_ids.append(example['example_id'])
-
-            if 'query' in example:
-                question = example['query']
-            elif 'question' in example:
-                question = example['question']
-            else:
-                raise ValueError("No 'query' or 'question' key in example")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
             
-            if self.do_normalize_query:
-                question = normalize_text.normalize(question)
-            self.questions.append(question)
+            for idx, example in enumerate(data):
+                try:
+                    self.example_ids.append(example['example_id'])
+
+                    if 'query' in example:
+                        question = example['query']
+                    elif 'question' in example:
+                        question = example['question']
+                    else:
+                        logging.error(f"Example {idx}: Missing query and question keys")
+                        raise ValueError("No 'query' or 'question' key in example")
+                    
+                    if self.do_normalize_query:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            question = normalize_text.normalize(question)
+                            
+                    self.questions.append(question)
+
+                    # Log progress only occasionally for large datasets
+                    if idx % 1000 == 0 and idx > 0:
+                        logging.debug(f"Processed {idx} examples")
+
+                except Exception as e:
+                    logging.error(f"Error processing example {idx}: {str(e)}")
+                    continue
+
+            # Log final statistics at debug level
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(f"Processing complete: {len(self.example_ids)} examples processed")
 
     def build_qa_prompt(
         self,
