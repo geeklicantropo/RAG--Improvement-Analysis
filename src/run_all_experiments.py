@@ -29,6 +29,46 @@ from experiments.experiment0_baseline.main import BaselineExperiment
 from experiments.experiment0_baseline.config import BaselineConfigFactory, BaselineConfig
 from experiments.experiment0_baseline.utils import save_metrics
 
+import contextlib
+import io
+import warnings
+
+# Add this class before ExperimentPipeline class
+class OutputController:
+    """Controls output during experiment execution"""
+    def __init__(self, logger: ExperimentLogger):
+        self.logger = logger
+        self.stream = io.StringIO()
+        
+    def __enter__(self):
+        # Suppress all warnings
+        warnings.filterwarnings('ignore')
+        
+        # Disable tokenizer parallelism warning
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        
+        # Set logging levels
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+        logging.getLogger("torch").setLevel(logging.ERROR)
+        
+        # Redirect stdout/stderr
+        self.old_stdout = sys.stdout
+        self.old_stderr = sys.stderr
+        sys.stdout = self.stream
+        sys.stderr = self.stream
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Restore stdout/stderr
+        sys.stdout = self.old_stdout
+        sys.stderr = self.old_stderr
+        
+        # Log captured output if there was an error
+        if exc_type is not None:
+            self.logger.log_error(exc_val, "Error output:\n" + self.stream.getvalue())
+        
+        self.stream.close()
+
 class ExperimentPipeline:
     def __init__(self, base_output_dir: str = "experiments"):
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -197,7 +237,7 @@ class ExperimentPipeline:
         return self.run_experiment_batch(configs, 'categories')
 
     def run_experiment_batch(self, configs: List[Dict], experiment_type: str) -> List[Dict]:
-        """Run a batch of experiments with improved error handling."""
+        """Run a batch of experiments with improved error handling and output control."""
         results = []
         
         for config in tqdm(configs, desc=f"Running {experiment_type} experiments"):
@@ -217,8 +257,9 @@ class ExperimentPipeline:
                 experiment_args = config['args'].copy()
                 experiment_args['output_dir'] = str(output_dir)
                 
-                # Run experiment
-                experiment_results = experiment_module.main(experiment_args)
+                # Run experiment with controlled output
+                with OutputController(self.logger):
+                    experiment_results = experiment_module.main(experiment_args)
                 
                 if experiment_results:
                     results_dict, metrics_dict = experiment_results

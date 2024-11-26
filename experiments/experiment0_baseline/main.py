@@ -13,7 +13,13 @@ project_root = str(Path(__file__).parent.parent.parent)
 sys.path.append(project_root)
 
 from src.experiment_logger import ExperimentLogger
-from src.utils import seed_everything
+from src.utils import (
+    seed_everything, 
+    read_pickle,
+    read_corpus_json,
+    read_test_corpus_with_random_and_bm25,
+    read_corpus_with_contriever
+)
 from src.llm import LLM
 from src.prompt_dataset import PromptDataset
 from src.utils import read_corpus_json, read_pickle, write_pickle
@@ -77,39 +83,6 @@ class BaselineExperiment:
             return read_pickle(str(self.config.bm25_results_path))
         else:
             return read_pickle(str(self.config.contriever_results_path))
-
-    def _load_dataset(self) -> PromptDataset:
-        """Load and prepare dataset with proper configuration."""
-        # Load corpus
-        from src.utils import read_corpus_json
-        corpus = read_corpus_json(str(self.config.corpus_path))
-        
-        # Load search results
-        search_results = self._load_search_results()
-        
-        # Prepare dataset arguments
-        dataset_kwargs = {
-            'corpus': corpus,
-            'data_path': str(self.config.train_dataset_path),
-            'tokenizer': self.llm.tokenizer,
-            'max_tokenized_length': self.config.model_max_length - 2,
-            'search_results': search_results,
-            'num_documents_in_context': self.config.num_documents_in_context,
-            'gold_position': self.config.gold_position,
-            'get_documents_without_answer': self.config.get_documents_without_answer,
-            'full_to_subset_idx_map': None  # Add if needed
-        }
-        
-        # Add clustering configuration if enabled
-        if getattr(self.config, 'use_clustering', False):
-            dataset_kwargs.update({
-                'use_clustering': True,
-                'num_clusters': self.config.num_clusters,
-                'cluster_seed': self.config.cluster_seed
-            })
-            
-        # Create and return dataset
-        return PromptDataset(**dataset_kwargs)
 
     def run(self):
         try:
@@ -291,6 +264,75 @@ class BaselineExperiment:
             json.dump(metrics, f, indent=2)
             
         self.logger.experiment_logger.info(f"Saved results to {output_dir}")
+
+    def _load_dataset(self) -> PromptDataset:
+        """Load and prepare dataset with proper configuration."""
+        try:
+            self.logger.log_step_start("Loading dataset")
+            
+            # Load corpus based on retriever type
+            self.logger.experiment_logger.info(f"Loading corpus for {self.retriever_type}")
+            
+            if self.config.use_bm25:
+                self.logger.experiment_logger.info("Using BM25 corpus...")
+                corpus, full_to_subset_idx_map = read_test_corpus_with_random_and_bm25()
+            else:
+                self.logger.experiment_logger.info("Using Contriever corpus...")
+                corpus, full_to_subset_idx_map = read_corpus_with_contriever()
+            
+            self.logger.log_metric("corpus_size", len(corpus))
+            
+            # Load search results based on retriever type
+            self.logger.experiment_logger.info("Loading search results...")
+            
+            if self.config.use_bm25:
+                search_results = read_pickle(str(self.config.bm25_results_path))
+            else:
+                search_results = read_pickle(str(self.config.contriever_results_path))
+                
+            self.logger.log_metric("search_results_size", len(search_results))
+            
+            # Log key configuration parameters
+            self.logger.log_metric("corpus_mapping_size", 
+                                 len(full_to_subset_idx_map) if full_to_subset_idx_map else 0)
+            
+            # Prepare dataset arguments
+            dataset_kwargs = {
+                'corpus': corpus,
+                'data_path': str(self.config.train_dataset_path),
+                'tokenizer': self.llm.tokenizer,
+                'max_tokenized_length': self.config.model_max_length - 2,
+                'search_results': search_results,
+                'num_documents_in_context': self.config.num_documents_in_context,
+                'gold_position': self.config.gold_position,
+                'get_documents_without_answer': self.config.get_documents_without_answer,
+                'full_to_subset_idx_map': full_to_subset_idx_map
+            }
+            
+            # Add clustering configuration if enabled
+            if getattr(self.config, 'use_clustering', False):
+                dataset_kwargs.update({
+                    'use_clustering': True,
+                    'num_clusters': self.config.num_clusters,
+                    'cluster_seed': self.config.cluster_seed
+                })
+            
+            # Log dataset configuration
+            self.logger.log_metric("dataset_config", {
+                k: str(v) if isinstance(v, Path) else v
+                for k, v in dataset_kwargs.items()
+            })
+            
+            # Create dataset
+            dataset = PromptDataset(**dataset_kwargs)
+            self.logger.experiment_logger.info(f"Created dataset with {len(dataset)} samples")
+            
+            self.logger.log_step_end("Loading dataset")
+            return dataset
+            
+        except Exception as e:
+            self.logger.log_error(e, "Error loading dataset")
+            raise
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run baseline experiments")

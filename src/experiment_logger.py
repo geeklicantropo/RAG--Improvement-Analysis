@@ -11,43 +11,62 @@ import torch
 from tqdm import tqdm
 
 class ExperimentLogger:
-    """
-    A comprehensive logger for RAG experiments that handles both console and file logging,
-    progress tracking, and resource monitoring.
-    """
-    def __init__(
-        self,
-        experiment_name: str,
-        base_log_dir: str = "logs",
-        console_level: int = logging.INFO,
-        file_level: int = logging.DEBUG
-    ):
-        self.experiment_name = experiment_name
-        self.start_time = time.time()
+    _instances = {}  # Class variable to store instances
+    
+    def __new__(cls, experiment_name: str, base_log_dir: str = "logs"):
+        # Create singleton instance per experiment name
+        if experiment_name not in cls._instances:
+            cls._instances[experiment_name] = super().__new__(cls)
+        return cls._instances[experiment_name]
         
-        # Setup log directories
-        self.experiment_log_dir = os.path.join(base_log_dir, "experiment_logs", experiment_name)
-        self.system_log_dir = os.path.join(base_log_dir, "system_logs")
-        Path(self.experiment_log_dir).mkdir(parents=True, exist_ok=True)
-        Path(self.system_log_dir).mkdir(parents=True, exist_ok=True)
-
-        # Create loggers
-        self.experiment_logger = self._setup_logger(
-            f"{experiment_name}_experiment",
-            os.path.join(self.experiment_log_dir, f"{experiment_name}_{self._get_timestamp()}.log"),
-            console_level,
-            file_level
-        )
+    def __init__(self, experiment_name: str, base_log_dir: str = "logs"):
+        # Only initialize if this is a new instance
+        if not hasattr(self, 'initialized'):
+            self.experiment_name = experiment_name
+            self.start_time = time.time()
+            
+            # Setup log directories
+            self.experiment_log_dir = os.path.join(base_log_dir, "experiment_logs", experiment_name)
+            self.system_log_dir = os.path.join(base_log_dir, "system_logs")
+            Path(self.experiment_log_dir).mkdir(parents=True, exist_ok=True)
+            Path(self.system_log_dir).mkdir(parents=True, exist_ok=True)
+            
+            # Initialize loggers only once
+            self.experiment_logger = self._get_logger(
+                f"{experiment_name}_experiment",
+                os.path.join(self.experiment_log_dir, f"{experiment_name}_{self._get_timestamp()}.log")
+            )
+            self.system_logger = self._get_logger(
+                f"{experiment_name}_system",
+                os.path.join(self.system_log_dir, f"{experiment_name}_system_{self._get_timestamp()}.log")
+            )
+            
+            self.metrics = {}
+            self.initialized = True
+            
+    def _get_logger(self, name: str, log_file: str) -> logging.Logger:
+        """Get or create logger with proper configuration."""
+        logger = logging.getLogger(name)
         
-        self.system_logger = self._setup_logger(
-            f"{experiment_name}_system",
-            os.path.join(self.system_log_dir, f"{experiment_name}_system_{self._get_timestamp()}.log"),
-            console_level,
-            file_level
-        )
-
-        # Initialize metrics storage
-        self.metrics: Dict[str, Any] = {}
+        # Only add handlers if logger doesn't have any
+        if not logger.handlers:
+            logger.setLevel(logging.DEBUG)
+            
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            
+            # Add console handler
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(formatter)
+            logger.addHandler(console_handler)
+            
+            # Add file handler
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            
+        return logger
         
     def _get_timestamp(self) -> str:
         """Generate a timestamp string."""
