@@ -24,6 +24,7 @@ class ExperimentLogger:
         if not hasattr(self, 'initialized'):
             self.experiment_name = experiment_name
             self.start_time = time.time()
+            self.step_start_times = {}
             
             # Setup log directories
             self.experiment_log_dir = os.path.join(base_log_dir, "experiment_logs", experiment_name)
@@ -183,15 +184,21 @@ class ExperimentLogger:
             #self.experiment_logger.debug(f"{metric_name}: {value}")
             self.experiment_logger.debug(f"{metric_name}")
 
-    def log_step_start(self, step_name: str):
-        """Log step start with minimal output."""
+    def log_step_start(self, step_name: str) -> float:
+        """Log step start with timing."""
+        start_time = time.time()
+        self.step_start_times[step_name] = start_time
         self.experiment_logger.info(f"Starting: {step_name}")
-        return time.time()
+        return start_time
 
-    def log_step_end(self, step_name: str, start_time: float):
+    def log_step_end(self, step_name: str, start_time: Optional[float] = None) -> None:
         """Log step completion with timing."""
+        if start_time is None:
+            start_time = self.step_start_times.get(step_name, time.time())
+        
         duration = time.time() - start_time
         self.experiment_logger.info(f"Completed: {step_name} ({duration:.2f}s)")
+        self.step_start_times.pop(step_name, None)
 
     def save_metrics(self):
         """Save metrics to file without console output."""

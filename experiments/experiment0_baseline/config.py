@@ -16,6 +16,7 @@ class BaselineConfig:
     use_bm25: bool = False
     use_adore: bool = False
     normalize_embeddings: bool = False
+    use_test: bool = False
     
     # Document Configuration
     num_documents_in_context: int = 5
@@ -24,16 +25,8 @@ class BaselineConfig:
     
     # Random Document Configuration
     use_random: bool = False
+    random_doc_percentage: float = 0.4  # Support random docs
 
-    # Clustering Configuration (New)
-    use_clustering: bool = False
-    num_clusters: Optional[int] = None
-    cluster_seed: int = 42
-
-    # Experimental Features
-    use_fusion: bool = False
-    use_categories: bool = False
-    
     # Data Paths
     base_data_dir: Path = Path("data")
     processed_dir: Path = base_data_dir / "processed"
@@ -57,13 +50,27 @@ class BaselineConfig:
         return self.base_data_dir / "test_dataset.json"
     
     @property
+    def data_path(self) -> Path:
+        """Get appropriate dataset path based on configuration."""
+        if self.use_test:
+            return self.test_dataset_path
+        return self.train_dataset_path
+
+    @property 
     def search_results_path(self) -> Path:
-        if self.use_random:
-            return self.base_data_dir / "10k_random_results_at60.pkl"
-        elif self.use_adore:
-            return self.base_data_dir / "adore_search_results_at200.pkl"
+        """Get appropriate search results based on configuration."""
+        if self.use_test:
+            if self.use_bm25:
+                return self.base_data_dir / "bm25_test_search_results_at250.pkl"
+            return self.base_data_dir / "contriever_test_search_results_at150.pkl"
         else:
+            if self.use_bm25:
+                return self.base_data_dir / "bm25_search_results_at150.pkl"
             return self.base_data_dir / "contriever_search_results_at150.pkl"
+    
+    # Output Configuration
+    output_dir: Path = Path("experiments/experiment0_baseline/results")
+    save_every: int = 250
         
     @property
     def contriever_results_path(self) -> Path:
@@ -93,7 +100,7 @@ class BaselineConfig:
         if self.gold_position is not None:
             if self.gold_position < 0 or self.gold_position >= self.num_documents_in_context:
                 raise ValueError("gold_position must be within document context range")
-                
+            
         # Validate file existence
         if not self.corpus_path.exists():
             raise ValueError(f"Corpus file not found: {self.corpus_path}")
@@ -121,6 +128,7 @@ class BaselineConfig:
                 config_dict[key] = Path(value)
         return cls(**config_dict)   
 
+
 # Default configurations for different scenarios
 class BaselineConfigFactory:
     @staticmethod 
@@ -129,7 +137,7 @@ class BaselineConfigFactory:
         if retriever_type == 'contriever':
             return BaselineConfigFactory.get_contriever_config()
         elif retriever_type == 'bm25':
-            return BaselineConfigFactory.get_bm25_config() 
+            return BaselineConfigFactory.get_bm25_config()
         elif retriever_type == 'random':
             return BaselineConfigFactory.get_random_config()
         else:
@@ -142,7 +150,8 @@ class BaselineConfigFactory:
             use_bm25=False,
             normalize_embeddings=True,
             num_documents_in_context=7,
-            get_documents_without_answer=True
+            get_documents_without_answer=True,
+            use_test=False
         )
     
     @staticmethod
@@ -151,7 +160,8 @@ class BaselineConfigFactory:
         return BaselineConfig(
             use_bm25=True,
             num_documents_in_context=7,
-            get_documents_without_answer=True
+            get_documents_without_answer=True,
+            use_test=True  # BM25 results are only available for test set
         )
     
     @staticmethod
@@ -160,6 +170,7 @@ class BaselineConfigFactory:
         return BaselineConfig(
             use_random=True,
             random_doc_percentage=0.4,
-            num_documents_in_context=7,
-            get_documents_without_answer=True
+            num_documents_in_context=7, 
+            get_documents_without_answer=True,
+            use_test=False
         )

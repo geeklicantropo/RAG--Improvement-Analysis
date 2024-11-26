@@ -146,3 +146,15 @@ class FusionConfigFactory:
             random_doc_ratio=0.3
         )
         return config
+    
+    @staticmethod
+    def get_config_for_strategy(strategy: str, use_random: bool = False) -> 'FusionConfig':
+        """Get configuration for specified fusion strategy."""
+        if strategy == 'rrf':
+            if use_random:
+                return FusionConfigFactory.get_random_config()
+            return FusionConfigFactory.get_rrf_config()
+        elif strategy == 'linear':
+            return FusionConfigFactory.get_linear_config()
+        else:
+            raise ValueError(f"Unknown fusion strategy: {strategy}")

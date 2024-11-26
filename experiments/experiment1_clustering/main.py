@@ -30,9 +30,12 @@ from src.retriever import Retriever
 class ClusteringExperiment:
     """Implements experiment workflow for testing K-means clustering impact on RAG systems."""
     
-    def __init__(self, config: ClusteringConfig, logger: ExperimentLogger):
+    def __init__(self, config: ClusteringConfig, logger: Optional[ExperimentLogger] = None):
         self.config = config
-        self.logger = logger
+        self.logger = logger or ExperimentLogger(
+            experiment_name=f"clustering_{config.num_clusters}clusters",
+            base_log_dir="logs"
+        )
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # Initialize core components

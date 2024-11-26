@@ -152,3 +152,15 @@ class CategoriesConfigFactory:
             random_doc_ratio=0.3,
             random_doc_category="supplementary"
         )
+    
+    @staticmethod
+    def get_config_for_type(config_type: str) -> 'CategoriesConfig':
+        """Get configuration for specified category type."""
+        if config_type == 'confidence':
+            return CategoriesConfigFactory.get_confidence_based_config()
+        elif config_type == 'fusion':
+            return CategoriesConfigFactory.get_fusion_based_config() 
+        elif config_type == 'random':
+            return CategoriesConfigFactory.get_random_augmented_config()
+        else:
+            raise ValueError(f"Unknown category type: {config_type}")

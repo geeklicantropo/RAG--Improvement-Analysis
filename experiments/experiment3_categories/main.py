@@ -14,13 +14,15 @@ import json
 project_root = str(Path(__file__).parent.parent.parent)
 sys.path.append(project_root)
 
+from src.utils import read_corpus_json
+
 from src.experiment_logger import ExperimentLogger
 from src.utils import seed_everything
 from src.llm import LLM
 from src.prompt_dataset import PromptDataset
 from src.rag_fusion_utils import RAGFusionRanker
 from .config import CategoriesConfig, CategoriesConfigFactory
-from utils import CategoriesExperimentUtils
+from .utils import CategoriesExperimentUtils
 
 class CategoriesExperiment:
     """
@@ -83,30 +85,39 @@ class CategoriesExperiment:
             raise
             
     def _load_dataset(self) -> PromptDataset:
-        """Load and prepare dataset with categorized documents."""
-        # Load corpus
-        from src.utils import read_corpus_json
-        corpus = read_corpus_json(str(self.config.corpus_path))
-        
-        # Prepare search results
-        if self.config.use_fusion:
-            search_results = self.fusion_ranker.fuse_search_results(
-                self.retriever_results
+        """Load and prepare dataset with safe corpus handling."""
+        try:
+            # Load corpus
+            corpus = read_corpus_json(str(self.config.corpus_path))
+            
+            # Load or perform fusion on search results
+            if self.config.use_fusion:
+                search_results = self.fusion_ranker.fuse_search_results(self.retriever_results)
+                
+                # Validate corpus indices
+                max_idx = len(corpus) - 1
+                filtered_results = []
+                for doc_ids, scores in search_results:
+                    valid_ids = [idx for idx in map(int, doc_ids) if 0 <= idx <= max_idx]
+                    if valid_ids:
+                        filtered_results.append((valid_ids, scores[:len(valid_ids)]))
+                    else:
+                        filtered_results.append(([], []))
+                search_results = filtered_results
+            else:
+                search_results = self.retriever_results['contriever']
+            
+            return PromptDataset(
+                corpus=corpus,
+                data_path=str(self.config.train_dataset_path),
+                tokenizer=self.llm.tokenizer,
+                max_tokenized_length=self.config.model_max_length - 2,
+                search_results=search_results,
+                category_info={'score_thresholds': self.config.score_thresholds}
             )
-        else:
-            search_results = self.retriever_results['contriever']
-        
-        return PromptDataset(
-            corpus=corpus,
-            data_path=str(self.config.train_dataset_path),
-            tokenizer=self.llm.tokenizer,
-            max_tokenized_length=self.config.model_max_length - 2,
-            search_results=search_results,
-            category_info={
-                'score_thresholds': self.config.score_thresholds,
-                'max_docs_per_category': self.config.max_docs_per_category
-            }
-        )
+        except Exception as e:
+            self.logger.log_error(e, "Error loading dataset")
+            raise
     
     def run(self):
         """Run the categories experiment."""

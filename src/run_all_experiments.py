@@ -3,112 +3,84 @@ import sys
 from pathlib import Path
 import argparse
 from datetime import datetime
-import subprocess
-from tqdm import tqdm
-import pandas as pd
-import importlib
-import json
-from typing import Dict, List, Any
-import logging
-import contextlib
-import io
+import time
 import warnings
+import logging
+from typing import Dict, List, Any, Optional
+from tqdm import tqdm
+import json
+import pandas as pd
 
+# Ensure project root is in path
 project_root = Path(__file__).parent.parent
-sys.path.extend([
-    str(project_root),
-    str(project_root / "experiments"),
-    str(project_root / "experiments/plotting")
-])
+sys.path.extend([str(project_root)])
 
+# Import experiment modules
+from experiments.experiment0_baseline.main import BaselineExperiment
+from experiments.experiment0_baseline.config import BaselineConfigFactory
+from experiments.experiment1_clustering.main import ClusteringExperiment
+from experiments.experiment1_clustering.config import ClusteringConfig
+from experiments.experiment2_fusion.main import FusionExperiment
+from experiments.experiment2_fusion.config import FusionConfigFactory
+from experiments.experiment3_categories.main import CategoriesExperiment
+from experiments.experiment3_categories.config import CategoriesConfigFactory
+
+# Import plotting utilities
 from experiments.plotting.plot_baseline import BaselinePlotter 
 from experiments.plotting.plot_clustering import ClusteringPlotter
 from experiments.plotting.plot_fusion import FusionPlotter
 from experiments.plotting.plot_categories import CategoriesPlotter
-from setup_experiments import ExperimentSetup
-from experiment_logger import ExperimentLogger
 
-from experiments.experiment0_baseline.main import BaselineExperiment
-from experiments.experiment0_baseline.config import BaselineConfigFactory, BaselineConfig
-from experiments.experiment0_baseline.utils import save_metrics
-
-from experiments.experiment1_clustering.main import ClusteringExperiment
-from experiments.experiment1_clustering.config import ClusteringConfig
-#from experiments.experiment1_clustering.utils import ClusteringExperimentUtils
-
-from experiments.experiment2_fusion.main import FusionExperiment
-from experiments.experiment2_fusion.config import FusionConfigFactory, FusionConfig
-from experiments.experiment2_fusion.utils import FusionExperimentUtils
-
-#from experiments.experiment3_categories.main import CategoriesExperiment
-from experiments.experiment3_categories.config import CategoriesConfigFactory, CategoriesConfig
-from experiments.experiment3_categories.utils import CategoriesExperimentUtils
+# Import utilities
+from src.setup_experiments import ExperimentSetup
+from src.experiment_logger import ExperimentLogger
 
 class OutputController:
-    """Enhanced output controller with strict filtering"""
+    """Controls and filters experiment output."""
     def __init__(self, logger: ExperimentLogger):
         self.logger = logger
-        self.stream = io.StringIO()
         self.output_buffer = []
         self.buffer_size = 100
-        self.last_progress_update = 0
-        self.min_progress_interval = 1.0  # seconds
+        self.min_progress_interval = 1.0
         
     def write(self, text: str):
-        """Write to buffer with enhanced filtering."""
+        """Write filtered output to buffer."""
         if self._should_log(text):
             self.output_buffer.append(text)
             if len(self.output_buffer) >= self.buffer_size:
                 self.flush()
     
     def _should_log(self, text: str) -> bool:
-        """More aggressive filter function to determine if text should be logged."""
-        # Skip empty or whitespace-only lines
+        """Determine if text should be logged."""
         if not text.strip():
             return False
             
-        # Skip long text content (like corpus entries)
-        if len(text) > 300:  # More restrictive length threshold
+        if len(text) > 300:
             return False
             
-        # Expanded skip patterns
         skip_patterns = [
-            # Original patterns
-            'token indices sequence length is longer than',
+            'token indices sequence',
             'Setting `pad_token_id`',
-            'You are using',
             'Special tokens have been added',
-            'full_corpus_idx',
-            'title',
-            '_idx',
-            'corpus',
-            # Additional patterns
+            'Using device:',
+            'corpus_idx',
             'Document [',
-            'text',
-            'idx:',
-            'question',
-            'answer',
-            'retriever',
             'embedding',
-            'loading',
-            'processing',
-            'computing',
-            'creating'
+            'processing batch',
+            'tokenizer'
         ]
         
-        if any(pattern.lower() in text.lower() for pattern in skip_patterns):
+        if any(pattern in text.lower() for pattern in skip_patterns):
             return False
             
-        # Only allow specific patterns
         allow_patterns = [
-            '%|',  # tqdm progress bar
+            '%|',  # tqdm progress
             'Error:',
             'WARNING:',
             'Running experiment',
             'Completed experiment',
-            'Starting',
             'Progress:',
-            'Finished'
+            'Accuracy:'
         ]
         
         return any(pattern in text for pattern in allow_patterns)
@@ -118,7 +90,6 @@ class OutputController:
         if self.output_buffer:
             output = ''.join(self.output_buffer)
             if output.strip():
-                # Only log important messages at INFO level
                 if any(('Error:' in line or 'WARNING:' in line) for line in self.output_buffer):
                     self.logger.experiment_logger.warning(output)
                 else:
@@ -126,77 +97,68 @@ class OutputController:
             self.output_buffer.clear()
     
     def __enter__(self):
-        # Suppress all warnings and debug output
+        """Set up output capturing."""
         warnings.filterwarnings('ignore')
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         
-        # Set strict logging levels
-        for logger_name in [
-            "transformers", 
-            "torch", 
-            "faiss", 
-            "datasets", 
-            "numpy",
-            "pytorch_lightning",
-            "accelerate"
-        ]:
+        for logger_name in ["transformers", "torch", "pytorch_lightning"]:
             logging.getLogger(logger_name).setLevel(logging.ERROR)
         
-        # Flush existing output
         sys.stdout.flush()
         sys.stderr.flush()
         
-        # Save original stdout/stderr
         self.old_stdout = sys.stdout
         self.old_stderr = sys.stderr
-        
-        # Replace with our controller
         sys.stdout = self
         sys.stderr = self
         return self
         
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # Restore original stdout/stderr
+        """Restore original output streams."""
         sys.stdout = self.old_stdout
         sys.stderr = self.old_stderr
-        
-        # Final flush
         self.flush()
         
-        # Log any errors
         if exc_type is not None:
             self.logger.log_error(exc_val, "Error output:\n" + '\n'.join(self.output_buffer))
 
 class ExperimentPipeline:
+    """Manages the execution of all experiments."""
     def __init__(self, base_output_dir: str = "experiments"):
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.base_output_dir = Path(base_output_dir)
         self.results_dir = self.base_output_dir / "results" / self.timestamp
         self.plots_dir = self.results_dir / "plots"
         self.setup = ExperimentSetup()
+        
+        # Initialize logger
         self.logger = ExperimentLogger(
             experiment_name=f"experiment_pipeline_{self.timestamp}",
             base_log_dir="logs"
         )
+        
+        # Initialize output controller
+        self.output_controller = OutputController(self.logger)
+        
+        # Configure experiments
         self.experiment_dir_mapping = {
             'baseline': 'experiment0_baseline',
             'clustering': 'experiment1_clustering',
             'fusion': 'experiment2_fusion', 
             'categories': 'experiment3_categories'
         }
+        
         self.enabled_experiments = {
             'baseline': True,
             'clustering': True,
             'fusion': True,
             'categories': True
         }
-        self.plotting_enabled = True
         
-        # Initialize output controller
-        self.output_controller = OutputController(self.logger)
+        self.plotting_enabled = True
 
     def set_experiment_flags(self, flags: Dict[str, bool]):
-        """Set which experiments to run."""
+        """Configure which experiments to run."""
         self.enabled_experiments.update(flags)
         self.logger.log_metric("enabled_experiments", self.enabled_experiments)
 
@@ -205,146 +167,51 @@ class ExperimentPipeline:
         self.plotting_enabled = enabled
         self.logger.log_metric("plotting_enabled", enabled)
 
-    @contextlib.contextmanager
-    def managed_execution(self):
-        """Context manager for controlled experiment execution."""
-        with self.output_controller:
-            with self.logger:
-                try:
-                    yield
-                except Exception as e:
-                    self.logger.log_error(e, "Experiment execution failed")
-                    raise
-
     def run_pipeline(self):
-        """Run the experiment pipeline with enhanced output control."""
-        with self.managed_execution():
+        """Execute all enabled experiments."""
+        with self.output_controller:
+            start_time = time.time()
             self.logger.log_step_start("Initializing experiment pipeline")
             
+            # Perform setup
             if not self.setup.setup():
                 self.logger.log_error(None, "Setup failed")
                 return
             
+            # Create output directories
             self.results_dir.mkdir(parents=True, exist_ok=True)
             if self.plotting_enabled:
                 self.plots_dir.mkdir(parents=True, exist_ok=True)
 
             results = {}
             
-            # Run each enabled experiment type
+            # Run enabled experiments
             for exp_type in self.enabled_experiments:
                 if self.enabled_experiments[exp_type]:
+                    exp_start = time.time()
                     self.logger.log_step_start(f"Running {exp_type} experiments")
                     run_method = getattr(self, f"run_{exp_type}_experiments")
                     results[exp_type] = run_method()
                     
-                    # Plot results if enabled
+                    # Generate plots if enabled
                     if self.plotting_enabled:
                         plotter_class = globals()[f"{exp_type.capitalize()}Plotter"]
                         plotter = plotter_class(self.results_dir)
                         plotter.plot_results(results[exp_type])
+                    
+                    self.logger.log_step_end(f"Running {exp_type} experiments", exp_start)
             
+            # Generate and save report
             self.generate_report(results)
-            self.logger.log_step_end("Pipeline execution completed")
-
-    # Running experimments methods
-    def run_baseline_experiments(self) -> List[Dict]:
-        configs = [
-            {
-                'command': f'{sys.executable} {project_root}/experiments/experiment0_baseline/main.py',
-                'args': {
-                    'retriever': 'contriever',
-                    'gold_position': None,
-                    'num_documents': 7
-                },
-                'description': 'Baseline-Contriever'
-            },
-            {
-                'command': f'{sys.executable} {project_root}/experiments/experiment0_baseline/main.py',
-                'args': {
-                    'retriever': 'bm25',
-                    'gold_position': None,
-                    'num_documents': 7
-                },
-                'description': 'Baseline-BM25'
-            },
-            {
-                'command': f'{sys.executable} {project_root}/experiments/experiment0_baseline/main.py',
-                'args': {
-                    'retriever': 'contriever',
-                    'use_random': True,
-                    'num_documents': 7
-                },
-                'description': 'Baseline-Random'
-            }
-        ]
-        return self.run_experiment_batch(configs, 'baseline')
-
-    def run_clustering_experiments(self) -> List[Dict]:
-        configs = [
-            {
-                'command': f'{sys.executable} {project_root}/experiments/experiment1_clustering/main.py',
-                'args': {
-                    'num_clusters': k,
-                    'use_random': False
-                },
-                'description': f'Clustering-{k}Clusters'
-            }
-            for k in [3, 5, 7]
-        ]
-        configs.append({
-            'command': f'{sys.executable} {project_root}/experiments/experiment1_clustering/main.py',
-            'args': {
-                'num_clusters': 5,
-                'use_random': True
-            },
-            'description': 'Clustering-Random'
-        })
-        return self.run_experiment_batch(configs, 'clustering')
-
-    def run_fusion_experiments(self) -> List[Dict]:
-        configs = [
-            {
-                'command': f'{sys.executable} {project_root}/experiments/experiment2_fusion/main.py',
-                'args': {
-                    'strategy': strategy,
-                    'use_random': False
-                },
-                'description': f'Fusion-{strategy}'
-            }
-            for strategy in ['rrf', 'linear']
-        ]
-        configs.append({
-            'command': f'{sys.executable} {project_root}/experiments/experiment2_fusion/main.py',
-            'args': {
-                'strategy': 'rrf',
-                'use_random': True
-            },
-            'description': 'Fusion-Random'
-        })
-        return self.run_experiment_batch(configs, 'fusion')
-
-    def run_categories_experiments(self) -> List[Dict]:
-        configs = [
-            {
-                'command': f'{sys.executable} {project_root}/experiments/experiment3_categories/main.py',
-                'args': {
-                    'config_type': config_type
-                },
-                'description': f'Categories-{config_type.capitalize()}'
-            }
-            for config_type in ['confidence', 'fusion', 'random']
-        ]
-        return self.run_experiment_batch(configs, 'categories')
+            self.logger.log_step_end("Pipeline execution completed", start_time)
 
     def run_experiment_batch(self, configs: List[Dict], experiment_type: str) -> List[Dict]:
-        """Run a batch of experiments with enhanced output control."""
+        """Run a batch of experiments of the same type."""
         results = []
         
-        # Remove the OutputController here since we already have it in managed_execution
-        for config in tqdm(configs, desc=f"Running {experiment_type} experiments", 
-                        file=sys.stderr):
+        for config in tqdm(configs, desc=f"Running {experiment_type} experiments"):
             try:
+                # Prepare output directory
                 output_dir = self.results_dir / experiment_type / config['description']
                 output_dir.mkdir(parents=True, exist_ok=True)
                 
@@ -352,9 +219,9 @@ class ExperimentPipeline:
                 experiment_args = config['args'].copy()
                 experiment_args['output_dir'] = str(output_dir)
                 
-                # Run experiment without additional output control
+                # Import and run experiment
                 module_path = f"experiments.{self.experiment_dir_mapping[experiment_type]}.main"
-                experiment_module = importlib.import_module(module_path)
+                experiment_module = __import__(module_path, fromlist=['main'])
                 experiment_results = experiment_module.main(experiment_args)
                 
                 if experiment_results:
@@ -364,13 +231,10 @@ class ExperimentPipeline:
                     )
                     results.append(result)
                     
-                    # Only log essential information
                     self.logger.experiment_logger.info(
                         f"Completed {config['description']} with "
                         f"accuracy: {metrics_dict.get('accuracy', 0):.4f}"
                     )
-                else:
-                    raise ValueError(f"No results from {config['description']}")
                     
             except Exception as e:
                 self.logger.log_error(e, f"Error in {config['description']}")
@@ -402,7 +266,6 @@ class ExperimentPipeline:
             'success': True
         }
         
-        # Save individual results
         results_file = output_dir / 'experiment_results.json'
         with open(results_file, 'w') as f:
             json.dump(result, f, indent=2)
@@ -414,8 +277,8 @@ class ExperimentPipeline:
         
         return result
 
-    # Your existing generate_report method remains unchanged
     def generate_report(self, all_results: Dict[str, List[Dict]]):
+        """Generate comprehensive experiment report."""
         report_path = self.results_dir / "report.md"
         
         experiment_metrics = {}
@@ -426,7 +289,8 @@ class ExperimentPipeline:
                     metrics = r['metrics'].copy()
                     metrics['experiment'] = r['config']['description']
                     exp_metrics.append(metrics)
-            experiment_metrics[exp_type] = pd.DataFrame(exp_metrics)
+            if exp_metrics:  # Only create DataFrame if there are valid metrics
+                experiment_metrics[exp_type] = pd.DataFrame(exp_metrics)
             
         with open(report_path, 'w') as f:
             f.write(f"# Experiment Results Report\n")
@@ -449,18 +313,107 @@ class ExperimentPipeline:
                 f.write(metrics_df.to_string())
                 f.write("\n\n")
 
-# Parser
-def str2bool(v: str) -> bool:
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
-    else:
-        raise argparse.ArgumentTypeError('Boolean value expected.')
+    # Individual experiment runner methods
+    def run_baseline_experiments(self) -> List[Dict]:
+        """Run baseline experiments."""
+        configs = [
+            {
+                'command': f'{sys.executable} {project_root}/experiments/experiment0_baseline/main.py',
+                'args': {
+                    'retriever': 'contriever',
+                    'gold_position': None,
+                    'num_documents': 7,
+                    'use_test': False
+                },
+                'description': 'Baseline-Contriever'
+            },
+            {
+                'command': f'{sys.executable} {project_root}/experiments/experiment0_baseline/main.py',
+                'args': {
+                    'retriever': 'bm25',
+                    'gold_position': None,
+                    'num_documents': 7,
+                    'use_test': True
+                },
+                'description': 'Baseline-BM25'
+            },
+            {
+                'command': f'{sys.executable} {project_root}/experiments/experiment0_baseline/main.py',
+                'args': {
+                    'retriever': 'contriever',
+                    'use_random': True,
+                    'num_documents': 7,
+                    'use_test': False
+                },
+                'description': 'Baseline-Random'
+            }
+        ]
+        return self.run_experiment_batch(configs, 'baseline')
+
+    def run_clustering_experiments(self) -> List[Dict]:
+        """Run clustering experiments."""
+        configs = [
+            {
+                'command': f'{sys.executable} {project_root}/experiments/experiment1_clustering/main.py',
+                'args': {
+                    'num_clusters': k,
+                    'use_random': False,
+                    'compute_new_embeddings': True
+                },
+                'description': f'Clustering-{k}Clusters'
+            }
+            for k in [3, 5, 7]
+        ]
+        configs.append({
+            'command': f'{sys.executable} {project_root}/experiments/experiment1_clustering/main.py',
+            'args': {
+                'num_clusters': 5,
+                'use_random': True,
+                'compute_new_embeddings': True
+            },
+            'description': 'Clustering-Random'
+        })
+        return self.run_experiment_batch(configs, 'clustering')
+
+    def run_fusion_experiments(self) -> List[Dict]:
+        """Run fusion experiments."""
+        configs = [
+            {
+                'command': f'{sys.executable} {project_root}/experiments/experiment2_fusion/main.py',
+                'args': {
+                    'strategy': strategy,
+                    'use_random': False
+                },
+                'description': f'Fusion-{strategy}'
+            }
+            for strategy in ['rrf', 'linear']
+        ]
+        configs.append({
+            'command': f'{sys.executable} {project_root}/experiments/experiment2_fusion/main.py',
+            'args': {
+                'strategy': 'rrf',
+                'use_random': True
+            },
+            'description': 'Fusion-Random'
+        })
+        return self.run_experiment_batch(configs, 'fusion')
+
+    def run_categories_experiments(self) -> List[Dict]:
+        """Run categorization experiments."""
+        configs = [
+            {
+                'command': f'{sys.executable} {project_root}/experiments/experiment3_categories/main.py',
+                'args': {
+                    'config_type': config_type
+                },
+                'description': f'Categories-{config_type.capitalize()}'
+            }
+            for config_type in ['confidence', 'fusion', 'random']
+        ]
+        return self.run_experiment_batch(configs, 'categories')
 
 def parse_arguments():
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run complete experiment pipeline")
     
     # Directory configurations
@@ -502,12 +455,12 @@ def parse_arguments():
     # Visualization options
     parser.add_argument(
         '--save_plots',
-        type=str2bool,
-        default=True,
+        type=str,
+        default='true',
         help='Whether to generate plots (true/false)'
     )
     
-    # Additional experiment-specific arguments
+    # Experiment-specific configurations
     parser.add_argument(
         '--cluster_sizes',
         nargs='+',
@@ -531,20 +484,25 @@ def parse_arguments():
     )
     
     args = parser.parse_args()
+    
+    # Convert string 'true'/'false' to boolean
+    args.save_plots = args.save_plots.lower() == 'true'
+    
     return args
 
 def main():
     """Main entry point for running all experiments."""
-    args = parse_arguments()
-    
     # Configure logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # Create experiment pipeline
     try:
+        # Parse arguments
+        args = parse_arguments()
+        
+        # Create experiment pipeline
         pipeline = ExperimentPipeline(args.output_dir)
         
         # Configure experiments based on arguments
@@ -556,6 +514,9 @@ def main():
         }
         
         # Update experiment configurations
+        pipeline.set_experiment_flags(experiments_to_run)
+        pipeline.set_plotting_enabled(args.save_plots)
+        
         if not args.skip_clustering:
             pipeline.cluster_sizes = args.cluster_sizes
         if not args.skip_fusion:
@@ -563,13 +524,8 @@ def main():
         if not args.skip_categories:
             pipeline.category_types = args.category_types
             
-        # Configure pipeline
-        pipeline.set_experiment_flags(experiments_to_run)
-        pipeline.set_plotting_enabled(args.save_plots)
-        
-        # Run pipeline with enhanced output control
-        with pipeline.managed_execution():
-            pipeline.run_pipeline()
+        # Run pipeline
+        pipeline.run_pipeline()
             
     except Exception as e:
         logging.error(f"Error in experiment pipeline: {str(e)}", exc_info=True)

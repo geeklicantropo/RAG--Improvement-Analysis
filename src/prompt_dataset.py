@@ -216,6 +216,9 @@ class PromptDataset(Dataset):
         
         # Category organization
         self.category_info = category_info
+
+        # Add preprocessing step before validation and data loading
+        self.preprocess_search_results()
         
         self._validate_initialization_parameters()
         self._load_data()
@@ -413,9 +416,121 @@ class PromptDataset(Dataset):
         self.cluster_assignments.update(new_assignments)
 
     def _get_indices(self, example_idx: int) -> List[int]:
-        """ Get indices in the corpus of the documents retrieved by a retriever. """
+        """
+        Get indices in the corpus of the documents retrieved by a retriever with validation.
+        
+        Args:
+            example_idx: Index of the example in the dataset
+            
+        Returns:
+            List of valid corpus indices
+            
+        Raises:
+            ValueError: If there is an index mismatch or invalid indices
+        """
+        # Validate example index against search results
+        if not self.search_results:
+            raise ValueError("No search results available")
+            
+        if example_idx >= len(self.search_results):
+            raise ValueError(f"Example index {example_idx} out of range for search results of length {len(self.search_results)}")
+
+        # Get search result indices and validate
         indices, scores = self.search_results[example_idx]
-        return indices
+        
+        # Convert to integers and validate corpus bounds
+        try:
+            valid_indices = []
+            max_corpus_idx = len(self.corpus) - 1
+            
+            for idx in indices:
+                corpus_idx = int(idx)  # Convert to int
+                
+                # Handle index mapping if using subset
+                if self.full_to_subset_idx_map is not None:
+                    if corpus_idx not in self.full_to_subset_idx_map:
+                        continue
+                    corpus_idx = self.full_to_subset_idx_map[corpus_idx]
+                    
+                # Validate corpus bounds
+                if 0 <= corpus_idx <= max_corpus_idx:
+                    valid_indices.append(corpus_idx)
+                
+            # Ensure we have enough valid indices
+            if len(valid_indices) < self.num_documents_in_context:
+                # If not enough valid indices, find additional valid indices
+                current_indices = set(valid_indices)
+                additional_needed = self.num_documents_in_context - len(valid_indices)
+                
+                # Find additional valid indices from corpus
+                additional_indices = []
+                for i in range(max_corpus_idx + 1):
+                    if len(additional_indices) >= additional_needed:
+                        break
+                    if i not in current_indices:
+                        additional_indices.append(i)
+                        
+                valid_indices.extend(additional_indices[:additional_needed])
+                
+            return valid_indices[:self.num_documents_in_context]
+            
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid index in search results: {str(e)}")
+        
+    def preprocess_search_results(self) -> bool:
+        """
+        Preprocess and validate search results before dataset creation.
+        
+        Returns:
+            bool: True if preprocessing successful, False otherwise
+            
+        Raises:
+            ValueError: If search results are invalid
+        """
+        if not self.search_results:
+            raise ValueError("No search results available")
+            
+        # Validate format
+        if not all(isinstance(result, tuple) and len(result) == 2 for result in self.search_results):
+            raise ValueError("Invalid search results format")
+            
+        processed_results = []
+        max_corpus_idx = len(self.corpus) - 1
+        
+        for indices, scores in self.search_results:
+            # Validate and convert indices
+            valid_indices = []
+            valid_scores = []
+            
+            for idx, score in zip(indices, scores):
+                try:
+                    corpus_idx = int(idx)
+                    if self.full_to_subset_idx_map is not None:
+                        if corpus_idx not in self.full_to_subset_idx_map:
+                            continue
+                        corpus_idx = self.full_to_subset_idx_map[corpus_idx]
+                            
+                    if 0 <= corpus_idx <= max_corpus_idx:
+                        valid_indices.append(corpus_idx)
+                        valid_scores.append(score)
+                        
+                except (ValueError, TypeError):
+                    continue
+                    
+            # Ensure minimum required indices
+            while len(valid_indices) < self.num_documents_in_context:
+                # Find unused valid index
+                for i in range(max_corpus_idx + 1):
+                    if i not in valid_indices:
+                        valid_indices.append(i)
+                        valid_scores.append(0.0)  # Default score for added indices
+                        break
+                        
+            processed_results.append((valid_indices[:self.num_documents_in_context], 
+                                    valid_scores[:self.num_documents_in_context]))
+                                    
+        self.search_results = processed_results
+        return True
 
     def _insert_gold_document_idx(
         self, 
@@ -455,42 +570,54 @@ class PromptDataset(Dataset):
 
     def _get_documents_from_indices(self, indices: List[int]) -> Tuple[List[str], List[int]]:
         """
-        Selects documents from the corpus based on provided indices and formats them.
-        Handles both full corpus and subsets by mapping indices if necessary.
+        Selects documents from the corpus based on provided indices with robust index handling.
         """
-        formatted_documents = []
-        
-        # Full corpus
-        if self.full_to_subset_idx_map is None:
-            documents_info = [self.corpus[i] for i in map(int, indices)]
-        else: 
-            documents_info: List[Dict] = []
-            # 'indices' are from the full corpus, so we need to map them to the subset
+        try:
+            formatted_documents = []
+            document_indices = []
+            seen_hashes = set()
+            
+            # Validate indices before mapping
+            valid_indices = []
+            max_idx = len(self.corpus) - 1
+            
             for i in map(int, indices):
-                documents_info.append(self.corpus[self.full_to_subset_idx_map[i]])
-        
-        seen_hashes = set()
-        # List to store the indices of documents actually added
-        document_indices = []  
-        for doc_info in documents_info:
-            if len(formatted_documents) == self.num_documents_in_context:
-                break
+                # Handle index mapping if using subset
+                if self.full_to_subset_idx_map is not None:
+                    # Only proceed if index exists in mapping
+                    if i in self.full_to_subset_idx_map:
+                        mapped_idx = self.full_to_subset_idx_map[i]
+                        if 0 <= mapped_idx <= max_idx:
+                            valid_indices.append(mapped_idx)
+                else:
+                    # Direct index validation for full corpus
+                    if 0 <= i <= max_idx:
+                        valid_indices.append(i)
+                        
+            # Process valid indices
+            for idx in valid_indices:
+                doc_info = self.corpus[idx]
+                doc_idx = doc_info.get('full_corpus_idx', idx)
+                title = doc_info.get('title', '')
+                text = doc_info.get('text', '')
+                
+                doc_hash = hash_document(text)
+                if doc_hash in seen_hashes:
+                    continue
+                seen_hashes.add(doc_hash)
+                
+                doc_str = f"Document [{doc_idx}](Title: {title}) {text}"
+                formatted_documents.append(doc_str)
+                document_indices.append(doc_idx)
+                
+                if len(formatted_documents) == self.num_documents_in_context:
+                    break
+                    
+            return formatted_documents, document_indices
             
-            doc_idx = doc_info['full_corpus_idx']
-            title = doc_info['title']
-            text = doc_info['text']
-
-            doc_hash = hash_document(text)
-            # Skip the document if it is a duplicate
-            if doc_hash in seen_hashes:
-                continue
-            seen_hashes.add(doc_hash)
-            
-            doc_str = f"Document [{doc_idx}](Title: {title}) {text}"
-            formatted_documents.append(doc_str)
-            document_indices.append(doc_idx)
-
-        return formatted_documents, document_indices
+        except Exception as e:
+            logging.error(f"Error processing documents: {str(e)}")
+            return [], []
 
     def _get_answerless_documents_from_indices(
         self,
@@ -665,6 +792,7 @@ class MixedDocumentsDataset(PromptDataset):
             # Retrieved documents are reversed ([::-1]), so that the documents with higher scores are at the end
             indices = random_indices[:num_random_documents] + retrieved_indices[:num_retrieved_documents][::-1]
         return indices
+
 
 
 class MultiCorpusDataset(PromptDataset):

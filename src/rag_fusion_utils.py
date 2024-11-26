@@ -1,6 +1,7 @@
 import numpy as np
 from typing import List, Tuple, Dict, Union, Optional
 from tqdm import tqdm
+import logging
 
 class RAGFusionRanker:
     """
@@ -32,6 +33,7 @@ class RAGFusionRanker:
         if strategy not in ["rrf", "linear"]:
             raise ValueError("Invalid fusion strategy. Must be 'rrf' or 'linear'.")
 
+
     def normalize_score_list(
         self, 
         scores: List[float], 
@@ -58,7 +60,27 @@ class RAGFusionRanker:
             return [1.0] * len(scores)
             
         return [(score - min_score) / (max_score - min_score) for score in scores]
-
+    
+    def reciprocal_rank_fusion(self, results_list: List[Tuple[List[str], List[float]]]) -> List[Tuple[List[str], List[float]]]:
+        """Implement reciprocal rank fusion."""
+        fused_results = []
+        
+        for query_results in zip(*results_list):
+            fused_scores = {}
+            for rank, (doc_id, score) in enumerate(query_results):
+                fused_score = 1 / (rank + self.k)
+                if doc_id in fused_scores:
+                    fused_scores[doc_id] += fused_score
+                else:
+                    fused_scores[doc_id] = fused_score
+                    
+            # Sort by fused scores
+            sorted_results = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+            doc_ids, scores = zip(*sorted_results)
+            fused_results.append((list(doc_ids), list(scores)))
+            
+        return fused_results
+    
     def _compute_rrf_scores(
         self, 
         doc_ranks: Dict[str, int]
@@ -78,70 +100,66 @@ class RAGFusionRanker:
             rrf_score += weight * (1.0 / (self.k + rank))
         return rrf_score
 
-    def fuse_search_results(
-        self,
-        retriever_results: Dict[str, List[Tuple[List[str], List[float]]]]
-    ) -> List[Tuple[List[str], List[float]]]:
+    def fuse_search_results(self, retriever_results: Dict[str, List[Tuple[List[str], List[float]]]]) -> List[Tuple[List[str], List[float]]]:
         """
-        Fuse search results from multiple retrievers into a single ranked list.
-        
-        Args:
-            retriever_results: Dictionary mapping retriever names to their search results
-                             Each result is a tuple of (doc_ids, scores)
-                             
-        Returns:
-            Combined and reranked results as (doc_ids, scores) tuples
+        Safely fuse search results with validation.
         """
-        fused_results = []
-        
-        for query_idx in tqdm(range(len(next(iter(retriever_results.values())))), desc="Fusing results"):
-            # Gather results for this query from all retrievers
-            query_results = {
-                name: results[query_idx] 
-                for name, results in retriever_results.items()
-            }
+        try:
+            # Validate input format
+            if not isinstance(retriever_results, dict):
+                raise ValueError("Retriever results must be a dictionary")
+                
+            for name, results in retriever_results.items():
+                if not isinstance(results, list):
+                    raise ValueError(f"Results for {name} must be a list")
+                if not results:
+                    raise ValueError(f"Empty results for {name}")
+                
+                # Validate format of each result
+                for result in results:
+                    if not isinstance(result, tuple) or len(result) != 2:
+                        raise ValueError(f"Invalid result format for {name}")
+                    doc_ids, scores = result
+                    if not isinstance(doc_ids, list) or not isinstance(scores, list):
+                        raise ValueError(f"Invalid doc_ids/scores format for {name}")
+                    if len(doc_ids) != len(scores):
+                        raise ValueError(f"Mismatched lengths for doc_ids/scores in {name}")
+
+            # Process results
+            fused_results = []
+            num_queries = len(next(iter(retriever_results.values())))
             
-            # Track document ranks and scores
-            doc_info: Dict[str, Dict[str, Union[int, float]]] = {}
-            
-            # Process each retriever's results
-            for retriever_name, (doc_ids, scores) in query_results.items():
-                # Normalize scores if requested
+            for query_idx in range(num_queries):
+                query_results = {
+                    name: results[query_idx] 
+                    for name, results in retriever_results.items()
+                }
+                
+                # Normalize scores if configured
                 if self.normalize_scores:
-                    scores = self.normalize_score_list(scores)
+                    for name in query_results:
+                        doc_ids, scores = query_results[name]
+                        min_score = min(scores) if scores else 0
+                        max_score = max(scores) if scores else 1
+                        norm_scores = (
+                            [(s - min_score) / (max_score - min_score) if max_score > min_score else 0.5 
+                            for s in scores]
+                        )
+                        query_results[name] = (doc_ids, norm_scores)
                 
-                # Record rank and score for each document
-                for rank, (doc_id, score) in enumerate(zip(doc_ids, scores)):
-                    if doc_id not in doc_info:
-                        doc_info[doc_id] = {
-                            "ranks": {},
-                            "scores": {},
-                            "retrievers": set()
-                        }
-                    doc_info[doc_id]["ranks"][retriever_name] = rank
-                    doc_info[doc_id]["scores"][retriever_name] = score
-                    doc_info[doc_id]["retrievers"].add(retriever_name)
-            
-            # Compute fused scores
-            fused_doc_scores = []
-            for doc_id, info in doc_info.items():
-                if self.strategy == "rrf":
-                    fused_score = self._compute_rrf_scores(info["ranks"])
-                else:  # linear combination
-                    fused_score = 0.0
-                    for retriever in info["retrievers"]:
-                        weight = self.score_weights.get(retriever, 1.0)
-                        fused_score += weight * info["scores"][retriever]
+                # Apply fusion strategy
+                if self.strategy == 'rrf':
+                    fused_result = self.reciprocal_rank_fusion(query_results)
+                else:
+                    fused_result = self._linear_combination(query_results)
+                    
+                fused_results.append(fused_result)
                 
-                fused_doc_scores.append((doc_id, fused_score))
+            return fused_results
             
-            # Sort by fused score
-            fused_doc_scores.sort(key=lambda x: x[1], reverse=True)
-            doc_ids, scores = zip(*fused_doc_scores)
-            
-            fused_results.append((list(doc_ids), list(scores)))
-        
-        return fused_results
+        except Exception as e:
+            logging.error(f"Error during fusion: {str(e)}")
+            raise
 
     def rescore_with_clusters(
         self,

@@ -9,7 +9,7 @@ from datetime import datetime
 class ClusteringConfig:
     """Configuration for clustering experiment."""
     
-    # Experiment identification
+     # Experiment identification
     experiment_name: str = "clustering_experiment"
     experiment_id: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d_%H%M%S"))
     
@@ -25,9 +25,10 @@ class ClusteringConfig:
     min_cluster_size: int = 3
     
     # Embeddings configuration
-    compute_new_embeddings: bool = False
+    compute_new_embeddings: bool = True
     embeddings_path: Optional[str] = None
     max_length_encoder: int = 512
+    embeddings_output_dir: str = "data/embeddings"
     
     # Data configuration
     base_data_dir: Path = Path("data")
@@ -36,6 +37,14 @@ class ClusteringConfig:
     use_adore: bool = False
     use_random: bool = False
     
+    # Processing configuration
+    batch_size: int = 32
+    use_gpu: bool = True
+    
+    # Output configuration 
+    output_dir: str = field(default_factory=lambda: f"experiments/experiment1_clustering/results/{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    save_intermediates: bool = True
+   
     @property
     def corpus_path(self) -> Path:
         """Get appropriate corpus path based on configuration."""
@@ -94,8 +103,13 @@ class ClusteringConfig:
             raise ValueError("num_clusters must be at least 2")
             
         if not self.compute_new_embeddings and not self.embeddings_path:
-            raise ValueError("Must either compute new embeddings or provide embeddings_path")
-            
+            self.embeddings_path = os.path.join(self.embeddings_output_dir, "document_embeddings.npy")
+            self.compute_new_embeddings = True
+
+        # Validate file existence     
+        if not self.compute_new_embeddings and not os.path.exists(self.embeddings_path):
+            raise ValueError(f"Embeddings path does not exist: {self.embeddings_path}")
+        
         # Validate file existence
         if not self.corpus_path.exists():
             raise ValueError(f"Corpus path does not exist: {self.corpus_path}")
@@ -108,8 +122,9 @@ class ClusteringConfig:
             
         if self.use_random_docs and not self.random_doc_source.exists():
             raise ValueError(f"Random document source does not exist: {self.random_doc_source}")
-    
+        
     def __post_init__(self):
         """Post-initialization validation and setup."""
         self.validate()
         os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.embeddings_output_dir, exist_ok=True)
