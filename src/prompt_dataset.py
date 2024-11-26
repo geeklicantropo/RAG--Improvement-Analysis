@@ -4,6 +4,7 @@ import hashlib
 from typing import List, Tuple, Dict, Any, Optional
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
+import logging
 
 import normalize_text
 from normalize_answers import *
@@ -738,29 +739,51 @@ class MultiCorpusDataset(PromptDataset):
             merged_document_indices = indices_other[:num_other_documents] + indices_main[:num_main_documents][::-1]
         return merged_documents, merged_document_indices
 
-    def _get_documents_from_indices_other_corpus(self, indices):
+    def _get_documents_from_indices(self, indices: List[int]) -> Tuple[List[str], List[int]]:
         """
-        Selects and formats documents from the additional corpus based on provided indices.
+        Safely get documents from corpus using indices, with validation.
         """
         formatted_documents = []
-        seen_hashes = set()
-        num_other_documents = self.documents_disposition_info['num_other_documents']
-
-        # List to store the indices of documents actually added
-        document_indices = []  
-        for doc_idx in map(int, indices):
-            if len(formatted_documents) == num_other_documents:
-                break
+        document_indices = []
+        
+        # Full corpus
+        try:
+            if self.full_to_subset_idx_map is None:
+                # Validate indices are within corpus bounds
+                max_idx = len(self.corpus) - 1
+                valid_indices = [i for i in map(int, indices) if 0 <= i <= max_idx]
+                documents_info = [self.corpus[i] for i in valid_indices]
+            else:
+                documents_info = []
+                # Map indices and validate
+                for i in map(int, indices):
+                    if i in self.full_to_subset_idx_map:
+                        subset_idx = self.full_to_subset_idx_map[i]
+                        if 0 <= subset_idx < len(self.corpus):
+                            documents_info.append(self.corpus[subset_idx])
             
-            text = self.documents_other_corpus[doc_idx].strip()
-            doc_hash = hash_document(text)
-            # Skip the document if it is a duplicate
-            if doc_hash in seen_hashes:
-                continue
-            seen_hashes.add(doc_hash)
-            
-            doc_str = f"Document [{doc_idx}] {text}"
-            formatted_documents.append(doc_str)
-            document_indices.append(doc_idx)
+            # Process valid documents
+            seen_hashes = set()
+            for doc_info in documents_info:
+                if len(formatted_documents) == self.num_documents_in_context:
+                    break
+                
+                doc_idx = doc_info['full_corpus_idx']
+                title = doc_info.get('title', '')
+                text = doc_info.get('text', '')
 
-        return formatted_documents, document_indices
+                doc_hash = hash_document(text)
+                if doc_hash in seen_hashes:
+                    continue
+                seen_hashes.add(doc_hash)
+                
+                doc_str = f"Document [{doc_idx}](Title: {title}) {text}"
+                formatted_documents.append(doc_str)
+                document_indices.append(doc_idx)
+
+            return formatted_documents, document_indices
+            
+        except Exception as e:
+            logging.error(f"Error accessing corpus documents: {str(e)}")
+            # Return empty results rather than failing
+            return [], []

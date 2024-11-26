@@ -25,6 +25,7 @@ rank-bm25
 sentence-transformers
 # faiss-gpu removed
 #pyserini>=0.16.0
+str2bool
 
 # RAG-Fusion specific requirements
 rank_bm25>=0.2.2

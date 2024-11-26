@@ -9,6 +9,8 @@ import pandas as pd
 import importlib
 import json
 from typing import Dict, List, Any
+import logging
+#import str2bool
 
 project_root = Path(__file__).parent.parent
 sys.path.extend([
@@ -24,7 +26,7 @@ from experiments.plotting.plot_categories import CategoriesPlotter
 from setup_experiments import ExperimentSetup
 from experiment_logger import ExperimentLogger
 from experiments.experiment0_baseline.main import BaselineExperiment
-from experiments.experiment0_baseline.config import BaselineConfig
+from experiments.experiment0_baseline.config import BaselineConfigFactory, BaselineConfig
 from experiments.experiment0_baseline.utils import save_metrics
 
 class ExperimentPipeline:
@@ -44,8 +46,26 @@ class ExperimentPipeline:
             'fusion': 'experiment2_fusion', 
             'categories': 'experiment3_categories'
         }
+        self.enabled_experiments = {
+            'baseline': True,
+            'clustering': True,
+            'fusion': True,
+            'categories': True
+        }
+        self.plotting_enabled = True
+
+    def set_experiment_flags(self, flags: Dict[str, bool]):
+        """Set which experiments to run."""
+        self.enabled_experiments.update(flags)
+        self.logger.log_metric("enabled_experiments", self.enabled_experiments)
+
+    def set_plotting_enabled(self, enabled: bool):
+        """Set whether to generate plots."""
+        self.plotting_enabled = enabled
+        self.logger.log_metric("plotting_enabled", enabled)
 
     def run_pipeline(self):
+        """Run the experiment pipeline with enabled experiments."""
         try:
             with self.logger:
                 self.logger.log_step_start("Initializing experiment pipeline")
@@ -55,20 +75,23 @@ class ExperimentPipeline:
                     return
                 
                 self.results_dir.mkdir(parents=True, exist_ok=True)
-                self.plots_dir.mkdir(parents=True, exist_ok=True)
+                if self.plotting_enabled:
+                    self.plots_dir.mkdir(parents=True, exist_ok=True)
 
                 results = {}
                 
-                # Run each experiment type
-                experiment_types = ['baseline', 'clustering', 'fusion', 'categories']
-                for exp_type in experiment_types:
-                    self.logger.log_step_start(f"Running {exp_type} experiments")
-                    run_method = getattr(self, f"run_{exp_type}_experiments")
-                    results[exp_type] = run_method()
-                    
-                    # Plot results
-                    plotter_class = globals()[f"{exp_type.capitalize()}Plotter"]
-                    plotter_class(self.results_dir).plot_results(results[exp_type])
+                # Run each enabled experiment type
+                for exp_type in self.enabled_experiments:
+                    if self.enabled_experiments[exp_type]:
+                        self.logger.log_step_start(f"Running {exp_type} experiments")
+                        run_method = getattr(self, f"run_{exp_type}_experiments")
+                        results[exp_type] = run_method()
+                        
+                        # Plot results if enabled
+                        if self.plotting_enabled:
+                            plotter_class = globals()[f"{exp_type.capitalize()}Plotter"]
+                            plotter = plotter_class(self.results_dir)
+                            plotter.plot_results(results[exp_type])
                 
                 self.generate_report(results)
                 self.logger.log_step_end("Pipeline execution completed")
@@ -273,14 +296,100 @@ class ExperimentPipeline:
                 f.write(metrics_df.to_string())
                 f.write("\n\n")
 
-def main():
-    parser = argparse.ArgumentParser(description="Run complete experiment pipeline")
-    parser.add_argument('--output_dir', type=str, default='experiments',
-                      help='Base output directory')
-    args = parser.parse_args()
+def str2bool(v: str) -> bool:
+    """Convert string to boolean."""
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
-    pipeline = ExperimentPipeline(args.output_dir)
-    pipeline.run_pipeline()
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Run complete experiment pipeline")
+    
+    # Directory configurations
+    parser.add_argument(
+        '--output_dir', 
+        type=str, 
+        default='experiments',
+        help='Base output directory'
+    )
+    parser.add_argument(
+        '--log_dir', 
+        type=str, 
+        default='logs',
+        help='Directory for experiment logs'
+    )
+    
+    # Experiment selection
+    parser.add_argument(
+        '--skip_baseline',
+        action='store_true',
+        help='Skip baseline experiments'
+    )
+    parser.add_argument(
+        '--skip_clustering',
+        action='store_true',
+        help='Skip clustering experiments'
+    )
+    parser.add_argument(
+        '--skip_fusion',
+        action='store_true',
+        help='Skip fusion experiments'
+    )
+    parser.add_argument(
+        '--skip_categories',
+        action='store_true',
+        help='Skip categories experiments'
+    )
+    
+    # Visualization options
+    parser.add_argument(
+        '--save_plots',
+        type=str2bool,
+        default=True,
+        help='Whether to generate plots (true/false)'
+    )
+    
+    args = parser.parse_args()
+    return args
+
+def main():
+    """Main entry point for running all experiments."""
+    args = parse_arguments()
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    try:
+        # Create experiment pipeline with parsed arguments
+        pipeline = ExperimentPipeline(args.output_dir)
+        
+        # Set experiment flags based on arguments
+        experiments_to_run = {
+            'baseline': not args.skip_baseline,
+            'clustering': not args.skip_clustering,
+            'fusion': not args.skip_fusion,
+            'categories': not args.skip_categories
+        }
+        
+        # Configure pipeline
+        pipeline.set_experiment_flags(experiments_to_run)
+        pipeline.set_plotting_enabled(args.save_plots)
+        
+        # Run pipeline
+        pipeline.run_pipeline()
+        
+    except Exception as e:
+        logging.error(f"Error in experiment pipeline: {str(e)}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
     main()
