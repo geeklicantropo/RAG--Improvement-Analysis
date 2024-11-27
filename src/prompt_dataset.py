@@ -478,59 +478,62 @@ class PromptDataset(Dataset):
             raise ValueError(f"Invalid index in search results: {str(e)}")
         
     def preprocess_search_results(self) -> bool:
-        """
-        Preprocess and validate search results before dataset creation.
-        
-        Returns:
-            bool: True if preprocessing successful, False otherwise
-            
-        Raises:
-            ValueError: If search results are invalid
-        """
+        """Preprocess and validate search results."""
         if not self.search_results:
             raise ValueError("No search results available")
-            
-        # Validate format
-        if not all(isinstance(result, tuple) and len(result) == 2 for result in self.search_results):
-            raise ValueError("Invalid search results format")
-            
-        processed_results = []
-        max_corpus_idx = len(self.corpus) - 1
-        
-        for indices, scores in self.search_results:
-            # Validate and convert indices
-            valid_indices = []
-            valid_scores = []
-            
-            for idx, score in zip(indices, scores):
-                try:
-                    corpus_idx = int(idx)
-                    if self.full_to_subset_idx_map is not None:
-                        if corpus_idx not in self.full_to_subset_idx_map:
-                            continue
-                        corpus_idx = self.full_to_subset_idx_map[corpus_idx]
-                            
-                    if 0 <= corpus_idx <= max_corpus_idx:
-                        valid_indices.append(corpus_idx)
-                        valid_scores.append(score)
+
+        try:
+            processed_results = []
+            max_corpus_idx = len(self.corpus) - 1
+
+            for result in self.search_results:
+                # Handle both tuple and list formats
+                if isinstance(result, (tuple, list)):
+                    if len(result) == 2:
+                        indices, scores = result
+                    else:
+                        # Try to extract indices and scores from single list
+                        indices = [x[0] for x in result]
+                        scores = [x[1] for x in result]
+                else:
+                    raise ValueError("Invalid result format")
+
+                # Validate and convert indices
+                valid_indices = []
+                valid_scores = []
+                
+                for idx, score in zip(indices, scores):
+                    try:
+                        corpus_idx = int(idx)
+                        if self.full_to_subset_idx_map is not None:
+                            if corpus_idx not in self.full_to_subset_idx_map:
+                                continue
+                            corpus_idx = self.full_to_subset_idx_map[corpus_idx]
                         
-                except (ValueError, TypeError):
-                    continue
-                    
-            # Ensure minimum required indices
-            while len(valid_indices) < self.num_documents_in_context:
-                # Find unused valid index
-                for i in range(max_corpus_idx + 1):
-                    if i not in valid_indices:
-                        valid_indices.append(i)
-                        valid_scores.append(0.0)  # Default score for added indices
-                        break
-                        
-            processed_results.append((valid_indices[:self.num_documents_in_context], 
-                                    valid_scores[:self.num_documents_in_context]))
-                                    
-        self.search_results = processed_results
-        return True
+                        if 0 <= corpus_idx <= max_corpus_idx:
+                            valid_indices.append(corpus_idx)
+                            valid_scores.append(float(score))
+                    except (ValueError, TypeError):
+                        continue
+
+                # Ensure minimum required indices
+                while len(valid_indices) < self.num_documents_in_context:
+                    for i in range(max_corpus_idx + 1):
+                        if i not in valid_indices:
+                            valid_indices.append(i)
+                            valid_scores.append(0.0)
+                            break
+
+                processed_results.append((
+                    valid_indices[:self.num_documents_in_context],
+                    valid_scores[:self.num_documents_in_context]
+                ))
+
+            self.search_results = processed_results
+            return True
+
+        except Exception as e:
+            raise ValueError(f"Invalid search results format: {str(e)}")
 
     def _insert_gold_document_idx(
         self, 

@@ -3,11 +3,14 @@ import argparse
 import warnings
 from typing import Dict, List, Any, Tuple, Optional
 import torch
+from transformers import AutoConfig, AutoModel
+
 from tqdm import tqdm
 from datetime import datetime
 from pathlib import Path
 import sys
 import logging
+import gc
 
 # Add project root to system path
 project_root = str(Path(__file__).parent.parent.parent)
@@ -27,10 +30,13 @@ from src.llm import LLM
 from src.prompt_dataset import PromptDataset
 from src.retriever import Retriever
 
+
 class ClusteringExperiment:
-    """Implements experiment workflow for testing K-means clustering impact on RAG systems."""
-    
-    def __init__(self, config: ClusteringConfig, logger: Optional[ExperimentLogger] = None):
+    def __init__(
+        self,
+        config: ClusteringConfig,
+        logger: Optional[ExperimentLogger] = None
+    ):
         self.config = config
         self.logger = logger or ExperimentLogger(
             experiment_name=f"clustering_{config.num_clusters}clusters",
@@ -54,6 +60,19 @@ class ClusteringExperiment:
                 model_max_length=self.config.model_max_length
             )
             
+            # Initialize encoder for retriever
+            config = AutoConfig.from_pretrained('facebook/contriever')
+            self.encoder = AutoModel.from_config(config).eval()
+            
+            # Initialize retriever with encoder
+            if self.config.compute_new_embeddings:
+                self.retriever = Retriever(
+                    device=self.device,
+                    tokenizer=self.llm.tokenizer,
+                    query_encoder=self.encoder,
+                    max_length=self.config.max_length_encoder
+                )
+            
             # Initialize clusterer
             self.clusterer = DocumentClusterer(
                 num_clusters=self.config.num_clusters,
@@ -62,23 +81,23 @@ class ClusteringExperiment:
                 logger=self.logger
             )
             
-            # Initialize retriever if needed for embeddings
-            if self.config.compute_new_embeddings:
-                self.retriever = Retriever(
-                    device=self.device,
-                    tokenizer=self.llm.tokenizer,
-                    max_length=self.config.max_length_encoder
-                )
-                
             self.logger.log_step_end("Initializing components")
             
         except Exception as e:
             self.logger.log_error(e, "Error initializing components")
             raise
 
-    def run_experiment(self):
-        """Execute the clustering experiment workflow."""
+    def run(self):
+        """Run the clustering experiment."""
         try:
+            self.logger.log_step_start("Experiment execution")
+            
+            # Monitor initial GPU memory
+            if torch.cuda.is_available():
+                gpu = torch.cuda.current_device()
+                initial_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
+                self.config.adjust_batch_sizes(initial_memory)
+
             # Create timestamp for new results
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = Path(self.config.output_dir) / f"run_{timestamp}"
@@ -90,21 +109,65 @@ class ClusteringExperiment:
             # Perform document clustering
             clusters = self._cluster_documents(embeddings)
             
-            # Save cluster assignments
-            self._save_clusters(clusters, output_dir)
+            # Initialize dataset with clustering
+            dataset = self._initialize_dataset(clusters)
             
-            # Generate answers with clustered documents
-            results = self._generate_answers(clusters)
+            # Create dataloader with adjusted batch size
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=self.config.batch_size,
+                shuffle=False,
+                num_workers=8,
+                pin_memory=True
+            )
             
-            # Evaluate and save results
+            results = []
+            for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
+                # Monitor memory during processing
+                if torch.cuda.is_available():
+                    current_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
+                    self.config.adjust_batch_sizes(current_memory)
+                
+                # Generate answers
+                prompts = batch['prompt']
+                generated_outputs = self.llm.generate(
+                    prompts,
+                    max_new_tokens=self.config.max_new_tokens
+                )
+                
+                # Process batch results
+                batch_results = self._process_batch_outputs(batch, generated_outputs)
+                results.extend(batch_results)
+                
+                # Save checkpoint if needed
+                if self.config.save_intermediates and (batch_idx + 1) % self.config.save_every == 0:
+                    self._save_checkpoint(results, batch_idx + 1)
+            
+            # Evaluate results
             metrics = self._evaluate_results(results)
+            
+            # Save artifacts
             self._save_experiment_artifacts(results, metrics, clusters, output_dir)
             
+            self.logger.log_step_end("Experiment execution")
             return results, metrics
             
         except Exception as e:
             self.logger.log_error(e, "Error during experiment execution")
             raise
+    
+    def _initialize_dataset(self, clusters: Dict[int, List[int]]) -> PromptDataset:
+        """Initialize dataset with clustering."""
+        return PromptDataset(
+            corpus=self._load_corpus(),
+            data_path=str(self.config.queries_path),
+            tokenizer=self.llm.tokenizer,
+            max_tokenized_length=self.config.model_max_length - 2,
+            search_results=self._load_search_results(),
+            use_clustering=True,
+            cluster_assignments=clusters,
+            num_clusters=self.config.num_clusters
+        )
 
     def _prepare_embeddings(self, output_dir: Path) -> np.ndarray:
         """Load existing embeddings or compute new ones."""
@@ -379,6 +442,7 @@ class ClusteringConfigFactory:
 
 def main(args=None):
     try:
+        # Set up args
         if isinstance(args, dict):
             parser = argparse.ArgumentParser()
             parser.add_argument('--num_clusters', type=int)
@@ -390,20 +454,33 @@ def main(args=None):
         else:
             args = parse_arguments()
 
+        # Run experiment
         config = ClusteringConfigFactory.get_config(args.num_clusters, args.use_random)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             experiment = ClusteringExperiment(
                 config=config,
-                experiment_name=f"clustering_{args.num_clusters}",
                 logger=ExperimentLogger(f"clustering_{args.num_clusters}")
             )
             experiment.setup()
-            return experiment.run()
+            results = experiment.run()
+            
+        # Cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+            
+        return results
             
     except Exception as e:
-        logging.error(f"Error in clustering experiment: {str(e)}", exc_info=True)
+        logging.error(f"Error in clustering experiment: {str(e)}", exc_info=True) 
         raise
+    finally:
+        # Final cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
 
 if __name__ == "__main__":
     main()

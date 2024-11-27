@@ -9,6 +9,7 @@ import argparse
 import logging
 import warnings
 import json
+import gc
 
 # Add project root to system path
 project_root = str(Path(__file__).parent.parent.parent)
@@ -124,10 +125,16 @@ class CategoriesExperiment:
         try:
             self.logger.log_step_start("Experiment execution")
             
+            # Monitor initial GPU memory
+            if torch.cuda.is_available():
+                gpu = torch.cuda.current_device()
+                initial_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
+                self.config.adjust_batch_sizes(initial_memory)
+            
             # Log configuration
             self.logger.log_experiment_params(self.config.to_dict())
             
-            # Create data loader
+            # Create data loader with adjusted batch size
             dataloader = torch.utils.data.DataLoader(
                 self.dataset,
                 batch_size=self.config.batch_size,
@@ -137,24 +144,48 @@ class CategoriesExperiment:
             )
             
             # Run generation
-            results = self._run_generation(dataloader)
-            
+            results = []
+            for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
+                # Monitor memory during processing
+                if torch.cuda.is_available():
+                    current_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
+                    self.config.adjust_batch_sizes(current_memory)
+
+                # Categorize documents
+                categorized_docs = self.utils.categorize_documents(
+                    batch['documents'],
+                    batch['scores'],
+                    self.config.score_thresholds,
+                    self.config.max_docs_per_category,
+                    batch_size=self.config.categorization_batch_size,
+                    logger=self.logger
+                )
+                
+                # Generate answers
+                prompts = [
+                    self.utils.format_category_prompt(q, docs, self.logger)
+                    for q, docs in zip(batch['query'], categorized_docs)
+                ]
+                
+                generated_outputs = self.llm.generate(
+                    prompts,
+                    max_new_tokens=self.config.max_new_tokens
+                )
+                
+                # Process outputs
+                batch_results = self._process_batch_outputs(
+                    batch,
+                    generated_outputs,
+                    categorized_docs
+                )
+                results.extend(batch_results)
+                
+                # Save checkpoint if needed
+                if self.config.save_intermediates and (batch_idx + 1) % self.config.save_every == 0:
+                    self._save_checkpoint(results, batch_idx + 1)
+
             # Analyze results
             metrics = self.utils.analyze_category_impact(results, self.logger)
-            
-            # Create category info
-            category_info = {
-                'thresholds': self.config.score_thresholds,
-                'max_docs_per_category': self.config.max_docs_per_category,
-                'statistics': self.utils.compute_category_statistics(
-                    results[0]['category_info'],
-                    self.logger
-                ),
-                'diversity_metrics': self.utils.evaluate_retrieval_diversity(
-                    results[0]['category_info'],
-                    self.logger
-                )
-            }
             
             # Save results
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -163,7 +194,7 @@ class CategoriesExperiment:
             self.utils.save_category_artifacts(
                 results,
                 metrics,
-                category_info,
+                categorized_docs,
                 str(output_dir),
                 self.logger
             )
@@ -283,8 +314,8 @@ def parse_arguments():
     return parser.parse_args()
 
 def main(args=None):
-    """Main entry point with silent execution for categories experiment."""
     try:
+        # Set up args
         if isinstance(args, dict):
             parser = argparse.ArgumentParser()
             parser.add_argument('--config_type', type=str)
@@ -295,21 +326,33 @@ def main(args=None):
         else:
             args = parse_arguments()
 
-        # Use existing CategoriesConfigFactory from config.py
+        # Run experiment
         config = CategoriesConfigFactory.get_config_for_type(args.config_type)
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
+            warnings.simplefilter("ignore") 
             experiment = CategoriesExperiment(
                 config=config,
                 experiment_name=f"categories_{args.config_type}",
                 logger=ExperimentLogger(f"categories_{args.config_type}")
             )
             experiment.setup()
-            return experiment.run()
+            results = experiment.run()
+            
+        # Cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache() 
+        gc.collect()
+            
+        return results
             
     except Exception as e:
         logging.error(f"Error in categories experiment: {str(e)}", exc_info=True)
         raise
+    finally:
+        # Final cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
 if __name__ == "__main__":
     main()

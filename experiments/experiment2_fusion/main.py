@@ -9,6 +9,9 @@ import argparse
 import json
 import warnings
 import logging
+import gc
+
+
 
 # Add project root to system path
 project_root = str(Path(__file__).parent.parent.parent)
@@ -118,10 +121,16 @@ class FusionExperiment:
         try:
             self.logger.log_step_start("Experiment execution")
             
+            # Monitor initial GPU memory
+            if torch.cuda.is_available():
+                gpu = torch.cuda.current_device()
+                initial_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
+                self.config.adjust_batch_sizes(initial_memory)
+            
             # Log configuration
             self.logger.log_experiment_params(self.config.to_dict())
             
-            # Create data loader
+            # Create data loader with adjusted batch size
             dataloader = torch.utils.data.DataLoader(
                 self.dataset,
                 batch_size=self.config.batch_size,
@@ -131,21 +140,42 @@ class FusionExperiment:
             )
             
             # Run generation
-            results = self._run_generation(dataloader)
+            results = []
+            for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
+                # Monitor memory during processing
+                if torch.cuda.is_available():
+                    current_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
+                    self.config.adjust_batch_sizes(current_memory)
+
+                # Perform fusion ranking
+                fused_results = self.fusion_ranker.fuse_batch(
+                    batch,
+                    batch_size=self.config.fusion_batch_size
+                )
+                
+                # Generate answers
+                prompts = [
+                    self.utils.format_fusion_prompt(q, docs)
+                    for q, docs in zip(batch['query'], fused_results)
+                ]
+                
+                generated_outputs = self.llm.generate(
+                    prompts,
+                    max_new_tokens=self.config.max_new_tokens
+                )
+                
+                # Process outputs
+                batch_results = self._process_batch_outputs(
+                    batch, generated_outputs, fused_results
+                )
+                results.extend(batch_results)
+                
+                # Save checkpoint if needed
+                if self.config.save_intermediates and (batch_idx + 1) % self.config.save_every == 0:
+                    self._save_checkpoint(results, batch_idx + 1)
             
             # Analyze results
             metrics = self.utils.analyze_fusion_results(results, self.logger)
-            
-            # Create fusion info
-            fusion_info = {
-                'strategy': self.config.fusion_strategy,
-                'weights': {
-                    'contriever': self.config.contriever_weight,
-                    'bm25': self.config.bm25_weight
-                },
-                'normalize_scores': self.config.normalize_scores,
-                'fusion_k': self.config.fusion_k
-            }
             
             # Save results
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -154,7 +184,7 @@ class FusionExperiment:
             self.utils.save_fusion_artifacts(
                 results,
                 metrics,
-                fusion_info,
+                self.fusion_ranker.get_fusion_info(),
                 str(output_dir),
                 self.logger
             )
@@ -258,10 +288,10 @@ def parse_arguments():
     return parser.parse_args()
 
 def main(args=None):
-    """Main entry point with silent execution for fusion experiment."""
     try:
+        # Set up args
         if isinstance(args, dict):
-            parser = argparse.ArgumentParser()
+            parser = argparse.ArgumentParser() 
             parser.add_argument('--strategy', type=str)
             parser.add_argument('--use_random', type=bool, default=False)
             namespace = parser.parse_args([])
@@ -271,6 +301,7 @@ def main(args=None):
         else:
             args = parse_arguments()
 
+        # Run experiment
         config = FusionConfigFactory.get_config_for_strategy(args.strategy, args.use_random)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -280,11 +311,23 @@ def main(args=None):
                 logger=ExperimentLogger(f"fusion_{args.strategy}")
             )
             experiment.setup()
-            return experiment.run()
+            results = experiment.run()
+            
+        # Cleanup    
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+            
+        return results
             
     except Exception as e:
         logging.error(f"Error in fusion experiment: {str(e)}", exc_info=True)
         raise
+    finally:
+        # Final cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
 if __name__ == "__main__":
     main()

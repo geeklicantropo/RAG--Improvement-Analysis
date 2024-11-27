@@ -128,3 +128,31 @@ class ClusteringConfig:
         self.validate()
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.embeddings_output_dir, exist_ok=True)
+
+    # Batch size management
+    batch_size: int = 32
+    min_batch_size: int = 1
+    max_batch_size: int = 64
+    batch_size_reduction_factor: float = 0.5
+    clustering_batch_size: int = 1000
+    
+    def adjust_batch_sizes(self, memory_usage: float):
+        """Adjust batch sizes for generation and clustering"""
+        if memory_usage > 0.9:
+            self.batch_size = max(
+                self.min_batch_size,
+                int(self.batch_size * self.batch_size_reduction_factor)
+            )
+            self.clustering_batch_size = max(
+                100,
+                int(self.clustering_batch_size * self.batch_size_reduction_factor)
+            )
+        elif memory_usage < 0.7:
+            self.batch_size = min(
+                self.max_batch_size,
+                int(self.batch_size / self.batch_size_reduction_factor)
+            )
+            self.clustering_batch_size = min(
+                5000,
+                int(self.clustering_batch_size / self.batch_size_reduction_factor)
+            )

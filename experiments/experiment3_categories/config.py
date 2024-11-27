@@ -118,6 +118,34 @@ class CategoriesConfig:
             if isinstance(value, str) and (key.endswith('_path') or key.endswith('_dir')):
                 config_dict[key] = Path(value)
         return cls(**config_dict)
+    
+    # Batch size management
+    batch_size: int = 32
+    min_batch_size: int = 1
+    max_batch_size: int = 64
+    batch_size_reduction_factor: float = 0.5
+    categorization_batch_size: int = 200
+    
+    def adjust_batch_sizes(self, memory_usage: float):
+        """Adjust batch sizes for generation and categorization"""
+        if memory_usage > 0.9:
+            self.batch_size = max(
+                self.min_batch_size,
+                int(self.batch_size * self.batch_size_reduction_factor)
+            )
+            self.categorization_batch_size = max(
+                20,
+                int(self.categorization_batch_size * self.batch_size_reduction_factor)
+            )
+        elif memory_usage < 0.7:
+            self.batch_size = min(
+                self.max_batch_size,
+                int(self.batch_size / self.batch_size_reduction_factor)
+            )
+            self.categorization_batch_size = min(
+                1000,
+                int(self.categorization_batch_size / self.batch_size_reduction_factor)
+            )
 
 # Factory for common configurations
 class CategoriesConfigFactory:

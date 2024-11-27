@@ -112,6 +112,35 @@ class FusionConfig:
             if isinstance(value, str) and (key.endswith('_path') or key.endswith('_dir')):
                 config_dict[key] = Path(value)
         return cls(**config_dict)
+    
+     # Batch size management
+    batch_size: int = 32
+    min_batch_size: int = 1 
+    max_batch_size: int = 64
+    batch_size_reduction_factor: float = 0.5
+    fusion_batch_size: int = 100
+    
+    def adjust_batch_sizes(self, memory_usage: float):
+        """Adjust batch sizes for generation and fusion"""
+        if memory_usage > 0.9:
+            self.batch_size = max(
+                self.min_batch_size,
+                int(self.batch_size * self.batch_size_reduction_factor)
+            )
+            self.fusion_batch_size = max(
+                10,
+                int(self.fusion_batch_size * self.batch_size_reduction_factor)
+            )
+        elif memory_usage < 0.7:
+            self.batch_size = min(
+                self.max_batch_size,
+                int(self.batch_size / self.batch_size_reduction_factor)
+            )
+            self.fusion_batch_size = min(
+                500,
+                int(self.fusion_batch_size / self.batch_size_reduction_factor)
+            )
+
 
 
 # Factory for common configurations

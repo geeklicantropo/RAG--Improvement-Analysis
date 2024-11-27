@@ -56,30 +56,63 @@ class LLM:
  
 
     def _initialize_model_tokenizer(self, model_id: str) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
-        """
-        Initializes the model and tokenizer with the given model ID.
-        """
         model_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         model_config.max_seq_len = self.model_max_length
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            trust_remote_code=True,
-            config=model_config,
-            quantization_config=self.bnb_config,
-            torch_dtype=torch.bfloat16,
-            device_map='auto',
-        )
-        model.eval() # Set the model to evaluation mode
+        # Split model across available GPU memory and CPU
+        device_map = self._get_optimal_device_map()
+        
+        model_kwargs = {
+            "trust_remote_code": True,
+            "config": model_config,
+            "torch_dtype": torch.float16,  # Use float16 instead of bfloat16 for better memory efficiency
+            "device_map": device_map,
+            "low_cpu_mem_usage": True,
+            "quantization_config": BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type='nf4'
+            )
+        }
+
+        model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+        model.eval()
 
         tokenizer = AutoTokenizer.from_pretrained(
-            model_id, padding_side="left", truncation_side="left",
+            model_id,
+            padding_side="left",
+            truncation_side="left",
             model_max_length=self.model_max_length
         )
-        # Most LLMs don't have a pad token by default
-        tokenizer.pad_token = tokenizer.eos_token  
-
+        tokenizer.pad_token = tokenizer.eos_token
+        
         return model, tokenizer
+
+    def _get_optimal_device_map(self) -> dict:
+        """Calculate optimal device map based on available GPU memory."""
+        if not torch.cuda.is_available():
+            return "cpu"
+            
+        total_gpus = torch.cuda.device_count()
+        if total_gpus == 0:
+            return "cpu"
+
+        # Get available memory on each GPU
+        available_memory = []
+        for i in range(total_gpus):
+            total_mem = torch.cuda.get_device_properties(i).total_memory
+            used_mem = torch.cuda.memory_allocated(i)
+            available_mem = (total_mem - used_mem) / 1024**3  # Convert to GB
+            available_memory.append(available_mem)
+
+        # If very limited GPU memory, use CPU
+        if max(available_memory) < 2:  # Less than 2GB available
+            return "cpu"
+            
+        # Create balanced device map
+        device_map = "balanced"
+        return device_map
 
 
     def _define_stopping_criteria(self) -> StoppingCriteriaList:

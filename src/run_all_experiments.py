@@ -10,6 +10,7 @@ from typing import Dict, List, Any, Optional
 from tqdm import tqdm
 import json
 import pandas as pd
+import torch
 
 # Ensure project root is in path
 project_root = Path(__file__).parent.parent
@@ -211,17 +212,24 @@ class ExperimentPipeline:
         
         for config in tqdm(configs, desc=f"Running {experiment_type} experiments"):
             try:
-                # Prepare output directory
+                # Clear memory before each experiment
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
+                # Reduce batch size if previous experiment failed
+                if results and not results[-1].get('success', False):
+                    config['args']['batch_size'] = max(1, config['args'].get('batch_size', 8) // 2)
+                    
                 output_dir = self.results_dir / experiment_type / config['description']
                 output_dir.mkdir(parents=True, exist_ok=True)
                 
-                # Configure experiment
                 experiment_args = config['args'].copy()
                 experiment_args['output_dir'] = str(output_dir)
                 
-                # Import and run experiment
-                module_path = f"experiments.{self.experiment_dir_mapping[experiment_type]}.main"
-                experiment_module = __import__(module_path, fromlist=['main'])
+                experiment_module = __import__(
+                    f"experiments.{self.experiment_dir_mapping[experiment_type]}.main",
+                    fromlist=['main']
+                )
                 experiment_results = experiment_module.main(experiment_args)
                 
                 if experiment_results:
