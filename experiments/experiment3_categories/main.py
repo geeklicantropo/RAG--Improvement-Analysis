@@ -1,22 +1,10 @@
 import os
 import sys
-import torch
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional
 from datetime import datetime
-from tqdm import tqdm
-import argparse
-import logging
-import warnings
-import json
-import gc
-
-# Add project root to system path
-project_root = str(Path(__file__).parent.parent.parent)
-sys.path.append(project_root)
-
+import torch
 from src.utils import read_corpus_json
-
 from src.experiment_logger import ExperimentLogger
 from src.utils import seed_everything
 from src.llm import LLM
@@ -25,11 +13,18 @@ from src.rag_fusion_utils import RAGFusionRanker
 from .config import CategoriesConfig, CategoriesConfigFactory
 from .utils import CategoriesExperimentUtils
 
+import argparse
+import json
+import gc
+import tqdm
+import warnings
+import logging
+
+# Define project_root
+project_root = str(Path(__file__).parent.parent.parent)
+
+
 class CategoriesExperiment:
-    """
-    Implements experiment workflow for testing category-based document organization in RAG systems.
-    """
-    
     def __init__(
         self,
         config: CategoriesConfig,
@@ -43,71 +38,56 @@ class CategoriesExperiment:
             base_log_dir=str(Path(project_root) / "logs")
         )
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Initialize utilities
         self.utils = CategoriesExperimentUtils()
-        
+
     def setup(self):
-        """Set up experiment components."""
         try:
             self.logger.log_step_start("Setup")
-            
-            # Initialize LLM
+
             self.llm = LLM(
                 self.config.llm_id,
                 self.device,
                 quantization_bits=4,
                 model_max_length=self.config.model_max_length
             )
-            
-            # Load retrieval results
+
             self.retriever_results = self.utils.load_retrieval_results(
                 str(self.config.contriever_results_path),
                 str(self.config.bm25_results_path) if self.config.use_bm25 else None,
                 self.config.use_fusion,
                 self.logger
             )
-            
-            # Initialize fusion ranker if needed
+
             if self.config.use_fusion:
                 self.fusion_ranker = RAGFusionRanker(
                     strategy="rrf",
                     normalize_scores=True,
                     score_weights=self.config.fusion_weights
                 )
-            
-            # Load dataset
+
             self.dataset = self._load_dataset()
-            
             self.logger.log_step_end("Setup")
-            
+
         except Exception as e:
             self.logger.log_error(e, "Error in experiment setup")
             raise
-            
+
     def _load_dataset(self) -> PromptDataset:
-        """Load and prepare dataset with safe corpus handling."""
         try:
-            # Load corpus
             corpus = read_corpus_json(str(self.config.corpus_path))
-            
-            # Load or perform fusion on search results
+
             if self.config.use_fusion:
                 search_results = self.fusion_ranker.fuse_search_results(self.retriever_results)
-                
-                # Validate corpus indices
                 max_idx = len(corpus) - 1
-                filtered_results = []
+                valid_search_results = []
                 for doc_ids, scores in search_results:
                     valid_ids = [idx for idx in map(int, doc_ids) if 0 <= idx <= max_idx]
                     if valid_ids:
-                        filtered_results.append((valid_ids, scores[:len(valid_ids)]))
-                    else:
-                        filtered_results.append(([], []))
-                search_results = filtered_results
+                        valid_search_results.append((valid_ids, scores[:len(valid_ids)]))
+                search_results = valid_search_results
             else:
                 search_results = self.retriever_results['contriever']
-            
+
             return PromptDataset(
                 corpus=corpus,
                 data_path=str(self.config.train_dataset_path),
@@ -116,22 +96,22 @@ class CategoriesExperiment:
                 search_results=search_results,
                 category_info={'score_thresholds': self.config.score_thresholds}
             )
+
         except Exception as e:
             self.logger.log_error(e, "Error loading dataset")
             raise
-    
+
     def run(self):
-        """Run the categories experiment with memory optimization."""
         try:
             self.logger.log_step_start("Experiment execution")
-            
+
             if torch.cuda.is_available():
                 gpu = torch.cuda.current_device()
                 initial_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
                 self.config.adjust_batch_sizes(initial_memory)
-            
+
             self.logger.log_experiment_params(self.config.to_dict())
-            
+
             dataloader = torch.utils.data.DataLoader(
                 self.dataset,
                 batch_size=self.config.batch_size,
@@ -139,14 +119,13 @@ class CategoriesExperiment:
                 num_workers=8,
                 pin_memory=True
             )
-            
+
             results = []
             for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
                 if torch.cuda.is_available():
                     current_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
                     self.config.adjust_batch_sizes(current_memory)
 
-                # Categorize documents in smaller batches
                 categorized_docs = self.utils.categorize_documents(
                     batch['documents'],
                     batch['scores'],
@@ -155,41 +134,38 @@ class CategoriesExperiment:
                     batch_size=self.config.categorization_batch_size,
                     logger=self.logger
                 )
-                
-                # Generate answers
+
                 prompts = [
                     self.utils.format_category_prompt(q, docs, self.logger)
                     for q, docs in zip(batch['query'], categorized_docs)
                 ]
-                
+
                 generated_outputs = self.llm.generate(
                     prompts,
                     max_new_tokens=self.config.max_new_tokens
                 )
-                
+
                 batch_results = self._process_batch_outputs(
                     batch,
                     generated_outputs,
                     categorized_docs
                 )
                 results.extend(batch_results)
-                
+
                 if self.config.save_intermediates and (batch_idx + 1) % self.config.save_every == 0:
                     self._save_checkpoint(results, batch_idx + 1)
 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 gc.collect()
-                
+
                 if self.logger.check_memory_threshold():
                     self.config.batch_size = max(1, self.config.batch_size // 2)
                     self.config.categorization_batch_size = max(20, self.config.categorization_batch_size // 2)
 
             metrics = self.utils.analyze_category_impact(results, self.logger)
-            
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = Path(self.config.output_dir) / f"run_{timestamp}"
-            
             self.utils.save_category_artifacts(
                 results,
                 metrics,
@@ -197,10 +173,10 @@ class CategoriesExperiment:
                 str(output_dir),
                 self.logger
             )
-            
+
             self.logger.log_step_end("Experiment execution")
             return results, metrics
-            
+
         except Exception as e:
             self.logger.log_error(e, "Error during experiment execution")
             raise
@@ -208,58 +184,13 @@ class CategoriesExperiment:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
-            
-    def _run_generation(
-        self, 
-        dataloader: torch.utils.data.DataLoader
-    ) -> List[Dict[str, Any]]:
-        """Run generation on batches."""
-        results = []
-        
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
-            # Categorize documents and prepare prompts
-            categorized_docs = self.utils.categorize_documents(
-                batch['documents'],
-                batch['scores'],
-                self.config.score_thresholds,
-                self.config.max_docs_per_category,
-                self.logger
-            )
-            
-            # Generate answers
-            prompts = [
-                self.utils.format_category_prompt(
-                    q, categorized_docs, self.logger
-                )
-                for q in batch['query']
-            ]
-            
-            generated_outputs = self.llm.generate(
-                prompts,
-                max_new_tokens=self.config.max_new_tokens
-            )
-            
-            # Process outputs
-            batch_results = self._process_batch_outputs(
-                batch,
-                generated_outputs,
-                categorized_docs
-            )
-            results.extend(batch_results)
-            
-            # Save checkpoint if configured
-            if self.config.save_intermediates and (batch_idx + 1) % self.config.save_every == 0:
-                self._save_checkpoint(results, batch_idx + 1)
-                
-        return results
-    
+
     def _process_batch_outputs(
-    self,
-    batch: Dict[str, Any],
-    outputs: List[str],
-    categorized_docs: Dict[str, List[Dict]]
+        self,
+        batch: Dict[str, Any],
+        outputs: List[str],
+        categorized_docs: Dict[str, List[Dict]]
     ) -> List[Dict[str, Any]]:
-        """Process generation outputs with memory optimization."""
         processed_results = []
         answer_string = "### Response:" if 'mpt' in self.config.llm_id else "Answer:"
         
@@ -290,13 +221,8 @@ class CategoriesExperiment:
                         del v
         
         return processed_results
-    
-    def _save_checkpoint(
-        self,
-        results: List[Dict],
-        batch_idx: int
-    ):
-        """Save generation checkpoint."""
+
+    def _save_checkpoint(self, results: List[Dict], batch_idx: int):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         checkpoint_dir = Path(self.config.output_dir) / "checkpoints"
         checkpoint_dir.mkdir(exist_ok=True)
@@ -304,13 +230,11 @@ class CategoriesExperiment:
         checkpoint_path = checkpoint_dir / f"checkpoint_{batch_idx}_{timestamp}.json"
         with open(checkpoint_path, 'w') as f:
             json.dump(results, f, indent=2)
-            
+        
         self.logger.experiment_logger.info(f"Saved checkpoint at batch {batch_idx}")
 
 def parse_arguments():
-    """Parse command line arguments for categories experiment."""
     parser = argparse.ArgumentParser(description="Run categories experiment")
-    
     parser.add_argument(
         '--config_type',
         type=str,
@@ -324,12 +248,10 @@ def parse_arguments():
         default='experiments/experiment3_categories/results',
         help='Output directory for results'
     )
-    
     return parser.parse_args()
 
 def main(args=None):
     try:
-        # Set up args
         if isinstance(args, dict):
             parser = argparse.ArgumentParser()
             parser.add_argument('--config_type', type=str)
@@ -340,10 +262,9 @@ def main(args=None):
         else:
             args = parse_arguments()
 
-        # Run experiment
         config = CategoriesConfigFactory.get_config_for_type(args.config_type)
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore") 
+            warnings.simplefilter("ignore")
             experiment = CategoriesExperiment(
                 config=config,
                 experiment_name=f"categories_{args.config_type}",
@@ -351,22 +272,17 @@ def main(args=None):
             )
             experiment.setup()
             results = experiment.run()
-            
-        # Cleanup
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache() 
-        gc.collect()
-            
-        return results
-            
-    except Exception as e:
-        logging.error(f"Error in categories experiment: {str(e)}", exc_info=True)
-        raise
-    finally:
-        # Final cleanup
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
 
-if __name__ == "__main__":
-    main()
+        return results
+
+    except Exception as e:
+        logging.error(f"Error in categories experiment: {str(e)}", exc_info=True)
+        raise
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()

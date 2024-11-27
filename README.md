@@ -9,7 +9,7 @@
 # **How to Download the data**
 Since most of data is from the previous experiment in the Power of Noise paper, most of data is downloaded directly from there. But some files are downloaded from the Driver provided by Florin in his work
 
-* **Command to download the data:** Just run the command python3 src/download_data.py
+* **Command to download the data:** Just run the command python3 src/run_all_experiments.py
 
 **What this command is going to do:** 
 * This command will download all required files into a folder called data/downloaded_files.

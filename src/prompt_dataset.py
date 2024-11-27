@@ -178,25 +178,25 @@ class PromptDataset(Dataset):
         category_info (Optional[Dict[str, Any]]): Information for category-based organization.
     """
     def __init__(
-        self, 
+        self,
         corpus: List[Dict],
-        data_path: str,  
+        data_path: str,
         tokenizer: AutoTokenizer,
         max_tokenized_length: int,
         search_results: List[Tuple[List[int], List[float]]],
-        full_to_subset_idx_map: Dict[int, int] = None,
+        full_to_subset_idx_map: Optional[Dict[int, int]] = None,
         do_normalize_query: bool = False,
         num_documents_in_context: int = 5,
-        gold_position: int = None,
+        gold_position: Optional[int] = None,
         randomize_gold_position: bool = False,
         get_documents_without_answer: bool = False,
+        max_doc_length: Optional[int] = None,  # Keep max_doc_length
         use_clustering: bool = False,
         num_clusters: Optional[int] = None,
         cluster_seed: int = 42,
-        category_info: Optional[Dict[str, Any]] = None
+        category_info: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
-        # Core parameters
         self.corpus = corpus
         self.data_path = data_path
         self.tokenizer = tokenizer
@@ -208,20 +208,15 @@ class PromptDataset(Dataset):
         self.gold_position = gold_position
         self.randomize_gold_position = randomize_gold_position
         self.get_documents_without_answer = get_documents_without_answer
-
-        # Clustering configuration
+        self.max_doc_length = max_doc_length  # Use this for truncation
         self.use_clustering = use_clustering
-        if use_clustering and num_clusters is None:
-            raise ValueError("num_clusters must be specified when use_clustering is True")
-        self.clusterer = DocumentClusterer(num_clusters, cluster_seed) if use_clustering else None
-        
-        # Category organization
+        self.clusterer = (
+            DocumentClusterer(num_clusters, cluster_seed) if use_clustering else None
+        )
         self.category_info = category_info
 
-        # Add preprocessing step before validation and data loading
-        self.preprocess_search_results()
-        
         self._validate_initialization_parameters()
+        self.preprocess_search_results()
         self._load_data()
 
     def _validate_initialization_parameters(self):
@@ -573,52 +568,37 @@ class PromptDataset(Dataset):
             return self._get_documents_from_indices(indices)
 
     def _get_documents_from_indices(self, indices: List[int]) -> Tuple[List[str], List[int]]:
-        """
-        Selects documents from the corpus based on provided indices with robust index handling.
-        """
         try:
             formatted_documents = []
             document_indices = []
             seen_hashes = set()
             
-            # Validate indices before mapping
             valid_indices = []
             max_idx = len(self.corpus) - 1
-            
+
             for i in map(int, indices):
-                # Handle index mapping if using subset
-                if self.full_to_subset_idx_map is not None:
-                    # Only proceed if index exists in mapping
+                if self.full_to_subset_idx_map:
                     if i in self.full_to_subset_idx_map:
-                        mapped_idx = self.full_to_subset_idx_map[i]
-                        if 0 <= mapped_idx <= max_idx:
-                            valid_indices.append(mapped_idx)
-                else:
-                    # Direct index validation for full corpus
-                    if 0 <= i <= max_idx:
-                        valid_indices.append(i)
-                        
-            # Process valid indices
+                        subset_idx = self.full_to_subset_idx_map[i]
+                        if 0 <= subset_idx <= max_idx:
+                            valid_indices.append(subset_idx)
+                elif 0 <= i <= max_idx:
+                    valid_indices.append(i)
+
             for idx in valid_indices:
                 doc_info = self.corpus[idx]
-                doc_idx = doc_info.get('full_corpus_idx', idx)
-                title = doc_info.get('title', '')
-                text = doc_info.get('text', '')
-                
-                doc_hash = hash_document(text)
-                if doc_hash in seen_hashes:
-                    continue
-                seen_hashes.add(doc_hash)
-                
-                doc_str = f"Document [{doc_idx}](Title: {title}) {text}"
+                text = doc_info.get("text", "")
+                if self.max_doc_length:
+                    text = text[:self.max_doc_length]
+                doc_str = f"Document [{idx}](Title: {doc_info.get('title', '')}) {text}"
                 formatted_documents.append(doc_str)
-                document_indices.append(doc_idx)
-                
+                document_indices.append(idx)
+
                 if len(formatted_documents) == self.num_documents_in_context:
                     break
-                    
+
             return formatted_documents, document_indices
-            
+
         except Exception as e:
             logging.error(f"Error processing documents: {str(e)}")
             return [], []
@@ -879,13 +859,13 @@ class MultiCorpusDataset(PromptDataset):
         documents_other: List[str], 
         indices_main: List[int], 
         indices_other: List[int]
-    ) -> Tuple[List[str], List[int]]:
+        ) -> Tuple[List[str], List[int]]:
         """
         Merges documents from the main and additional corpora based on the criteria specified in documents_disposition_info.
         """
-        num_main_documents = self.documents_disposition_info['num_main_documents']    
-        num_other_documents = self.documents_disposition_info['num_other_documents']
-        put_main_first = self.documents_disposition_info['put_main_first']
+        num_main_documents = self.documents_disposition_info.get('num_main_documents', len(documents_main))
+        num_other_documents = self.documents_disposition_info.get('num_other_documents', len(documents_other))
+        put_main_first = self.documents_disposition_info.get('put_main_first', True)
 
         if put_main_first:
             merged_documents = documents_main[:num_main_documents] + documents_other[:num_other_documents]
@@ -894,53 +874,52 @@ class MultiCorpusDataset(PromptDataset):
             # Retrieved documents are reversed ([::-1]), so that the documents with higher scores are at the end
             merged_documents = documents_other[:num_other_documents] + documents_main[:num_main_documents][::-1]
             merged_document_indices = indices_other[:num_other_documents] + indices_main[:num_main_documents][::-1]
+
         return merged_documents, merged_document_indices
 
     def _get_documents_from_indices(self, indices: List[int]) -> Tuple[List[str], List[int]]:
         """
-        Safely get documents from corpus using indices, with validation.
+        Retrieves documents from both the main corpus and the secondary corpus using indices.
+        Validates and merges documents based on the configuration.
+
+        Args:
+            indices (List[int]): Indices to fetch documents.
+
+        Returns:
+            Tuple[List[str], List[int]]: Merged list of formatted documents and their indices.
         """
-        formatted_documents = []
-        document_indices = []
-        
-        # Full corpus
         try:
-            if self.full_to_subset_idx_map is None:
-                # Validate indices are within corpus bounds
-                max_idx = len(self.corpus) - 1
-                valid_indices = [i for i in map(int, indices) if 0 <= i <= max_idx]
-                documents_info = [self.corpus[i] for i in valid_indices]
-            else:
-                documents_info = []
-                # Map indices and validate
-                for i in map(int, indices):
-                    if i in self.full_to_subset_idx_map:
-                        subset_idx = self.full_to_subset_idx_map[i]
-                        if 0 <= subset_idx < len(self.corpus):
-                            documents_info.append(self.corpus[subset_idx])
-            
-            # Process valid documents
-            seen_hashes = set()
-            for doc_info in documents_info:
-                if len(formatted_documents) == self.num_documents_in_context:
-                    break
-                
-                doc_idx = doc_info['full_corpus_idx']
-                title = doc_info.get('title', '')
-                text = doc_info.get('text', '')
+            # Validate indices and fetch from the main corpus
+            formatted_documents_main, document_indices_main = super()._get_documents_from_indices(indices)
 
-                doc_hash = hash_document(text)
-                if doc_hash in seen_hashes:
-                    continue
-                seen_hashes.add(doc_hash)
-                
-                doc_str = f"Document [{doc_idx}](Title: {title}) {text}"
-                formatted_documents.append(doc_str)
-                document_indices.append(doc_idx)
+            # Fetch indices and documents from the secondary corpus
+            indices_other_corpus, _ = self.search_results_other_corpus[indices[0]]  # Assumes example_idx for secondary
+            formatted_documents_other, document_indices_other = [], []
 
-            return formatted_documents, document_indices
-            
+            # Check for secondary corpus availability
+            if self.documents_other_corpus and indices_other_corpus:
+                for idx in indices_other_corpus:
+                    if 0 <= idx < len(self.documents_other_corpus):
+                        doc_info = self.documents_other_corpus[idx]
+                        text = doc_info.get("text", "")
+                        if self.max_doc_length:
+                            text = text[:self.max_doc_length]
+                        doc_str = f"Document [{idx}](Title: {doc_info.get('title', '')}) {text}"
+                        formatted_documents_other.append(doc_str)
+                        document_indices_other.append(idx)
+                    if len(formatted_documents_other) == self.documents_disposition_info.get('num_other_documents', 0):
+                        break
+
+            # Merge main and secondary corpus documents
+            merged_documents, merged_indices = self._merge_documents(
+                formatted_documents_main,
+                formatted_documents_other,
+                document_indices_main,
+                document_indices_other,
+            )
+
+            return merged_documents, merged_indices
+
         except Exception as e:
-            logging.error(f"Error accessing corpus documents: {str(e)}")
-            # Return empty results rather than failing
+            logging.error(f"Error accessing multi-corpus documents: {str(e)}")
             return [], []

@@ -210,4 +210,27 @@ class LLM:
             )
                 
         return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+    
+    def _define_stopping_criteria(self):
+        """Define stopping criteria for text generation."""
+        if not self.stop_list:
+            return StoppingCriteriaList()
+
+
+        class StopOnTokens(StoppingCriteria):
+            def __init__(self, tokenizer, stop_list):
+                super().__init__()
+                self.tokenizer = tokenizer
+                self.stop_token_ids = [
+                    tokenizer(stop_word, add_special_tokens=False)['input_ids']
+                    for stop_word in stop_list
+                ]
+
+            def __call__(self, input_ids, scores, **kwargs):
+                for stop_ids in self.stop_token_ids:
+                    if input_ids[0][-len(stop_ids):].tolist() == stop_ids:
+                        return True
+                return False
+
+        return StoppingCriteriaList([StopOnTokens(self.tokenizer, self.stop_list)])
 

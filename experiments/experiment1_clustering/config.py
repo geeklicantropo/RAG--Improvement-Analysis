@@ -40,6 +40,10 @@ class ClusteringConfig:
     # Processing configuration
     batch_size: int = 32
     use_gpu: bool = True
+
+    normalize_embeddings: bool = True
+    lower_case: bool = False 
+    do_normalize_text: bool = True
     
     # Output configuration 
     output_dir: str = field(default_factory=lambda: f"experiments/experiment1_clustering/results/{datetime.now().strftime('%Y%m%d_%H%M%S')}")

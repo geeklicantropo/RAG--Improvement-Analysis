@@ -70,7 +70,10 @@ class ClusteringExperiment:
                     device=self.device,
                     tokenizer=self.llm.tokenizer,
                     query_encoder=self.encoder,
-                    max_length=self.config.max_length_encoder
+                    max_length=self.config.max_length_encoder,
+                    norm_query_emb=self.config.normalize_embeddings,
+                    lower_case=self.config.lower_case,
+                    do_normalize_text=self.config.do_normalize_text
                 )
             
             # Initialize clusterer

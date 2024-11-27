@@ -10,6 +10,7 @@ import time
 from src.experiment_logger import ExperimentLogger
 from src.rag_fusion_utils import RAGFusionRanker
 
+
 class CategoriesExperimentUtils:
     """Utilities for category-based RAG experiments."""
     

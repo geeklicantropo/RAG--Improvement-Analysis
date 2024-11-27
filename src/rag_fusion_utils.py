@@ -60,7 +60,10 @@ class RAGFusionRanker:
             
         return [(score - min_score) / (max_score - min_score) for score in scores]
     
-    def reciprocal_rank_fusion(self, results_list: List[Union[Tuple[List[str], List[float]], Dict]]) -> List[Tuple[List[str], List[float]]]:
+    def reciprocal_rank_fusion(
+        self, 
+        results_list: List[Union[Tuple[List[str], List[float]], Dict]]
+    ) -> List[Tuple[List[str], List[float]]]:
         """Implement reciprocal rank fusion with better error handling."""
         fused_results = []
         
@@ -89,13 +92,16 @@ class RAGFusionRanker:
                 sorted_results = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
                 doc_ids, scores = zip(*sorted_results) if sorted_results else ([], [])
                 fused_results.append((list(doc_ids), list(scores)))
-                
+            
             return fused_results
             
         except Exception as e:
             raise ValueError(f"Error during fusion: {str(e)}")
     
-    def _linear_combination(self, results_list: List[Tuple[List[str], List[float]]]) -> Tuple[List[str], List[float]]:
+    def _linear_combination(
+        self, 
+        results_list: List[Tuple[List[str], List[float]]]
+    ) -> Tuple[List[str], List[float]]:
         """Implement linear score combination."""
         fused_scores = {}
         for retriever, (doc_ids, scores) in enumerate(results_list):
@@ -111,25 +117,6 @@ class RAGFusionRanker:
         doc_ids, scores = zip(*sorted_results)
         return list(doc_ids), list(scores)
     
-    def _compute_rrf_scores(
-        self, 
-        doc_ranks: Dict[str, int]
-    ) -> float:
-        """
-        Compute RRF score for a document based on its ranks from different retrievers.
-        
-        Args:
-            doc_ranks: Dictionary mapping retriever names to document ranks
-            
-        Returns:
-            Combined RRF score
-        """
-        rrf_score = 0.0
-        for retriever, rank in doc_ranks.items():
-            weight = self.score_weights.get(retriever, 1.0)
-            rrf_score += weight * (1.0 / (self.k + rank))
-        return rrf_score
-
     def fuse_search_results(
         self, 
         retriever_results: Dict[str, List[Union[Dict, Tuple[List[str], List[float]]]]]) -> List[Tuple[List[str], List[float]]]:
