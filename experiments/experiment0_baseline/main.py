@@ -87,15 +87,17 @@ class BaselineExperiment:
 
 
     def run(self):
-        """Execute the baseline experiment workflow with enhanced memory management."""
+        """Execute the baseline experiment workflow with memory optimization."""
         try:
             self.logger.log_step_start("Experiment execution")
             
+            # Monitor initial GPU memory
             if torch.cuda.is_available():
                 gpu = torch.cuda.current_device()
                 initial_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
                 self.config.adjust_batch_size(initial_memory)
 
+            # Create data loader with adjusted batch size
             dataloader = torch.utils.data.DataLoader(
                 self.dataset,
                 batch_size=self.config.batch_size,
@@ -103,87 +105,60 @@ class BaselineExperiment:
                 num_workers=8,
                 pin_memory=True
             )
-
-            all_metrics = []
-            checkpoint_counter = 0
             
+            results = []
             for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
+                # Monitor memory during processing
                 if torch.cuda.is_available():
                     current_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
                     self.config.adjust_batch_size(current_memory)
                     
-                    if current_memory > 0.85:  # Memory threshold
-                        torch.cuda.empty_cache()
-                        gc.collect()
-
-                try:
-                    # Process in smaller sub-batches if needed
-                    sub_batch_size = min(len(batch['prompt']), self.config.batch_size)
-                    results = []
+                # Generate answers
+                prompts = batch['prompt']
+                generated_outputs = self.llm.generate(
+                    prompts,
+                    max_new_tokens=self.config.max_new_tokens
+                )
+                
+                # Process outputs
+                batch_results = self._process_batch_outputs(batch, generated_outputs)
+                results.extend(batch_results)
+                
+                # Save checkpoint if configured
+                if self.config.save_every and (batch_idx + 1) % self.config.save_every == 0:
+                    self._save_checkpoint(results, batch_idx + 1)
+                
+                # Force cleanup between batches
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                     
-                    for i in range(0, len(batch['prompt']), sub_batch_size):
-                        end_idx = min(i + sub_batch_size, len(batch['prompt']))
-                        sub_batch = {k: v[i:end_idx] for k, v in batch.items()}
+                # Update memory metrics
+                if self.logger:
+                    self.logger.track_memory_usage()
+                    if self.logger.check_memory_threshold():
+                        self.config.batch_size = max(1, self.config.batch_size // 2)
                         
-                        # Generate answers
-                        generated_outputs = self.llm.generate(
-                            sub_batch['prompt'],
-                            max_new_tokens=self.config.max_new_tokens
-                        )
-                        
-                        # Process outputs
-                        batch_results = self._process_batch_outputs(sub_batch, generated_outputs)
-                        results.extend(batch_results)
-                        
-                        # Clear memory
-                        del generated_outputs
-                        torch.cuda.empty_cache()
-
-                    # Save checkpoint
-                    if self.config.save_every and (batch_idx + 1) % self.config.save_every == 0:
-                        checkpoint_dir = Path(self.config.output_dir) / "checkpoints"
-                        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                        
-                        checkpoint_counter += 1
-                        checkpoint_path = checkpoint_dir / f"checkpoint_{checkpoint_counter}.json"
-                        
-                        # Convert tensors and save
-                        serializable_results = [{k: v.tolist() if torch.is_tensor(v) else v for k, v in r.items()} for r in results]
-                        with open(checkpoint_path, 'w') as f:
-                            json.dump(serializable_results, f, indent=2)
-                        
-                        # Compute metrics for this batch
-                        batch_metrics = self._compute_metrics(results)
-                        all_metrics.append(batch_metrics)
-                        
-                        # Clear results after saving
-                        results = []
-                        gc.collect()
-                    
-                except Exception as e:
-                    self.logger.log_error(e, f"Error processing batch {batch_idx}")
-                    continue
-
-            # Compute final metrics
-            final_metrics = self._aggregate_metrics(all_metrics)
+            # Analyze results
+            metrics = self._compute_metrics(results)
             
-            # Save final results
+            # Save results with timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = Path(self.config.output_dir) / f"run_{timestamp}"
             output_dir.mkdir(parents=True, exist_ok=True)
             
-            with open(output_dir / "metrics.json", 'w') as f:
-                json.dump(final_metrics, f, indent=2)
-
+            self._save_results(results, metrics, output_dir)
+            
             self.logger.log_step_end("Experiment execution")
-            return None, final_metrics
+            return results, metrics
             
         except Exception as e:
             self.logger.log_error(e, "Error during experiment execution")
             raise
         finally:
+            # Ensure cleanup
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()
             gc.collect()
 
     def _run_generation(self, dataloader):
@@ -207,12 +182,8 @@ class BaselineExperiment:
                 
         return results
 
-    def _process_batch_outputs(
-    self,
-    batch: Dict[str, Any],
-    outputs: List[str]
-    ) -> List[Dict[str, Any]]:
-        """Process generation outputs for a batch."""
+    def _process_batch_outputs(self, batch: Dict[str, torch.Tensor], outputs: List[str]) -> List[Dict]:
+        """Process generation outputs with memory monitoring."""
         processed_results = []
         answer_string = "### Response:" if 'mpt' in self.config.llm_id else "Answer:"
         
@@ -224,26 +195,22 @@ class BaselineExperiment:
                 start_idx = outputs[idx].find(answer_string) + len(answer_string)
                 answer = outputs[idx][start_idx:].strip()
                 
-                # Convert tensors to regular Python types
-                doc_indices = batch['document_indices'][idx]
-                if torch.is_tensor(doc_indices):
-                    doc_indices = doc_indices.cpu().numpy().tolist()
-                elif isinstance(doc_indices, np.ndarray):
-                    doc_indices = doc_indices.tolist()
-                    
                 result = {
-                    'example_id': batch['example_id'][idx] if 'example_id' in batch else idx,
                     'query': batch['query'][idx],
                     'generated_answer': answer,
-                    'document_indices': doc_indices,
-                    'prompt_tokens_len': int(batch['prompt_tokens_len'][idx].item()) if torch.is_tensor(batch['prompt_tokens_len'][idx]) else batch['prompt_tokens_len'][idx]
+                    'document_indices': batch['document_indices'][idx] if isinstance(batch['document_indices'], list) else batch['document_indices'].tolist()[idx],
+                    'prompt_tokens_len': batch['prompt_tokens_len'][idx]
                 }
                 processed_results.append(result)
-                
             except Exception as e:
                 self.logger.log_error(e, f"Error processing batch item {idx}")
                 continue
-                    
+        
+        # Clean up batch tensors
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                del v
+        
         return processed_results
 
     def _compute_metrics(self, results):

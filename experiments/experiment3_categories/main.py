@@ -121,20 +121,17 @@ class CategoriesExperiment:
             raise
     
     def run(self):
-        """Run the categories experiment."""
+        """Run the categories experiment with memory optimization."""
         try:
             self.logger.log_step_start("Experiment execution")
             
-            # Monitor initial GPU memory
             if torch.cuda.is_available():
                 gpu = torch.cuda.current_device()
                 initial_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
                 self.config.adjust_batch_sizes(initial_memory)
             
-            # Log configuration
             self.logger.log_experiment_params(self.config.to_dict())
             
-            # Create data loader with adjusted batch size
             dataloader = torch.utils.data.DataLoader(
                 self.dataset,
                 batch_size=self.config.batch_size,
@@ -143,15 +140,13 @@ class CategoriesExperiment:
                 pin_memory=True
             )
             
-            # Run generation
             results = []
             for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
-                # Monitor memory during processing
                 if torch.cuda.is_available():
                     current_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
                     self.config.adjust_batch_sizes(current_memory)
 
-                # Categorize documents
+                # Categorize documents in smaller batches
                 categorized_docs = self.utils.categorize_documents(
                     batch['documents'],
                     batch['scores'],
@@ -172,7 +167,6 @@ class CategoriesExperiment:
                     max_new_tokens=self.config.max_new_tokens
                 )
                 
-                # Process outputs
                 batch_results = self._process_batch_outputs(
                     batch,
                     generated_outputs,
@@ -180,14 +174,19 @@ class CategoriesExperiment:
                 )
                 results.extend(batch_results)
                 
-                # Save checkpoint if needed
                 if self.config.save_intermediates and (batch_idx + 1) % self.config.save_every == 0:
                     self._save_checkpoint(results, batch_idx + 1)
 
-            # Analyze results
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+                
+                if self.logger.check_memory_threshold():
+                    self.config.batch_size = max(1, self.config.batch_size // 2)
+                    self.config.categorization_batch_size = max(20, self.config.categorization_batch_size // 2)
+
             metrics = self.utils.analyze_category_impact(results, self.logger)
             
-            # Save results
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = Path(self.config.output_dir) / f"run_{timestamp}"
             
@@ -205,6 +204,10 @@ class CategoriesExperiment:
         except Exception as e:
             self.logger.log_error(e, "Error during experiment execution")
             raise
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
             
     def _run_generation(
         self, 
@@ -251,30 +254,41 @@ class CategoriesExperiment:
         return results
     
     def _process_batch_outputs(
-        self,
-        batch: Dict[str, Any],
-        outputs: List[str],
-        categorized_docs: Dict[str, List[Dict]]
+    self,
+    batch: Dict[str, Any],
+    outputs: List[str],
+    categorized_docs: Dict[str, List[Dict]]
     ) -> List[Dict[str, Any]]:
-        """Process generation outputs for a batch."""
+        """Process generation outputs with memory optimization."""
         processed_results = []
         answer_string = "### Response:" if 'mpt' in self.config.llm_id else "Answer:"
         
         for idx, output in enumerate(outputs):
-            # Extract answer
-            start_idx = output.find(answer_string) + len(answer_string)
-            answer = output[start_idx:].strip()
-            
-            # Create result dictionary
-            result = {
-                'query': batch['query'][idx],
-                'generated_answer': answer,
-                'category_info': categorized_docs,
-                'document_indices': batch['document_indices'][idx],
-                'prompt_tokens_len': batch['prompt_tokens_len'][idx]
-            }
-            processed_results.append(result)
-            
+            try:
+                start_idx = output.find(answer_string) + len(answer_string)
+                answer = output[start_idx:].strip()
+                
+                result = {
+                    'query': batch['query'][idx],
+                    'generated_answer': answer,
+                    'category_info': {
+                        k: [d.copy() for d in docs] 
+                        for k, docs in categorized_docs.items()
+                    },
+                    'document_indices': batch['document_indices'][idx],
+                    'prompt_tokens_len': batch['prompt_tokens_len'][idx]
+                }
+                processed_results.append(result)
+                
+            except Exception as e:
+                self.logger.log_error(e, f"Error processing batch item {idx}")
+                continue
+                
+            if torch.cuda.is_available():
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        del v
+        
         return processed_results
     
     def _save_checkpoint(

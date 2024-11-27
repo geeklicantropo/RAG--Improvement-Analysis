@@ -88,31 +88,31 @@ class ClusteringExperiment:
             raise
 
     def run(self):
-        """Run the clustering experiment."""
+        """Run the clustering experiment with memory optimization."""
         try:
             self.logger.log_step_start("Experiment execution")
             
-            # Monitor initial GPU memory
+            # Monitor GPU memory
             if torch.cuda.is_available():
                 gpu = torch.cuda.current_device()
                 initial_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
                 self.config.adjust_batch_sizes(initial_memory)
 
-            # Create timestamp for new results
+            # Create timestamp for results
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = Path(self.config.output_dir) / f"run_{timestamp}"
             output_dir.mkdir(parents=True, exist_ok=True)
             
-            # Load or compute document embeddings
+            # Load or compute embeddings
             embeddings = self._prepare_embeddings(output_dir)
             
-            # Perform document clustering
+            # Cluster documents in batches
             clusters = self._cluster_documents(embeddings)
             
             # Initialize dataset with clustering
             dataset = self._initialize_dataset(clusters)
             
-            # Create dataloader with adjusted batch size
+            # Create dataloader
             dataloader = torch.utils.data.DataLoader(
                 dataset,
                 batch_size=self.config.batch_size,
@@ -123,7 +123,7 @@ class ClusteringExperiment:
             
             results = []
             for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
-                # Monitor memory during processing
+                # Monitor memory
                 if torch.cuda.is_available():
                     current_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
                     self.config.adjust_batch_sizes(current_memory)
@@ -139,14 +139,21 @@ class ClusteringExperiment:
                 batch_results = self._process_batch_outputs(batch, generated_outputs)
                 results.extend(batch_results)
                 
-                # Save checkpoint if needed
+                # Save checkpoints
                 if self.config.save_intermediates and (batch_idx + 1) % self.config.save_every == 0:
                     self._save_checkpoint(results, batch_idx + 1)
+
+                # Memory cleanup
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+                
+                # Adjust batch size if memory high
+                if self.logger.check_memory_threshold():
+                    self.config.batch_size = max(1, self.config.batch_size // 2)
             
-            # Evaluate results
+            # Evaluate and save results
             metrics = self._evaluate_results(results)
-            
-            # Save artifacts
             self._save_experiment_artifacts(results, metrics, clusters, output_dir)
             
             self.logger.log_step_end("Experiment execution")
@@ -155,6 +162,10 @@ class ClusteringExperiment:
         except Exception as e:
             self.logger.log_error(e, "Error during experiment execution")
             raise
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
     
     def _initialize_dataset(self, clusters: Dict[int, List[int]]) -> PromptDataset:
         """Initialize dataset with clustering."""
@@ -192,25 +203,37 @@ class ClusteringExperiment:
             raise
 
     def _cluster_documents(self, embeddings: np.ndarray) -> Dict[int, List[int]]:
-        """Perform K-means clustering on document embeddings."""
+        """Perform clustering with memory management."""
         self.logger.log_step_start("Clustering documents")
         
         try:
-            # Fit clusters
-            clusters = self.clusterer.fit_clusters(embeddings)
+            clusters = {}
+            embeddings_batch_size = self.config.clustering_batch_size
+
+            # Process embeddings in batches
+            for start_idx in range(0, len(embeddings), embeddings_batch_size):
+                end_idx = min(start_idx + embeddings_batch_size, len(embeddings))
+                batch_embeddings = embeddings[start_idx:end_idx]
+                
+                # Fit clusters for batch
+                batch_clusters = self.clusterer.fit_clusters(batch_embeddings)
+                
+                # Merge with existing clusters
+                for cluster_id, doc_indices in batch_clusters.items():
+                    if cluster_id not in clusters:
+                        clusters[cluster_id] = []
+                    clusters[cluster_id].extend([idx + start_idx for idx in doc_indices])
+                
+                # Memory cleanup
+                del batch_embeddings
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
-            # Log clustering metrics
+            # Log cluster stats
             cluster_sizes = {k: len(v) for k, v in clusters.items()}
             self.logger.log_metric("cluster_sizes", cluster_sizes)
-            self.logger.log_metric("num_clusters", len(clusters))
             
-            # Calculate cluster statistics
-            cluster_stats = self._compute_cluster_stats(clusters, embeddings)
-            self.logger.log_metric("cluster_statistics", cluster_stats)
-            
-            self.logger.log_step_end("Clustering documents")
             return clusters
-            
         except Exception as e:
             self.logger.log_error(e, "Error during clustering")
             raise

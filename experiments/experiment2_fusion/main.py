@@ -117,7 +117,7 @@ class FusionExperiment:
         )
     
     def run(self):
-        """Run the fusion experiment."""
+        """Run the fusion experiment with memory optimization."""
         try:
             self.logger.log_step_start("Experiment execution")
             
@@ -130,7 +130,7 @@ class FusionExperiment:
             # Log configuration
             self.logger.log_experiment_params(self.config.to_dict())
             
-            # Create data loader with adjusted batch size
+            # Create dataloader 
             dataloader = torch.utils.data.DataLoader(
                 self.dataset,
                 batch_size=self.config.batch_size,
@@ -147,7 +147,7 @@ class FusionExperiment:
                     current_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
                     self.config.adjust_batch_sizes(current_memory)
 
-                # Perform fusion ranking
+                # Perform fusion ranking in smaller batches
                 fused_results = self.fusion_ranker.fuse_batch(
                     batch,
                     batch_size=self.config.fusion_batch_size
@@ -173,13 +173,20 @@ class FusionExperiment:
                 # Save checkpoint if needed
                 if self.config.save_intermediates and (batch_idx + 1) % self.config.save_every == 0:
                     self._save_checkpoint(results, batch_idx + 1)
+                
+                # Memory cleanup
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+                
+                # Monitor memory threshold
+                if self.logger.check_memory_threshold():
+                    self.config.batch_size = max(1, self.config.batch_size // 2)
             
-            # Analyze results
+            # Analyze results and save
             metrics = self.utils.analyze_fusion_results(results, self.logger)
             
-            # Save results
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_dir = Path(self.config.output_dir) / f"run_{timestamp}"
+            output_dir = Path(self.config.output_dir) / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             
             self.utils.save_fusion_artifacts(
                 results,
@@ -195,6 +202,10 @@ class FusionExperiment:
         except Exception as e:
             self.logger.log_error(e, "Error during experiment execution")
             raise
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
             
     def _run_generation(
         self, 
@@ -222,32 +233,45 @@ class FusionExperiment:
         return results
     
     def _process_batch_outputs(
-        self,
-        batch: Dict[str, Any],
-        outputs: List[str]
+    self,
+    batch: Dict[str, Any],
+    outputs: List[str],
+    fused_results: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Process generation outputs for a batch."""
+        """Process generation outputs with memory monitoring."""
         processed_results = []
         answer_string = "### Response:" if 'mpt' in self.config.llm_id else "Answer:"
         
         for idx, output in enumerate(outputs):
-            # Extract answer from generation
-            start_idx = output.find(answer_string) + len(answer_string)
-            answer = output[start_idx:].strip()
-            
-            # Create result dictionary
-            result = {
-                'query': batch['query'][idx],
-                'generated_answer': answer,
-                'retriever_scores': {
-                    'contriever': batch.get('contriever_scores', [None])[idx],
-                    'bm25': batch.get('bm25_scores', [None])[idx]
-                },
-                'document_indices': batch['document_indices'][idx],
-                'prompt_tokens_len': batch['prompt_tokens_len'][idx]
-            }
-            processed_results.append(result)
-            
+            try:
+                # Extract answer text
+                start_idx = output.find(answer_string) + len(answer_string)
+                answer = output[start_idx:].strip()
+                
+                # Create result with fusion info
+                result = {
+                    'query': batch['query'][idx],
+                    'generated_answer': answer,
+                    'retriever_scores': {
+                        'contriever': batch.get('contriever_scores', [None])[idx],
+                        'bm25': batch.get('bm25_scores', [None])[idx]
+                    },
+                    'fused_score': fused_results[idx].get('score'),
+                    'document_indices': batch['document_indices'][idx],
+                    'prompt_tokens_len': batch['prompt_tokens_len'][idx]
+                }
+                processed_results.append(result)
+                
+            except Exception as e:
+                self.logger.log_error(e, f"Error processing batch item {idx}")
+                continue
+                
+            # Clean up batch tensors
+            if torch.cuda.is_available():
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        del v
+        
         return processed_results
     
     def _save_checkpoint(self, results: List[Dict], batch_idx: int):

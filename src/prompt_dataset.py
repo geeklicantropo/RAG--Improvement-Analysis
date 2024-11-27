@@ -6,6 +6,7 @@ from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 import logging
 import warnings
+import gc
 
 import normalize_text
 from normalize_answers import *
@@ -421,47 +422,47 @@ class PromptDataset(Dataset):
         
         Args:
             example_idx: Index of the example in the dataset
-            
+                
         Returns:
             List of valid corpus indices
-            
+                
         Raises:
             ValueError: If there is an index mismatch or invalid indices
         """
         # Validate example index against search results
         if not self.search_results:
             raise ValueError("No search results available")
-            
+                
         if example_idx >= len(self.search_results):
             raise ValueError(f"Example index {example_idx} out of range for search results of length {len(self.search_results)}")
 
         # Get search result indices and validate
         indices, scores = self.search_results[example_idx]
-        
+            
         # Convert to integers and validate corpus bounds
         try:
             valid_indices = []
             max_corpus_idx = len(self.corpus) - 1
-            
+                
             for idx in indices:
                 corpus_idx = int(idx)  # Convert to int
-                
+                    
                 # Handle index mapping if using subset
                 if self.full_to_subset_idx_map is not None:
                     if corpus_idx not in self.full_to_subset_idx_map:
                         continue
                     corpus_idx = self.full_to_subset_idx_map[corpus_idx]
-                    
+                        
                 # Validate corpus bounds
                 if 0 <= corpus_idx <= max_corpus_idx:
                     valid_indices.append(corpus_idx)
-                
+                    
             # Ensure we have enough valid indices
             if len(valid_indices) < self.num_documents_in_context:
                 # If not enough valid indices, find additional valid indices
                 current_indices = set(valid_indices)
                 additional_needed = self.num_documents_in_context - len(valid_indices)
-                
+                    
                 # Find additional valid indices from corpus
                 additional_indices = []
                 for i in range(max_corpus_idx + 1):
@@ -469,11 +470,11 @@ class PromptDataset(Dataset):
                         break
                     if i not in current_indices:
                         additional_indices.append(i)
-                        
+                            
                 valid_indices.extend(additional_indices[:additional_needed])
-                
+                    
             return valid_indices[:self.num_documents_in_context]
-            
+                
         except (ValueError, TypeError) as e:
             raise ValueError(f"Invalid index in search results: {str(e)}")
         

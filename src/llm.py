@@ -1,5 +1,8 @@
 import torch
 import warnings
+import gc
+from typing import Union, List
+
 from transformers import (
     AutoConfig, AutoTokenizer, AutoModelForCausalLM, 
     BitsAndBytesConfig, StoppingCriteriaList, StoppingCriteria
@@ -36,12 +39,9 @@ class LLM:
         self.bnb_config = self._set_quantization(quantization_bits)
         self.model, self.tokenizer = self._initialize_model_tokenizer(model_id)
         self.stopping_criteria = self._define_stopping_criteria()
-        
 
     def _set_quantization(self, quantization_bits: Optional[int]) -> Optional[BitsAndBytesConfig]:
-        """
-        Configure quantization settings based on the specified number of bits.
-        """
+        """Configure quantization settings based on the specified number of bits."""
         if quantization_bits in [4, 8]:
             bnb_config = BitsAndBytesConfig()
             if quantization_bits == 4:
@@ -53,41 +53,6 @@ class LLM:
                 bnb_config.load_in_8bit = True
             return bnb_config
         return None
- 
-
-    def _initialize_model_tokenizer(self, model_id: str) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
-        model_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        model_config.max_seq_len = self.model_max_length
-
-        # Split model across available GPU memory and CPU
-        device_map = self._get_optimal_device_map()
-        
-        model_kwargs = {
-            "trust_remote_code": True,
-            "config": model_config,
-            "torch_dtype": torch.float16,  # Use float16 instead of bfloat16 for better memory efficiency
-            "device_map": device_map,
-            "low_cpu_mem_usage": True,
-            "quantization_config": BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type='nf4'
-            )
-        }
-
-        model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
-        model.eval()
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_id,
-            padding_side="left",
-            truncation_side="left",
-            model_max_length=self.model_max_length
-        )
-        tokenizer.pad_token = tokenizer.eos_token
-        
-        return model, tokenizer
 
     def _get_optimal_device_map(self) -> dict:
         """Calculate optimal device map based on available GPU memory."""
@@ -114,55 +79,135 @@ class LLM:
         device_map = "balanced"
         return device_map
 
+    def _initialize_model_tokenizer(self, model_id: str) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
+        model_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        model_config.max_seq_len = self.model_max_length
 
-    def _define_stopping_criteria(self) -> StoppingCriteriaList:
-        """
-        Defines stopping criteria for text generation based on the provided stop_list.
-        """
-        stop_token_ids = [self.tokenizer(x)['input_ids'] for x in self.stop_list]
-        stop_token_ids = [torch.LongTensor(x).to(self.device) for x in stop_token_ids]
+        # Split model across available GPU memory and CPU
+        device_map = self._get_optimal_device_map()
+        
+        model_kwargs = {
+            "trust_remote_code": True,
+            "config": model_config,
+            "torch_dtype": torch.float16,
+            "device_map": device_map,
+            "low_cpu_mem_usage": True,
+            "quantization_config": BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type='nf4'
+            )
+        }
 
-        class StopOnTokens(StoppingCriteria):
-            def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-                for stop_ids in stop_token_ids:
-                    if torch.eq(input_ids[0][-len(stop_ids):], stop_ids).all():
-                        return True
-                return False
+        model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+        model.eval()
 
-        return StoppingCriteriaList([StopOnTokens()])
-    
-    
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            padding_side="left",
+            truncation_side="left",
+            model_max_length=self.model_max_length
+        )
+        tokenizer.pad_token = tokenizer.eos_token
+        
+        return model, tokenizer
+        
+    def cleanup_memory(self):
+        """Clean up GPU memory after generation."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+    def get_memory_usage(self) -> dict[str, float]:
+        """Get current GPU memory usage stats."""
+        memory_stats = {}
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                allocated = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                memory_stats[f'gpu_{i}'] = {
+                    'allocated_gb': allocated,
+                    'reserved_gb': reserved,
+                    'utilization': torch.cuda.utilization(i)
+                }
+        return memory_stats
+
+    def optimize_batch_size(self, initial_batch_size: int) -> int:
+        """Optimize batch size based on available memory."""
+        if not torch.cuda.is_available():
+            return initial_batch_size
+            
+        memory_stats = self.get_memory_usage()
+        min_available_gb = float('inf')
+        
+        for gpu_stats in memory_stats.values():
+            available = gpu_stats['reserved_gb'] - gpu_stats['allocated_gb']
+            min_available_gb = min(min_available_gb, available)
+            
+        if min_available_gb < 2:  # Less than 2GB available
+            return max(1, initial_batch_size // 2)
+        elif min_available_gb > 8:  # More than 8GB available
+            return min(initial_batch_size * 2, 64)
+            
+        return initial_batch_size
+
     def generate(self, prompt: str, max_new_tokens: int = 15) -> List[str]:
         """
-        Generates text based on the given prompt.
+        Generates text based on the given prompt with memory optimization.
         
         Args:
-            prompt (str): Input text prompt for generation.
+            prompt: Input text prompt for generation.
         
         Returns:
             List[str]: The generated text responses.
         """
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            
-            inputs = self.tokenizer(
-                prompt, 
-                padding=True, 
-                truncation=True, 
-                max_length=self.model_max_length, 
-                return_tensors="pt"
-            ).to(self.device)
-            
-            with torch.no_grad():
-                generated_ids = self.model.generate(
-                    **inputs,
-                    do_sample=False,
-                    max_new_tokens=max_new_tokens,
-                    repetition_penalty=1.1,
-                    stopping_criteria=self.stopping_criteria,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
                 
-            return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                # Optimize batch size before processing
+                if isinstance(prompt, list):
+                    batch_size = len(prompt)
+                    optimal_batch_size = self.optimize_batch_size(batch_size)
+                    if optimal_batch_size < batch_size:
+                        # Split into smaller batches if necessary
+                        all_outputs = []
+                        for i in range(0, batch_size, optimal_batch_size):
+                            batch_prompts = prompt[i:i + optimal_batch_size]
+                            batch_outputs = self._generate_batch(
+                                batch_prompts,
+                                max_new_tokens
+                            )
+                            all_outputs.extend(batch_outputs)
+                            self.cleanup_memory()
+                        return all_outputs
+                    
+                return self._generate_batch(prompt, max_new_tokens)
+                
+        finally:
+            self.cleanup_memory()
+            
+    def _generate_batch(self, prompts: Union[str, List[str]], max_new_tokens: int) -> List[str]:
+        """Generate text for a single batch."""
+        inputs = self.tokenizer(
+            prompts, 
+            padding=True,
+            truncation=True,
+            max_length=self.model_max_length,
+            return_tensors="pt"
+        ).to(self.device)
+            
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                **inputs,
+                do_sample=False,
+                max_new_tokens=max_new_tokens,
+                repetition_penalty=1.1,
+                stopping_criteria=self.stopping_criteria,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+                
+        return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 

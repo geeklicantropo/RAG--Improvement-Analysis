@@ -9,18 +9,17 @@ import warnings
 import psutil
 import torch
 from tqdm import tqdm
+import gc
 
 class ExperimentLogger:
-    _instances = {}  # Class variable to store instances
+    _instances = {}  
     
     def __new__(cls, experiment_name: str, base_log_dir: str = "logs"):
-        # Create singleton instance per experiment name
         if experiment_name not in cls._instances:
             cls._instances[experiment_name] = super().__new__(cls)
         return cls._instances[experiment_name]
         
     def __init__(self, experiment_name: str, base_log_dir: str = "logs"):
-        # Only initialize if this is a new instance
         if not hasattr(self, 'initialized'):
             self.experiment_name = experiment_name
             self.start_time = time.time()
@@ -32,6 +31,14 @@ class ExperimentLogger:
             Path(self.experiment_log_dir).mkdir(parents=True, exist_ok=True)
             Path(self.system_log_dir).mkdir(parents=True, exist_ok=True)
             
+            # Initialize memory tracking
+            self.memory_stats = {
+                'peak_gpu_memory': 0,
+                'peak_cpu_memory': 0,
+                'memory_warnings': [],
+                'gpu_utilization': []
+            }
+            
             # Suppress all warnings
             warnings.filterwarnings('ignore')
             logging.getLogger('transformers').setLevel(logging.ERROR)
@@ -41,22 +48,83 @@ class ExperimentLogger:
             self.experiment_logger = self._get_logger(
                 f"{experiment_name}_experiment",
                 os.path.join(self.experiment_log_dir, f"{experiment_name}_{self._get_timestamp()}.log"),
-                console_level=logging.INFO,  # More restrictive console output
-                file_level=logging.DEBUG     # Keep detailed logs in file
+                console_level=logging.INFO,
+                file_level=logging.DEBUG
             )
             self.system_logger = self._get_logger(
                 f"{experiment_name}_system",
                 os.path.join(self.system_log_dir, f"{experiment_name}_system_{self._get_timestamp()}.log"),
-                console_level=logging.WARNING,  # Only show warnings/errors on console
-                file_level=logging.INFO        # Keep important info in file
+                console_level=logging.WARNING,
+                file_level=logging.INFO
             )
             
             self.metrics = {}
             self.initialized = True
             
-            # Set up output filtering
             self._setup_output_filtering()
+
+    def track_memory_usage(self) -> Dict[str, float]:
+        """Track current memory usage statistics."""
+        stats = {
+            'cpu_percent': psutil.cpu_percent(),
+            'ram_percent': psutil.virtual_memory().percent,
+            'ram_used_gb': psutil.virtual_memory().used / (1024**3)
+        }
+        
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                stats[f'gpu_{i}_memory'] = torch.cuda.memory_allocated(i) / (1024**3)
+                stats[f'gpu_{i}_utilization'] = torch.cuda.utilization(i)
+                
+                self.memory_stats['peak_gpu_memory'] = max(
+                    self.memory_stats['peak_gpu_memory'],
+                    stats[f'gpu_{i}_memory']
+                )
+                
+        self.memory_stats['peak_cpu_memory'] = max(
+            self.memory_stats['peak_cpu_memory'],
+            stats['ram_used_gb']
+        )
+        
+        return stats
+
+    def check_memory_threshold(self, threshold: float = 0.9) -> bool:
+        """Check if memory usage exceeds threshold."""
+        stats = self.track_memory_usage()
+        
+        if stats['ram_percent'] / 100 > threshold:
+            self._log_memory_warning('CPU', stats['ram_percent'])
+            return True
+            
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                gpu_used = torch.cuda.memory_allocated(i) / torch.cuda.max_memory_allocated(i)
+                if gpu_used > threshold:
+                    self._log_memory_warning('GPU', gpu_used * 100, device=i)
+                    return True
+                    
+        return False
+
+    def _log_memory_warning(self, device_type: str, usage: float, device: int = 0):
+        """Log memory warning with timestamp."""
+        warning = {
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'device_type': device_type,
+            'device_id': device,
+            'usage_percent': usage
+        }
+        self.memory_stats['memory_warnings'].append(warning)
+        self.experiment_logger.warning(
+            f"High memory usage on {device_type}-{device}: {usage:.1f}%"
+        )
+
+    def cleanup_memory(self):
+        """Force memory cleanup."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
+    # Keep all existing methods
     def _setup_output_filtering(self):
         """Configure output filtering rules."""
         self.skip_patterns = [
@@ -67,11 +135,10 @@ class ExperimentLogger:
             'corpus_idx',
             'Document [',
             'embedding',
-            'processing batch',
+            'processing batch', 
             'tokenizer'
         ]
         
-        # Only show these patterns on console
         self.console_patterns = [
             'Error:',
             'WARNING:',
@@ -101,23 +168,20 @@ class ExperimentLogger:
         """Get or create logger with proper configuration and filtering."""
         logger = logging.getLogger(name)
         
-        # Remove existing handlers if any
         if logger.hasHandlers():
             logger.handlers.clear()
             
-        logger.setLevel(logging.DEBUG)  # Base level for logger
+        logger.setLevel(logging.DEBUG)
         
         formatter = logging.Formatter(
-            '%(asctime)s - %(levelname)s - %(message).500s'  # Limit message length
+            '%(asctime)s - %(levelname)s - %(message).500s'
         )
         
-        # Console handler with filtering
         console_handler = logging.StreamHandler()
         console_handler.setLevel(console_level)
         console_handler.setFormatter(formatter)
         console_handler.addFilter(lambda record: self._should_log_to_console(record.getMessage()))
         
-        # File handler for complete logging
         file_handler = logging.FileHandler(log_file)
         file_handler.setLevel(file_level)
         file_handler.setFormatter(formatter)
@@ -129,7 +193,6 @@ class ExperimentLogger:
         
     def log_experiment_params(self, params: Dict[str, Any]):
         """Log experiment parameters."""
-        # Only log to file, not console
         if isinstance(params, dict):
             self.experiment_logger.debug(f"Experiment Parameters: {json.dumps(params, indent=2)}")
         
@@ -138,8 +201,8 @@ class ExperimentLogger:
         return tqdm(
             iterable,
             desc=desc,
-            ncols=80,  # Fixed width
-            leave=False,  # Don't leave progress bars
+            ncols=80,
+            leave=False,
             **kwargs
         )
 
@@ -160,7 +223,6 @@ class ExperimentLogger:
                     for i in range(torch.cuda.device_count())
                 }
             
-            # Log to file only
             self.system_logger.debug(f"System Information: {json.dumps(system_info, indent=2)}")
             
         except Exception as e:
@@ -176,36 +238,39 @@ class ExperimentLogger:
     def log_metric(self, metric_name: str, value: Any):
         """Log metrics with controlled output."""
         self.metrics[metric_name] = value
-        # Only log certain metrics to console
         if any(pattern in metric_name for pattern in ['accuracy', 'loss', 'error']):
-            #self.experiment_logger.info(f"{metric_name}: {value}")
             self.experiment_logger.info(f"{metric_name}")
         else:
-            #self.experiment_logger.debug(f"{metric_name}: {value}")
             self.experiment_logger.debug(f"{metric_name}")
 
     def log_step_start(self, step_name: str) -> float:
-        """Log step start with timing."""
+        """Log step start with timing and memory stats."""
         start_time = time.time()
         self.step_start_times[step_name] = start_time
+        self.track_memory_usage()  # Add memory tracking
         self.experiment_logger.info(f"Starting: {step_name}")
         return start_time
 
     def log_step_end(self, step_name: str, start_time: Optional[float] = None) -> None:
-        """Log step completion with timing."""
+        """Log step completion with timing and memory stats."""
         if start_time is None:
             start_time = self.step_start_times.get(step_name, time.time())
         
         duration = time.time() - start_time
+        memory_stats = self.track_memory_usage() 
         self.experiment_logger.info(f"Completed: {step_name} ({duration:.2f}s)")
         self.step_start_times.pop(step_name, None)
 
     def save_metrics(self):
-        """Save metrics to file without console output."""
+        """Save metrics and memory stats to file."""
         metrics_file = os.path.join(
             self.experiment_log_dir,
             f"metrics_{self._get_timestamp()}.json"
         )
+        
+        # Add memory stats to metrics
+        self.metrics['memory_stats'] = self.memory_stats
+        
         with open(metrics_file, 'w') as f:
             json.dump(self.metrics, f, indent=2)
         self.experiment_logger.debug(f"Metrics saved to {metrics_file}")
@@ -218,11 +283,13 @@ class ExperimentLogger:
 
     def __enter__(self):
         self.log_system_info()
+        self.track_memory_usage()  
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is not None:
             self.log_error(exc_val)
         self.save_metrics()
+        self.cleanup_memory() 
         duration = self.get_experiment_duration()
         self.experiment_logger.info(f"Experiment completed in {duration:.2f}s")
