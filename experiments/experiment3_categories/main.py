@@ -262,27 +262,30 @@ def main(args=None):
         else:
             args = parse_arguments()
 
-        config = CategoriesConfigFactory.get_config_for_type(args.config_type)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            experiment = CategoriesExperiment(
-                config=config,
-                experiment_name=f"categories_{args.config_type}",
-                logger=ExperimentLogger(f"categories_{args.config_type}")
-            )
-            experiment.setup()
-            results = experiment.run()
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-
-        return results
-
+        try:
+            args = parse_arguments() if args is None else argparse.Namespace(**args)
+            config = CategoriesConfigFactory.get_config_for_type(args.config_type)
+            experiment = CategoriesExperiment(config)
+            
+            # Run phases sequentially with checkpoint detection
+            experiment.run_retrieval_phase()
+            experiment.run_categorization_phase() # Specific to categories
+            experiment.run_generation_phase()
+            metrics = experiment.run_evaluation_phase()
+            
+        except Exception as e:
+            logging.error(f"Error in categories experiment: {str(e)}", exc_info=True)
+            raise
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+                        
     except Exception as e:
-        logging.error(f"Error in categories experiment: {str(e)}", exc_info=True)
+        logging.error(f"Error in categories experiment: {str(e)}", exc_info=True) 
         raise
     finally:
+        # Final cleanup
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()

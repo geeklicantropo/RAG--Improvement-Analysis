@@ -12,22 +12,53 @@ import json
 import gc
 import numpy as np
 from torch.utils.data import DataLoader
-import matplotlib.pyplot as plt
 
-project_root = str(Path(__file__).parent.parent.parent)
-sys.path.append(project_root)
+from experiments.checkpoint_utils import (
+    save_checkpoint,
+    load_checkpoints, 
+    get_last_checkpoint_batch,
+    merge_checkpoint_results
+)
 
+from experiments.experiment0_baseline.config import BaselineConfig, BaselineConfigFactory
 from src.experiment_logger import ExperimentLogger
 from src.utils import seed_everything, read_corpus_json, read_pickle
 from src.llm import LLM
 from src.prompt_dataset import PromptDataset
-from .config import BaselineConfig, BaselineConfigFactory
+import matplotlib.pyplot as plt
 
+class ExperimentBase:
+    """Base class for all experiments with checkpoint handling"""
+    
+    def _get_phase_checkpoint(self, phase: str) -> Optional[Dict]:
+        """Check for phase-specific checkpoint"""
+        checkpoint_dir = self.output_dir / "checkpoints" / phase
+        if not checkpoint_dir.exists():
+            return None
+            
+        checkpoints = list(checkpoint_dir.glob("*.json"))
+        if not checkpoints:
+            return None
+            
+        latest = max(checkpoints, key=lambda p: p.stat().st_mtime)
+        with open(latest) as f:
+            return json.load(f)
 
-class BaselineExperiment:
+    def _save_phase_checkpoint(self, phase: str, data: Dict):
+        """Save phase-specific checkpoint"""
+        checkpoint_dir = self.output_dir / "checkpoints" / phase
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        checkpoint_path = checkpoint_dir / f"{phase}_checkpoint_{timestamp}.json"
+        
+        with open(checkpoint_path, 'w') as f:
+            json.dump(data, f, indent=2)
+
+class BaselineExperiment(ExperimentBase):
     def __init__(self, config: BaselineConfig, logger: Optional[ExperimentLogger] = None):
         self.config = config
-        self.logger = logger or ExperimentLogger("baseline", str(Path(project_root) / "logs"))
+        self.logger = logger or ExperimentLogger("baseline", str(Path(__file__).parent.parent.parent / "logs"))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.results = {"contriever": None, "bm25": None, "random": None}
         self.output_dir = Path(config.output_dir)  # Add output_dir attribute
@@ -62,24 +93,6 @@ class BaselineExperiment:
             
         except Exception as e:
             self.logger.log_error(e, "Error in retrieval phase")
-            raise
-
-    def run_generation_phase(self):
-        try:
-            self.logger.log_step_start("Generation Phase")
-            self.llm = self._initialize_llm()
-            
-            # Sequential Generation for each retriever
-            for retriever_type in ["contriever", "bm25", "random"]:
-                self.logger.log_step_start(f"{retriever_type.capitalize()} Generation")
-                self.results[retriever_type] = self._run_generation(retriever_type)
-                self._cleanup_memory()
-                self.logger.log_step_end(f"{retriever_type.capitalize()} Generation")
-            
-            self.logger.log_step_end("Generation Phase")
-            
-        except Exception as e:
-            self.logger.log_error(e, "Error in generation phase")
             raise
 
     def run_evaluation_phase(self):
@@ -166,7 +179,6 @@ class BaselineExperiment:
             self.logger.log_error(e, f"Error loading dataset for {retriever_type}")
             raise
 
-
     def _create_dataloader(self, dataset: PromptDataset) -> DataLoader:
         if torch.cuda.is_available():
             current_memory = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated()
@@ -180,15 +192,65 @@ class BaselineExperiment:
             pin_memory=True
         )
 
-    def _run_generation(self, retriever_type: str) -> List[Dict]:
-        dataset = self._load_dataset(retriever_type)
-        dataloader = self._create_dataloader(dataset)
-        return self._process_batches(dataloader)
+    def run_generation_phase(self):
+        try:
+            self.logger.log_step_start("Generation Phase")
+            
+            # Check for existing generation phase checkpoint
+            checkpoint = self._get_phase_checkpoint("generation")
+            if checkpoint:
+                self.logger.experiment_logger.info("Resuming from generation checkpoint")
+                self.results = checkpoint
+                return merge_checkpoint_results(self.results)
+            
+            # Check for batch-level checkpoints
+            checkpoint_dir = self.output_dir / "checkpoints" / "batches"
+            if checkpoint_dir.exists():
+                existing_results = load_checkpoints(checkpoint_dir)
+                if existing_results:
+                    self.logger.experiment_logger.info(f"Resuming from batch checkpoint {len(existing_results)}")
+                    self.results = merge_checkpoint_results(existing_results)
+                    return self.results
+            
+            # No checkpoints found, run full generation
+            self.llm = self._initialize_llm()
+            dataset = self._load_dataset()
+            dataloader = self._create_dataloader(dataset)
+            results = self._run_generation(dataloader)
+            
+            # Save final phase checkpoint
+            self._save_phase_checkpoint("generation", results)
+            
+            return merge_checkpoint_results(results)
+            
+        except Exception as e:
+            self.logger.log_error(e, "Error in generation phase")
+            raise
 
-    def _process_batches(self, dataloader: DataLoader) -> List[Dict]:
+    def _run_generation(self, dataloader: DataLoader) -> List[Dict]:
+        results = []
+        last_checkpoint = get_last_checkpoint_batch(Path(self.config.output_dir) / "checkpoints")
+        
+        for batch_idx, batch in enumerate(tqdm(dataloader)):
+            if batch_idx <= last_checkpoint:
+                continue
+                
+            batch_results = self._process_batch(batch)
+            results.extend(batch_results)
+            
+            if (batch_idx + 1) % self.config.save_every == 0:
+                save_checkpoint(results, batch_idx + 1, Path(self.config.output_dir))
+                results = []  # Clear processed results after checkpoint
+                
+        if results:  # Save any remaining results
+            save_checkpoint(results, len(dataloader), Path(self.config.output_dir))
+            
+        return load_checkpoints(Path(self.config.output_dir) / "checkpoints")
+
+    def _process_batch(self, batch: Dict) -> List[Dict]:
         """Process batches with improved error handling and checkpointing."""
         results = []
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
+        for batch_idx, batch in enumerate(tqdm(DataLoader, desc="Generating")):
             try:
                 batch_results = self._process_single_batch(batch)
                 results.extend(batch_results)
@@ -330,14 +392,11 @@ class BaselineExperiment:
             plt.bar(["Contriever", "BM25", "Random"], accuracies)
             plt.title("Retriever Accuracy Comparison")
             plt.ylabel("Accuracy")
-            
-            plot_dir = Path(self.config.output_dir) / "plots"
-            plot_dir.mkdir(exist_ok=True)
-            plt.savefig(plot_dir / "baseline_comparison.png")
+            plt.tight_layout()
+            plt.savefig(self.output_dir / "accuracy_comparison.png", dpi=300)
             plt.close()
-            
         except Exception as e:
-            self.logger.log_error(e, "Error plotting comparisons")
+            self.logger.log_error(e, "Error plotting baseline comparisons")
 
 def main(args=None):
     try:

@@ -326,26 +326,28 @@ def main(args=None):
             args = parse_arguments()
 
         # Run experiment
-        config = FusionConfigFactory.get_config_for_strategy(args.strategy, args.use_random)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            experiment = FusionExperiment(
-                config=config,
-                experiment_name=f"fusion_{args.strategy}",
-                logger=ExperimentLogger(f"fusion_{args.strategy}")
-            )
-            experiment.setup()
-            results = experiment.run()
+        try:
+            args = parse_arguments() if args is None else argparse.Namespace(**args)
+            config = FusionConfigFactory.get_config_for_strategy(args.strategy)
+            experiment = FusionExperiment(config)
             
-        # Cleanup    
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+            # Run phases sequentially with checkpoint detection
+            experiment.run_retrieval_phase()
+            experiment.run_fusion_phase()     # Specific to fusion
+            experiment.run_generation_phase()
+            metrics = experiment.run_evaluation_phase()
             
-        return results
-            
+            return experiment.results, metrics
+        except Exception as e:
+            logging.error(f"Error in fusion experiment: {str(e)}", exc_info=True)
+            raise
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+                        
     except Exception as e:
-        logging.error(f"Error in fusion experiment: {str(e)}", exc_info=True)
+        logging.error(f"Error in fusion experiment: {str(e)}", exc_info=True) 
         raise
     finally:
         # Final cleanup

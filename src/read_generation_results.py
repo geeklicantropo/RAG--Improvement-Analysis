@@ -1,5 +1,4 @@
 import os
-import re
 import json
 import pickle
 import argparse
@@ -10,8 +9,6 @@ from typing import List, Dict
 
 from utils import str2bool
 from normalize_answers import *
-
-
 
 def are_answers_matching(prediction: str, ground_truths: List[str]) -> float:
     normalized_prediction = normalize_answer(prediction)
@@ -70,7 +67,6 @@ def read_generation_results(file_path: str, df: pd.DataFrame) -> List[Dict]:
 
     return data
 
-
 def read_generation_results_only_query(file_path: str, df: pd.DataFrame) -> List[Dict]:
     data = []
     with open(file_path, "r") as fin:
@@ -104,19 +100,16 @@ def read_generation_results_only_query(file_path: str, df: pd.DataFrame) -> List
 
     return data
 
-
 def convert_tensors(cell):
     """ Converts tensors in the given cell to lists, if they are tensors. """
     if isinstance(cell, list):
         return [[t.tolist() if torch.is_tensor(t) else t for t in inner_list] for inner_list in cell]
     return cell
 
-
 def extract_number_from_filename(filename: str, pattern: re.Pattern) -> int:
     """ Extracts the number from the filename based on the provided pattern. """
     match = pattern.search(filename)
     return int(match.group(1)) if match else 0
-
 
 def load_pickle_files(directory: str, filename_prefix: str) -> pd.DataFrame:
     """ Loads and concatenates data from all pickle files in the directory with the given prefix. """
@@ -141,7 +134,6 @@ def load_pickle_files(directory: str, filename_prefix: str) -> pd.DataFrame:
         data_df['prompt_tokens_len'] = data_df['prompt_tokens_len'].apply(lambda x: x.tolist())
     return data_df
 
-
 def save_data_to_json(data_df: pd.DataFrame, directory: str, filename_prefix: str):
     """ Saves the given DataFrame to a JSON file. """
     data_path = os.path.join(directory, f'{filename_prefix}all.json')
@@ -159,7 +151,6 @@ def save_data_to_json(data_df: pd.DataFrame, directory: str, filename_prefix: st
     data_df.to_json(data_path, orient='records')
     return data_path
 
-
 def get_classic_path(args):
     gold_pos = args.gold_position
     rand_str = "_rand" if args.use_random else ""
@@ -168,7 +159,6 @@ def get_classic_path(args):
 
     filename_prefix = f'numdoc{args.num_doc}_gold_at{gold_pos}{rand_str}{answerless_str}{adore_str}_info_'
     return filename_prefix
-
 
 def get_mixed_path(args):
     answerless_str = "_answerless" if args.get_documents_without_answer else ""
@@ -182,7 +172,6 @@ def get_mixed_path(args):
     
     filename_prefix = f"numdoc{args.num_doc}{first_type_str}{second_type_str}{answerless_str}_info_"
     return filename_prefix
-
 
 def get_multi_corpus_path(args):
     answerless_str = "_answerless" if args.get_documents_without_answer else ""
@@ -198,11 +187,9 @@ def get_multi_corpus_path(args):
     filename_prefix = f"numdoc{args.num_doc}{first_type_str}{second_type_str}{answerless_str}{other_corpus_str}_info_"
     return filename_prefix
 
-
 def get_only_query_path():
     filename_prefix = f"only_query_info_"
     return filename_prefix
-
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Read Generation Results.")
@@ -226,7 +213,6 @@ def parse_arguments():
     parser.add_argument('--num_main_documents', type=int, help='Number of documents in the context from the main corpus')
     parser.add_argument('--num_other_documents', type=int, help='Number of documents in the context from the other corpus')
     parser.add_argument('--put_main_first', type=str2bool, help='Put the documents of the main corpus first in the context')
-    
 
     args = parser.parse_args()
 
@@ -258,7 +244,6 @@ def main():
     else:
         raise ValueError("Invalid prompt type")
 
-
     llm_id = args.llm_id
     split = "test" if args.use_test else "train"
     llm_folder = llm_id.split("/")[1] if '/' in llm_id else llm_id
@@ -286,7 +271,6 @@ def main():
     accuracy = round(results_df['ans_match_after_norm'].sum() / len(results_df), 4)
     print("ACCURACY: ", accuracy)
     results_df.to_json(os.path.join(directory, f'{filename_prefix}all_extended.json'), orient='records')
-
 
 if __name__ == "__main__":
     main()

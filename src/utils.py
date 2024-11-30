@@ -151,7 +151,6 @@ def read_test_corpus_with_random_and_bm25():
         corpus_path
     )
 
-
 def read_test_corpus_with_random_and_contriever():
     full_to_subset_path = "data/mappings/full_to_subset_test_random_contriever_in_corpus.pkl"
     subset_to_full_path = "data/mappings/subset_to_full_test_random_contriever_in_corpus.pkl"

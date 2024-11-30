@@ -25,6 +25,7 @@ class ClusteringPlotter:
             
         self._plot_cluster_accuracies(metrics_df)
         self._plot_cluster_sizes(metrics_df)
+        self._plot_silhouette_scores(metrics_df)
         self._plot_cluster_coherence(metrics_df)
         
     def _plot_cluster_accuracies(self, df: pd.DataFrame):

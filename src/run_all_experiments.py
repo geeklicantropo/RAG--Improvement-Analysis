@@ -19,7 +19,7 @@ sys.path.extend([str(project_root)])
 # Import experiment modules
 from experiments.experiment0_baseline.main import BaselineExperiment
 from experiments.experiment0_baseline.config import BaselineConfigFactory
-from experiments.experiment1_clustering.main import ClusteringExperiment
+from experiments.experiment1_clustering.main import ClusteringExperiment 
 from experiments.experiment1_clustering.config import ClusteringConfig
 from experiments.experiment2_fusion.main import FusionExperiment
 from experiments.experiment2_fusion.config import FusionConfigFactory
@@ -27,7 +27,7 @@ from experiments.experiment3_categories.main import CategoriesExperiment
 from experiments.experiment3_categories.config import CategoriesConfigFactory
 
 # Import plotting utilities
-from experiments.plotting.plot_baseline import BaselinePlotter 
+from experiments.plotting.plot_baseline import BaselinePlotter
 from experiments.plotting.plot_clustering import ClusteringPlotter
 from experiments.plotting.plot_fusion import FusionPlotter
 from experiments.plotting.plot_categories import CategoriesPlotter

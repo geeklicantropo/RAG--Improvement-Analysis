@@ -1,19 +1,16 @@
-import os 
+import os
 import argparse
 import warnings
 from tqdm import tqdm
-from typing import Tuple, Dict, Optional
+from typing import List, Dict, Optional, Any, Tuple
 
 import torch
 from torch.utils.data import DataLoader
-from transformers import PreTrainedTokenizer
 
 from llm import LLM
-from utils import *
+from utils import seed_everything, read_pickle, read_corpus_json
 from prompt_dataset import PromptDataset
 from experiment_logger import ExperimentLogger
-from cluster_utils import DocumentClusterer
-
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
@@ -21,258 +18,193 @@ warnings.filterwarnings('ignore')
 SEED = 10
 
 info = {
-    "data_path": 'data/10k_train_dataset.json',
-    "random_results_path": "data/10k_random_results_at60.pkl",
-    "adore_search_results_path": "data/adore_search_results_at200.pkl",
-    "contriever_search_results_path": "data/contriever_search_results_at150.pkl",
+    "train": {
+        "data_path": 'data/10k_train_dataset.json',
+        "search_results_path": "data/contriever_search_results_at150.pkl",
+    },
+    "test": {
+        "data_path": 'data/test_dataset.json',
+        "search_results_path": "data/contriever_test_search_results_at150.pkl",
+    }
 }
 
+class AnswerGenerationConfig:
+    def __init__(self, args: argparse.Namespace):
+        self.output_dir = args.output_dir
+        self.llm_id = args.llm_id
+        self.model_max_length = args.model_max_length
+        self.use_clustering = args.use_clustering
+        self.num_clusters = args.num_clusters if hasattr(args, 'num_clusters') else None
+        self.gold_position = args.gold_position
+        self.num_documents = args.num_documents_in_context
+        self.get_documents_without_answer = args.get_documents_without_answer
+        self.noise_ratio = args.noise_ratio if hasattr(args, 'noise_ratio') else 0.0
+        self.use_test = args.use_test
+        self.max_new_tokens = args.max_new_tokens
+        self.batch_size = args.batch_size
+        self.save_every = args.save_every
+
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Run LLM Generation with clustering support.")
-    
-    # Basic configuration
-    parser.add_argument('--output_dir', type=str, default='data/gen_res', help='Output directory')
-    parser.add_argument('--llm_id', type=str, default='meta-llama/Llama-2-7b-chat-hf', help='LLM model identifier')
-    parser.add_argument('--model_max_length', type=int, help='Maximum input length for the LLM model', default=4096)
-    parser.add_argument('--load_full_corpus', type=str2bool, help='Load the full corpus', default=True)    
-    
-    # Retrieval configuration
-    parser.add_argument('--use_random', type=str2bool, help='Use random irrelevant documents')
-    parser.add_argument('--use_adore', type=str2bool, help="Use the retrieved documents from ADORE", default=False)
-    parser.add_argument('--gold_position', type=int, help='The (0-indexed) position of the gold document in the context')
-    parser.add_argument('--num_documents_in_context', type=int, help='Total number of documents in the context')
-    parser.add_argument('--get_documents_without_answer', type=str2bool, help='Select only documents without the answer', default=True)
-    
-    # Generation configuration
-    parser.add_argument('--max_new_tokens', type=int, help='Maximum number of tokens to generate', default=15)
-    parser.add_argument('--batch_size', type=int)
+    parser = argparse.ArgumentParser(description="Run LLM Generation with clustering and noise support.")
+    parser.add_argument('--output_dir', type=str, default='data/gen_res')
+    parser.add_argument('--llm_id', type=str, default='meta-llama/Llama-2-7b-chat-hf')
+    parser.add_argument('--model_max_length', type=int, default=4096)
+    parser.add_argument('--use_clustering', type=bool, default=False)
+    parser.add_argument('--num_clusters', type=int)
+    parser.add_argument('--gold_position', type=int)
+    parser.add_argument('--num_documents_in_context', type=int, required=True)
+    parser.add_argument('--get_documents_without_answer', type=bool, default=False)
+    parser.add_argument('--noise_ratio', type=float, default=0.0)
+    parser.add_argument('--use_test', type=bool, default=False)
+    parser.add_argument('--max_new_tokens', type=int, default=15)
+    parser.add_argument('--batch_size', type=int, required=True)
     parser.add_argument('--save_every', type=int, default=250)
-    
-    # Clustering configuration
-    parser.add_argument('--use_clustering', type=str2bool, default=False, help='Whether to use document clustering')
-    parser.add_argument('--num_clusters', type=int, default=None, help='Number of clusters for K-means')
-    parser.add_argument('--cluster_seed', type=int, default=42, help='Random seed for clustering')
-    
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    if args.num_documents_in_context is None:
-        parser.error("'num_documents_in_context' must be specified.")
-    if args.num_documents_in_context <= 0:
-        parser.error("'num_documents_in_context' must be a positive integer.")
-    if args.gold_position is not None and (args.gold_position < 0 or args.gold_position >= args.num_documents_in_context):
-        parser.error("'gold_position' must be within the range of 'num_documents_in_context'.")
-    if args.use_clustering and args.num_clusters is None:
-        parser.error("'num_clusters' must be specified when using clustering.")
+class AnswerGenerator:
+    def __init__(self, config: AnswerGenerationConfig, logger: ExperimentLogger):
+        self.config = config
+        self.logger = logger
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._initialize_llm()
 
-    return args
+    def _initialize_llm(self):
+        self.logger.log_step_start("Initializing LLM")
+        self.llm = LLM(
+            self.config.llm_id,
+            self.device,
+            quantization_bits=4,
+            model_max_length=self.config.model_max_length
+        )
+        self.logger.log_step_end("LLM initialization")
 
-def load_corpus(
-    args: argparse.Namespace,
-    logger: ExperimentLogger
-) -> Tuple[List[Dict], Optional[Dict[int, int]]]:
-    """Load corpus with logging."""
-    logger.log_step_start("Loading corpus")
-    try:
-        if args.load_full_corpus:
-            corpus = read_corpus_json('data/corpus.json')
-            full_to_subset_idx_map = None
-        else:
-            if args.use_random:
-                corpus, full_to_subset_idx_map = read_corpus_with_random()
-            elif args.use_adore:
-                corpus, full_to_subset_idx_map = read_corpus_with_adore()
-            else:
-                corpus, full_to_subset_idx_map = read_corpus_with_contriever()
+    def _load_data(self) -> Tuple[List[Dict], List[Tuple[List[int], List[float]]]]:
+        self.logger.log_step_start("Loading data")
+        split = "test" if self.config.use_test else "train"
         
-        logger.log_metric("corpus_size", len(corpus))
-        logger.log_step_end("Loading corpus", time.time())
-        return corpus, full_to_subset_idx_map
-    
-    except Exception as e:
-        logger.log_error(e, "Error loading corpus")
-        raise
-
-def load_search_results(
-    args: argparse.Namespace,
-    logger: ExperimentLogger
-) -> List[Tuple[List[int], List[float]]]:
-    """Load search results with logging."""
-    logger.log_step_start("Loading search results")
-    try:
-        if args.use_random:
-            search_results_path = info['random_results_path']
-        elif args.use_adore:
-            search_results_path = info['adore_search_results_path']
-        else:
-            search_results_path = info['contriever_search_results_path']
+        corpus = read_corpus_json('data/corpus.json')
+        search_results = read_pickle(info[split]["search_results_path"])
         
-        search_results = read_pickle(search_results_path)
-        logger.log_metric("num_search_results", len(search_results))
-        logger.log_step_end("Loading search results", time.time())
-        return search_results
-    
-    except Exception as e:
-        logger.log_error(e, "Error loading search results")
-        raise
+        self.logger.log_metric("corpus_size", len(corpus))
+        self.logger.log_metric("num_search_results", len(search_results))
+        self.logger.log_step_end("Data loading")
+        
+        return corpus, search_results
 
-def initialize_dataset_and_loader(
-    args: argparse.Namespace,
-    corpus: List[Dict],
-    full_to_subset_idx_map: Optional[Dict[int, int]],
-    search_results: List[Tuple[List[int], List[float]]],
-    tokenizer: PreTrainedTokenizer,
-    logger: ExperimentLogger
-) -> DataLoader:
-    """Initialize dataset and dataloader with clustering support."""
-    logger.log_step_start("Initializing dataset")
-    try:
-        prompt_ds = PromptDataset(
+    def _create_dataset(self, corpus: List[Dict], search_results: List[Tuple[List[int], List[float]]]) -> DataLoader:
+        self.logger.log_step_start("Creating dataset")
+        split = "test" if self.config.use_test else "train"
+        
+        dataset = PromptDataset(
             corpus=corpus,
-            data_path=info['data_path'],
-            tokenizer=tokenizer,
-            max_tokenized_length=args.model_max_length - 2,
+            data_path=info[split]["data_path"],
+            tokenizer=self.llm.tokenizer,
+            max_tokenized_length=self.config.model_max_length - 2,
             search_results=search_results,
-            full_to_subset_idx_map=full_to_subset_idx_map,
-            do_normalize_query=True,
-            num_documents_in_context=args.num_documents_in_context,
-            gold_position=args.gold_position,
-            get_documents_without_answer=args.get_documents_without_answer,
-            use_clustering=args.use_clustering,
-            num_clusters=args.num_clusters,
-            cluster_seed=args.cluster_seed
+            use_clustering=self.config.use_clustering,
+            num_clusters=self.config.num_clusters,
+            num_documents_in_context=self.config.num_documents,
+            gold_position=self.config.gold_position,
+            get_documents_without_answer=self.config.get_documents_without_answer,
+            noise_ratio=self.config.noise_ratio
         )
         
-        prompt_dataloader = DataLoader(
-            prompt_ds,
-            batch_size=args.batch_size,
+        dataloader = DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=8,
-            pin_memory=True,
+            num_workers=4,
+            pin_memory=True
         )
         
-        logger.log_metric("dataset_size", len(prompt_ds))
-        logger.log_step_end("Initializing dataset", time.time())
-        return prompt_dataloader
-    
-    except Exception as e:
-        logger.log_error(e, "Error initializing dataset")
-        raise
-
-def print_experiment_info(args: argparse.Namespace, logger: ExperimentLogger):
-    """Log experiment information."""
-    info_dict = {
-        "DATA_PATH": info['data_path'],
-        "MODEL": args.llm_id,
-        "USE_RANDOM": args.use_random,
-        "USE_ADORE": args.use_adore,
-        "USE_CLUSTERING": args.use_clustering,
-        "NUM_CLUSTERS": args.num_clusters if args.use_clustering else "N/A",
-        "GOLD_POSITION": args.gold_position,
-        "NUM_DOCUMENTS": args.num_documents_in_context,
-        "DOCUMENTS_WITHOUT_ANSWER": args.get_documents_without_answer,
-        "BATCH_SIZE": args.batch_size,
-        "SAVE_EVERY": args.save_every
-    }
-    
-    logger.experiment_logger.info("Experiment Configuration:")
-    for key, value in info_dict.items():
-        logger.experiment_logger.info(f"{key}: {value}")
-
-def generate_and_save(
-    args: argparse.Namespace,
-    llm: LLM,
-    prompt_dataloader: DataLoader,
-    logger: ExperimentLogger
-):
-    """Generate and save responses with comprehensive logging."""
-    # Setup paths and configurations
-    llm_id = args.llm_id
-    num_doc = args.num_documents_in_context
-    save_every = args.save_every
-    gold_pos = args.gold_position
-    
-    retriever_str = "adore" if args.use_adore else "contriever"
-    rand_str = "_rand" if args.use_random else ""
-    answerless_str = "_answerless" if args.get_documents_without_answer else ""
-    cluster_str = f"_cluster{args.num_clusters}" if args.use_clustering else ""
-
-    # Create saving directory
-    llm_folder = llm_id.split("/")[1] if '/' in llm_id else llm_id
-    saving_dir = f"{args.output_dir}/{llm_folder}/train/classic/{retriever_str}/{num_doc}_doc"
-    os.makedirs(saving_dir, exist_ok=True)
-    
-    answer_string_in_prompt = "### Response:" if 'mpt' in llm_id else "Answer:"
-    
-    logger.log_step_start("Generation phase")
-    all_info = []
-    try:
-        for idx, prompt_batch in enumerate(tqdm(prompt_dataloader, desc="Generating responses")):
-            # Generate responses
-            prompts = prompt_batch['prompt']
-            generated_output = llm.generate(prompts, max_new_tokens=args.max_new_tokens)
-            
-            # Extract answers
-            generated_answers = []
-            for output in generated_output:
-                start = output.find(answer_string_in_prompt) + len(answer_string_in_prompt)
-                response = output[start:].strip()
-                generated_answers.append(response)
-            
-            prompt_batch['generated_answer'] = generated_answers
-            all_info.append(prompt_batch)
-            
-            # Save periodically
-            if (idx + 1) % save_every == 0 or (idx + 1) == len(prompt_dataloader):
-                logger.experiment_logger.info(f"Saving at batch {idx + 1}...")
-                file_name = f"{saving_dir}/numdoc{num_doc}_gold_at{gold_pos}{rand_str}{answerless_str}{cluster_str}_info_{idx+1}.pkl"
-                write_pickle(all_info, file_name)
-                logger.log_metric(f"saved_batch_{idx+1}", file_name)
-                all_info = []
+        self.logger.log_metric("dataset_size", len(dataset))
+        self.logger.log_step_end("Dataset creation")
         
-        logger.log_step_end("Generation phase", time.time())
+        return dataloader
+
+    def generate(self) -> List[Dict]:
+        corpus, search_results = self._load_data()
+        dataloader = self._create_dataset(corpus, search_results)
         
-    except Exception as e:
-        logger.log_error(e, "Error during generation")
-        raise
+        results = []
+        answer_string = "### Response:" if 'mpt' in self.config.llm_id else "Answer:"
+        
+        for batch_idx, batch in enumerate(tqdm(dataloader)):
+            try:
+                # Monitor memory
+                if torch.cuda.is_available():
+                    current_memory = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated()
+                    if current_memory > 0.95:
+                        self.logger.log_metric("memory_warning", current_memory)
+                        torch.cuda.empty_cache()
+
+                prompts = batch['prompt']
+                outputs = self.llm.generate(prompts, max_new_tokens=self.config.max_new_tokens)
+                
+                batch_results = self._process_batch(batch, outputs, answer_string)
+                results.extend(batch_results)
+                
+                if (batch_idx + 1) % self.config.save_every == 0:
+                    self._save_checkpoint(results, batch_idx + 1)
+                
+                # Clean up batch tensors
+                del batch
+                torch.cuda.empty_cache()
+                
+            except Exception as e:
+                self.logger.log_error(e, f"Error processing batch {batch_idx}")
+                continue
+                
+        return results
+
+    def _process_batch(self, batch: Dict[str, Any], outputs: List[str], answer_string: str) -> List[Dict]:
+        batch_results = []
+        
+        for idx, output in enumerate(outputs):
+            try:
+                start_idx = output.find(answer_string) + len(answer_string)
+                
+                result = {
+                    'query': batch['query'][idx],
+                    'generated_answer': output[start_idx:].strip(),
+                    'document_indices': [int(i) for i in batch['document_indices'][idx]],
+                    'prompt_tokens_len': int(batch['prompt_tokens_len'][idx])
+                }
+                
+                if self.config.use_clustering:
+                    result['cluster_assignments'] = batch['cluster_assignments'][idx]
+                    
+                batch_results.append(result)
+                
+            except Exception as e:
+                self.logger.log_error(e, f"Error processing batch item {idx}")
+                continue
+                
+        return batch_results
+
+    def _save_checkpoint(self, results: List[Dict], batch_idx: int):
+        output_dir = Path(self.config.output_dir)
+        checkpoint_dir = output_dir / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        checkpoint_path = checkpoint_dir / f"results_checkpoint_batch_{batch_idx}.json"
+        write_json(results, str(checkpoint_path))
+        self.logger.log_metric(f"checkpoint_saved", str(checkpoint_path))
 
 def main():
     args = parse_arguments()
+    config = AnswerGenerationConfig(args)
     
-    # Initialize logger
     logger = ExperimentLogger(
-        experiment_name="rag_generation",
+        experiment_name="answer_generation",
         base_log_dir="logs"
     )
     
     try:
         with logger:
-            logger.log_experiment_params(vars(args))
-            print_experiment_info(args, logger)
-            
-            # Load LLM
-            logger.log_step_start("Loading LLM")
-            llm = LLM(
-                args.llm_id,
-                device,
-                quantization_bits=4,
-                model_max_length=args.model_max_length
-            )
-            tokenizer = llm.tokenizer
-            logger.log_step_end("Loading LLM", time.time())
-            
-            # Load data
-            corpus, full_to_subset_idx_map = load_corpus(args, logger)
-            search_results = load_search_results(args, logger)
-            
-            # Initialize dataset and dataloader
-            prompt_dataloader = initialize_dataset_and_loader(
-                args, corpus, full_to_subset_idx_map,
-                search_results, tokenizer, logger
-            )
-            
-            # Generate and save results
-            generate_and_save(args, llm, prompt_dataloader, logger)
-            
+            generator = AnswerGenerator(config, logger)
+            results = generator.generate()
+            return results
     except Exception as e:
         logger.log_error(e, "Error in main execution")
         raise

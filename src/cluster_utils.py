@@ -1,93 +1,368 @@
 import os
+import gc
+import json
 import logging
-from typing import List, Tuple, Dict, Optional, Union
+from typing import List, Tuple, Dict, Optional, Union, Any
 import numpy as np
-from sklearn.cluster import KMeans
+from tqdm import tqdm
+from collections import defaultdict
+from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    silhouette_score, 
+    calinski_harabasz_score, 
+    davies_bouldin_score, 
+    adjusted_rand_score
+)
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoConfig, AutoModel
 
 from experiment_logger import ExperimentLogger
 from utils import seed_everything
 
+class ClusteringMethod:
+    KMEANS = "kmeans"
+    HIERARCHICAL = "hierarchical"
+    DBSCAN = "dbscan"
+
 class DocumentClusterer:
-    """
-    A class for clustering documents using K-means and organizing them for RAG systems.
-    Supports both embedding-based and text-based clustering with various preprocessing options.
-    """
     def __init__(
         self,
         num_clusters: int,
         random_seed: int = 42,
         use_scaler: bool = True,
+        min_cluster_size: int = 2,
+        noise_ratio: float = 0.0,
+        method: str = ClusteringMethod.KMEANS,
+        batch_size: int = 1000,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
         logger: Optional[ExperimentLogger] = None
     ):
-        """
-        Initialize the document clusterer.
-
-        Args:
-            num_clusters: Number of clusters for k-means
-            random_seed: Seed for reproducibility
-            use_scaler: Whether to standardize features before clustering
-            logger: Optional experiment logger for tracking
-        """
         self.num_clusters = num_clusters
         self.random_seed = random_seed
         self.use_scaler = use_scaler
+        self.min_cluster_size = min_cluster_size
+        self.noise_ratio = noise_ratio
+        self.method = method
+        self.batch_size = batch_size
+        self.device = device
         self.logger = logger
-        self.kmeans = None
+
+        self.clusterer = None
         self.scaler = StandardScaler() if use_scaler else None
+        self.cluster_metrics = {}
         
         seed_everything(random_seed)
         
         if logger:
             logger.experiment_logger.info(
-                f"Initialized DocumentClusterer with {num_clusters} clusters"
+                f"Initialized DocumentClusterer with {num_clusters} clusters using {method}"
             )
 
-    def fit_clusters(
-        self, 
-        embeddings: np.ndarray,
-        document_ids: Optional[List[int]] = None
-    ) -> Dict[int, List[int]]:
-        """
-        Fit k-means clustering on document embeddings.
-
-        Args:
-            embeddings: Document embeddings array
-            document_ids: Optional list of document IDs corresponding to embeddings
-
-        Returns:
-            Dictionary mapping cluster IDs to lists of document indices
-        """
-        try:
-            if self.logger:
-                self.logger.log_step_start("Fitting clusters")
-            
-            # Scale features if requested
-            if self.use_scaler:
-                embeddings = self.scaler.fit_transform(embeddings)
-            
-            # Initialize and fit k-means
-            self.kmeans = KMeans(
+    def _initialize_clusterer(self):
+        if self.method == ClusteringMethod.KMEANS:
+            self.clusterer = KMeans(
                 n_clusters=self.num_clusters,
                 random_state=self.random_seed,
                 n_init=10
             )
-            cluster_labels = self.kmeans.fit_predict(embeddings)
+        elif self.method == ClusteringMethod.HIERARCHICAL:
+            self.clusterer = AgglomerativeClustering(
+                n_clusters=self.num_clusters,
+                linkage='ward'
+            )
+        elif self.method == ClusteringMethod.DBSCAN:
+            self.clusterer = DBSCAN(
+                min_samples=self.min_cluster_size,
+                n_jobs=-1
+            )
+        else:
+            raise ValueError(f"Unsupported clustering method: {self.method}")
+
+    def add_noise_to_clusters(
+        self,
+        clusters: Dict[int, List[int]],
+        random_docs: List[int],
+        noise_ratio: Optional[float] = None,
+        strategy: str = "uniform"
+    ) -> Dict[int, List[int]]:
+        if noise_ratio is None:
+            noise_ratio = self.noise_ratio
             
-            # Organize documents by cluster
-            clusters = {i: [] for i in range(self.num_clusters)}
-            for idx, label in enumerate(cluster_labels):
-                doc_id = document_ids[idx] if document_ids else idx
-                clusters[label].append(doc_id)
+        if noise_ratio <= 0 or not random_docs:
+            return clusters
+            
+        try:
+            if self.logger:
+                self.logger.log_step_start("Adding noise to clusters")
+            
+            modified_clusters = {}
+            num_noise_total = int(sum(len(docs) for docs in clusters.values()) * noise_ratio)
+            
+            if strategy == "uniform":
+                noise_per_cluster = num_noise_total // len(clusters)
+                remaining_noise = num_noise_total % len(clusters)
+                
+                for cluster_id, doc_ids in clusters.items():
+                    cluster_noise_count = noise_per_cluster + (1 if remaining_noise > 0 else 0)
+                    remaining_noise -= 1
+                    
+                    cluster_noise = np.random.choice(
+                        random_docs,
+                        size=min(cluster_noise_count, len(random_docs)),
+                        replace=False
+                    ).tolist()
+                    
+                    modified_clusters[cluster_id] = doc_ids + cluster_noise
+                    
+            elif strategy == "proportional":
+                for cluster_id, doc_ids in clusters.items():
+                    cluster_ratio = len(doc_ids) / sum(len(d) for d in clusters.values())
+                    cluster_noise_count = int(num_noise_total * cluster_ratio)
+                    
+                    cluster_noise = np.random.choice(
+                        random_docs,
+                        size=min(cluster_noise_count, len(random_docs)),
+                        replace=False
+                    ).tolist()
+                    
+                    modified_clusters[cluster_id] = doc_ids + cluster_noise
+            
+            if self.logger:
+                self.logger.log_step_end("Adding noise to clusters")
+                self._log_clustering_stats(modified_clusters, noise_added=True)
+            
+            return modified_clusters
+            
+        except Exception as e:
+            if self.logger:
+                self.logger.log_error(e, "Error adding noise to clusters")
+            raise
+
+    def evaluate_clusters(
+        self, 
+        embeddings: np.ndarray,
+        save_dir: Optional[str] = None
+    ) -> Dict[str, float]:
+        try:
+            if self.clusterer is None:
+                raise ValueError("Must fit clusters before evaluation")
+                
+            labels = self.clusterer.labels_
+            metrics = {
+                "silhouette_score": silhouette_score(embeddings, labels),
+                "calinski_harabasz_score": calinski_harabasz_score(embeddings, labels),
+                "davies_bouldin_score": davies_bouldin_score(embeddings, labels)
+            }
+            
+            if hasattr(self.clusterer, "inertia_"):
+                metrics["inertia"] = self.clusterer.inertia_
+                
+            cluster_centers = self._get_cluster_centers(embeddings, labels)
+            metrics.update(self._calculate_cluster_qualities(embeddings, labels, cluster_centers))
+            
+            if save_dir:
+                self._save_evaluation_results(metrics, save_dir)
+            
+            if self.logger:
+                self.logger.log_metrics(metrics)
+                
+            self.cluster_metrics = metrics
+            return metrics
+            
+        except Exception as e:
+            if self.logger:
+                self.logger.log_error(e, "Error evaluating clusters")
+            raise
+
+    def _calculate_cluster_qualities(
+        self,
+        embeddings: np.ndarray,
+        labels: np.ndarray,
+        centers: np.ndarray
+    ) -> Dict[str, float]:
+        metrics = {}
+        
+        # Intra-cluster density
+        densities = []
+        for i in range(len(centers)):
+            cluster_points = embeddings[labels == i]
+            if len(cluster_points) > 1:
+                density = np.mean([
+                    np.linalg.norm(p - centers[i]) 
+                    for p in cluster_points
+                ])
+                densities.append(density)
+        
+        metrics["avg_cluster_density"] = np.mean(densities)
+        metrics["std_cluster_density"] = np.std(densities)
+        
+        # Inter-cluster separation
+        separations = []
+        for i in range(len(centers)):
+            for j in range(i + 1, len(centers)):
+                separation = np.linalg.norm(centers[i] - centers[j])
+                separations.append(separation)
+                
+        metrics["avg_cluster_separation"] = np.mean(separations)
+        metrics["std_cluster_separation"] = np.std(separations)
+        
+        return metrics
+
+    def _get_cluster_centers(
+        self,
+        embeddings: np.ndarray,
+        labels: np.ndarray
+    ) -> np.ndarray:
+        unique_labels = np.unique(labels[labels != -1])  # Exclude noise points
+        centers = np.zeros((len(unique_labels), embeddings.shape[1]))
+        
+        for i, label in enumerate(unique_labels):
+            centers[i] = np.mean(embeddings[labels == label], axis=0)
+            
+        return centers
+
+    def process_in_batches(
+        self,
+        embeddings: np.ndarray,
+        document_ids: Optional[List[int]] = None,
+        batch_size: Optional[int] = None
+    ) -> Dict[int, List[int]]:
+        if batch_size is None:
+            batch_size = self.batch_size
+            
+        try:
+            if self.logger:
+                self.logger.log_step_start("Processing in batches")
+            
+            total_batches = (len(embeddings) + batch_size - 1) // batch_size
+            all_labels = []
+            
+            for i in tqdm(range(total_batches), desc="Processing batches"):
+                start_idx = i * batch_size
+                end_idx = min((i + 1) * batch_size, len(embeddings))
+                
+                batch_embeddings = embeddings[start_idx:end_idx]
+                if self.use_scaler:
+                    batch_embeddings = self.scaler.transform(batch_embeddings)
+                
+                batch_labels = self.clusterer.predict(batch_embeddings)
+                all_labels.extend(batch_labels)
+                
+                # Memory cleanup
+                del batch_embeddings
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+                
+            clusters = self._labels_to_clusters(
+                all_labels,
+                document_ids if document_ids else range(len(embeddings))
+            )
+            
+            if self.logger:
+                self.logger.log_step_end("Batch processing")
+                self._log_clustering_stats(clusters)
+            
+            return clusters
+            
+        except Exception as e:
+            if self.logger:
+                self.logger.log_error(e, "Error in batch processing")
+            raise
+
+    def _labels_to_clusters(
+        self,
+        labels: List[int],
+        document_ids: Union[List[int], range]
+    ) -> Dict[int, List[int]]:
+        clusters = defaultdict(list)
+        for idx, label in enumerate(labels):
+            if label != -1:  # Exclude noise points from DBSCAN
+                clusters[label].append(document_ids[idx])
+            
+        # Filter small clusters
+        return {
+            k: v for k, v in clusters.items() 
+            if len(v) >= self.min_cluster_size
+        }
+
+    def save_cluster_results(
+        self,
+        output_dir: str,
+        clusters: Dict[int, List[int]],
+        embeddings: Optional[np.ndarray] = None
+    ) -> None:
+        try:
+            if self.logger:
+                self.logger.log_step_start("Saving cluster results")
+            
+            os.makedirs(output_dir, exist_ok=True)
+            
+            results = {
+                "clusters": clusters,
+                "config": {
+                    "num_clusters": self.num_clusters,
+                    "min_cluster_size": self.min_cluster_size,
+                    "noise_ratio": self.noise_ratio,
+                    "method": self.method
+                },
+                "metrics": self.cluster_metrics
+            }
+            
+            # Save main results
+            output_path = os.path.join(output_dir, "cluster_results.json")
+            with open(output_path, 'w') as f:
+                json.dump(results, f, indent=2)
+            
+            # Optionally save embeddings
+            if embeddings is not None:
+                embeddings_path = os.path.join(output_dir, "cluster_embeddings.npy")
+                np.save(embeddings_path, embeddings)
+            
+            # Save cluster centers if available
+            if hasattr(self.clusterer, "cluster_centers_"):
+                centers_path = os.path.join(output_dir, "cluster_centers.npy")
+                np.save(centers_path, self.clusterer.cluster_centers_)
+                
+            if self.logger:
+                self.logger.log_step_end("Saving cluster results")
+                
+        except Exception as e:
+            if self.logger:
+                self.logger.log_error(e, "Error saving cluster results")
+            raise
+
+    def fit_clusters(
+        self, 
+        embeddings: np.ndarray,
+        document_ids: Optional[List[int]] = None,
+        use_batches: bool = True
+    ) -> Dict[int, List[int]]:
+        try:
+            if self.logger:
+                self.logger.log_step_start("Fitting clusters")
+            
+            self._initialize_clusterer()
+            
+            if use_batches and len(embeddings) > self.batch_size:
+                clusters = self.process_in_batches(embeddings, document_ids)
+            else:
+                if self.use_scaler:
+                    embeddings = self.scaler.fit_transform(embeddings)
+                
+                labels = self.clusterer.fit_predict(embeddings)
+                clusters = self._labels_to_clusters(
+                    labels,
+                    document_ids if document_ids else range(len(embeddings))
+                )
             
             if self.logger:
                 self.logger.log_step_end("Fitting clusters")
                 self._log_clustering_stats(clusters)
             
             return clusters
-        
+            
         except Exception as e:
             if self.logger:
                 self.logger.log_error(e, "Error during cluster fitting")
@@ -96,265 +371,175 @@ class DocumentClusterer:
     def predict_clusters(
         self, 
         embeddings: np.ndarray,
-        document_ids: Optional[List[int]] = None
+        document_ids: Optional[List[int]] = None,
+        use_batches: bool = True
     ) -> Dict[int, List[int]]:
-        """
-        Predict clusters for new embeddings using fitted k-means model.
-
-        Args:
-            embeddings: Document embeddings array
-            document_ids: Optional list of document IDs corresponding to embeddings
-
-        Returns:
-            Dictionary mapping cluster IDs to lists of document indices
-        """
-        if self.kmeans is None:
+        if self.clusterer is None:
             raise ValueError("Must call fit_clusters before predict_clusters")
         
         try:
             if self.logger:
                 self.logger.log_step_start("Predicting clusters")
             
-            # Scale features if scaler was used during fitting
-            if self.use_scaler:
-                embeddings = self.scaler.transform(embeddings)
-            
-            # Predict clusters
-            cluster_labels = self.kmeans.predict(embeddings)
-            
-            # Organize documents by cluster
-            clusters = {i: [] for i in range(self.num_clusters)}
-            for idx, label in enumerate(cluster_labels):
-                doc_id = document_ids[idx] if document_ids else idx
-                clusters[label].append(doc_id)
+            if use_batches and len(embeddings) > self.batch_size:
+                clusters = self.process_in_batches(embeddings, document_ids)
+            else:
+                if self.use_scaler:
+                    embeddings = self.scaler.transform(embeddings)
+                
+                labels = self.clusterer.predict(embeddings)
+                clusters = self._labels_to_clusters(
+                    labels,
+                    document_ids if document_ids else range(len(embeddings))
+                )
             
             if self.logger:
                 self.logger.log_step_end("Predicting clusters")
                 self._log_clustering_stats(clusters)
             
             return clusters
-        
+            
         except Exception as e:
             if self.logger:
                 self.logger.log_error(e, "Error during cluster prediction")
             raise
 
-    def get_cluster_centroids(self) -> np.ndarray:
-        """Get the centroid vectors for each cluster."""
-        if self.kmeans is None:
-            raise ValueError("Must call fit_clusters before accessing centroids")
-        return self.kmeans.cluster_centers_
-
-    def get_inertia(self) -> float:
-        """Get the inertia (within-cluster sum of squares) of the clustering."""
-        if self.kmeans is None:
-            raise ValueError("Must call fit_clusters before accessing inertia")
-        return self.kmeans.inertia_
-
-    def _log_clustering_stats(self, clusters: Dict[int, List[int]]):
-        """Log statistics about the clustering results."""
-        stats = {
-            "num_clusters": len(clusters),
-            "cluster_sizes": {i: len(docs) for i, docs in clusters.items()},
-            "total_documents": sum(len(docs) for docs in clusters.values()),
-            "inertia": self.get_inertia() if self.kmeans else None
-        }
-        self.logger.experiment_logger.info(f"Clustering Stats: {stats}")
-        self.logger.log_metric("clustering_stats", stats)
-
-class ClusterOrganizer:
-    """
-    Class for organizing and preparing clustered documents for RAG prompts.
-    Handles document sorting, selection, and formatting within clusters.
-    """
-    def __init__(
-        self,
-        max_docs_per_cluster: int,
-        tokenizer: AutoTokenizer,
-        max_length: int = 512,
-        logger: Optional[ExperimentLogger] = None
-    ):
-        """
-        Initialize the cluster organizer.
-
-        Args:
-            max_docs_per_cluster: Maximum number of documents to include per cluster
-            tokenizer: Tokenizer for length checking
-            max_length: Maximum token length for documents
-            logger: Optional experiment logger
-        """
-        self.max_docs_per_cluster = max_docs_per_cluster
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.logger = logger
-
-    def organize_clusters(
+    def _log_clustering_stats(
         self,
         clusters: Dict[int, List[int]],
-        documents: List[Dict],
-        scores: Optional[Dict[int, float]] = None
-    ) -> List[Dict]:
-        """
-        Organize documents within clusters for prompt creation.
-
-        Args:
-            clusters: Mapping of cluster IDs to document indices
-            documents: List of document dictionaries
-            scores: Optional document relevance scores
-
-        Returns:
-            List of organized cluster dictionaries with selected documents
-        """
+        noise_added: bool = False
+    ):
         try:
-            if self.logger:
-                self.logger.log_step_start("Organizing clusters")
+            stats = {
+                "num_clusters": len(clusters),
+                "cluster_sizes": {i: len(docs) for i, docs in clusters.items()},
+                "total_documents": sum(len(docs) for docs in clusters.values()),
+                "avg_cluster_size": np.mean([len(docs) for docs in clusters.values()]),
+                "std_cluster_size": np.std([len(docs) for docs in clusters.values()]),
+                "min_cluster_size": min(len(docs) for docs in clusters.values()),
+                "max_cluster_size": max(len(docs) for docs in clusters.values()),
+            }
             
-            organized_clusters = []
-            
-            for cluster_id, doc_indices in clusters.items():
-                # Sort documents by score if available
-                if scores:
-                    doc_indices = sorted(
-                        doc_indices,
-                        key=lambda x: scores.get(x, 0),
-                        reverse=True
-                    )
+            if hasattr(self.clusterer, "inertia_"):
+                stats["inertia"] = self.clusterer.inertia_
                 
-                # Select documents while respecting length constraints
-                selected_docs = self._select_documents(
-                    [documents[i] for i in doc_indices]
-                )
+            if noise_added:
+                stats["noise_ratio"] = self.noise_ratio
                 
-                if selected_docs:
-                    cluster_info = {
-                        "cluster_id": cluster_id,
-                        "documents": selected_docs,
-                        "size": len(selected_docs)
-                    }
-                    organized_clusters.append(cluster_info)
+            self.logger.experiment_logger.info(f"Clustering Stats: {stats}")
+            self.logger.log_metric("clustering_stats", stats)
             
-            if self.logger:
-                self.logger.log_step_end("Organizing clusters")
-                self._log_organization_stats(organized_clusters)
-            
-            return organized_clusters
-        
         except Exception as e:
             if self.logger:
-                self.logger.log_error(e, "Error during cluster organization")
+                self.logger.log_error(e, "Error logging clustering stats")
             raise
-
-    def _select_documents(self, documents: List[Dict]) -> List[Dict]:
-        """
-        Select documents from a cluster while respecting length constraints.
-        
-        Args:
-            documents: List of document dictionaries
-
-        Returns:
-            List of selected documents
-        """
-        selected = []
-        current_length = 0
-        
-        for doc in documents[:self.max_docs_per_cluster]:
-            # Check document length in tokens
-            tokens = self.tokenizer.encode(
-                doc.get("text", ""),
-                add_special_tokens=True,
-                truncation=True
-            )
-            
-            if current_length + len(tokens) <= self.max_length:
-                selected.append(doc)
-                current_length += len(tokens)
-            else:
-                break
-                
-        return selected
-
-    def format_cluster_prompt(
-        self,
-        organized_clusters: List[Dict],
-        include_cluster_info: bool = True
-    ) -> str:
-        """
-        Format clustered documents into a prompt string.
-
-        Args:
-            organized_clusters: List of organized cluster dictionaries
-            include_cluster_info: Whether to include cluster metadata in prompt
-
-        Returns:
-            Formatted prompt string
-        """
-        prompt_parts = []
-        
-        for cluster in organized_clusters:
-            if include_cluster_info:
-                prompt_parts.append(f"\nCluster {cluster['cluster_id']} (Size: {cluster['size']}):")
-            
-            for doc in cluster["documents"]:
-                doc_str = f"Document [{doc.get('full_corpus_idx', '')}] "
-                if doc.get("title"):
-                    doc_str += f"(Title: {doc['title']}) "
-                doc_str += doc.get("text", "")
-                prompt_parts.append(doc_str)
-        
-        return "\n".join(prompt_parts)
-
-    def _log_organization_stats(self, organized_clusters: List[Dict]):
-        """Log statistics about the organized clusters."""
-        stats = {
-            "num_organized_clusters": len(organized_clusters),
-            "docs_per_cluster": [c["size"] for c in organized_clusters],
-            "total_selected_docs": sum(c["size"] for c in organized_clusters)
-        }
-        self.logger.experiment_logger.info(f"Cluster Organization Stats: {stats}")
-        self.logger.log_metric("organization_stats", stats)
 
 def find_optimal_clusters(
     embeddings: np.ndarray,
     max_clusters: int,
     min_clusters: int = 2,
+    method: str = ClusteringMethod.KMEANS,
+    batch_size: int = 1000,
     logger: Optional[ExperimentLogger] = None
-) -> Tuple[int, List[float]]:
-    """
-    Find optimal number of clusters using elbow method.
-
-    Args:
-        embeddings: Document embeddings array
-        max_clusters: Maximum number of clusters to try
-        min_clusters: Minimum number of clusters to try
-        logger: Optional experiment logger
-
-    Returns:
-        Tuple of (optimal number of clusters, list of inertia values)
-    """
+) -> Tuple[int, List[float], List[float], List[float]]:
     if logger:
         logger.log_step_start("Finding optimal clusters")
     
-    inertias = []
+    metrics = {
+        "inertias": [],
+        "silhouette_scores": [],
+        "calinski_scores": [],
+        "davies_scores": []
+    }
     
     try:
         for k in range(min_clusters, max_clusters + 1):
-            clusterer = DocumentClusterer(num_clusters=k, logger=logger)
-            _ = clusterer.fit_clusters(embeddings)
-            inertias.append(clusterer.get_inertia())
+            clusterer = DocumentClusterer(
+                num_clusters=k,
+                method=method,
+                batch_size=batch_size,
+                logger=logger
+            )
             
-        # Find elbow point using rate of change
-        diffs = np.diff(inertias)
-        rates_of_change = np.diff(diffs)
-        optimal_idx = np.argmin(rates_of_change) + min_clusters
+            clusters = clusterer.fit_clusters(embeddings)
+            evaluation = clusterer.evaluate_clusters(embeddings)
+            
+            for metric_name, values in metrics.items():
+                if metric_name[:-1] in evaluation:
+                    values.append(evaluation[metric_name[:-1]])
+            
+        # Find optimal k using combined metrics
+        normalized_scores = []
+        for k in range(len(metrics["silhouette_scores"])):
+            score = (
+                metrics["silhouette_scores"][k] / max(metrics["silhouette_scores"]) +
+                metrics["calinski_scores"][k] / max(metrics["calinski_scores"]) -
+                metrics["davies_scores"][k] / max(metrics["davies_scores"])
+            ) / 3
+            normalized_scores.append(score)
+            
+        optimal_k = min_clusters + np.argmax(normalized_scores)
         
         if logger:
             logger.log_step_end("Finding optimal clusters")
-            logger.log_metric("optimal_clusters", optimal_idx)
-            logger.log_metric("inertia_values", inertias)
+            logger.log_metric("optimal_clusters", optimal_k)
+            for metric_name, values in metrics.items():
+                logger.log_metric(metric_name, values)
         
-        return optimal_idx, inertias
-    
+        return optimal_k, metrics["inertias"], metrics["silhouette_scores"], metrics["davies_scores"]
+        
     except Exception as e:
         if logger:
             logger.log_error(e, "Error finding optimal clusters")
+        raise
+
+def compute_cluster_embeddings(
+    documents: List[Dict],
+    encoder: AutoModel,
+    tokenizer: AutoTokenizer,
+    batch_size: int = 32,
+    max_length: int = 512,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    logger: Optional[ExperimentLogger] = None
+) -> np.ndarray:
+    try:
+        if logger:
+            logger.log_step_start("Computing document embeddings")
+            
+        encoder = encoder.to(device)
+        embeddings = []
+        
+        for i in tqdm(range(0, len(documents), batch_size), desc="Computing embeddings"):
+            batch_docs = documents[i:i + batch_size]
+            texts = [doc.get("text", "") for doc in batch_docs]
+            
+            inputs = tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt"
+            ).to(device)
+            
+            with torch.no_grad():
+                outputs = encoder(**inputs)
+                batch_embeddings = outputs.last_hidden_state[:, 0].cpu().numpy()
+                embeddings.append(batch_embeddings)
+                
+            del inputs, outputs, batch_embeddings
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+                
+        embeddings = np.vstack(embeddings)
+        
+        if logger:
+            logger.log_step_end("Computing document embeddings")
+            logger.log_metric("embeddings_shape", embeddings.shape)
+            
+        return embeddings
+        
+    except Exception as e:
+        if logger:
+            logger.log_error(e, "Error computing embeddings")
         raise

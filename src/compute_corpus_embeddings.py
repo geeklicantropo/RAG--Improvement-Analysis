@@ -7,6 +7,9 @@ from retriever import *
 from utils import *
 from experiment_logger import ExperimentLogger
 import time
+import gc
+from typing import Optional
+from tqdm import tqdm
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
@@ -14,98 +17,110 @@ warnings.filterwarnings('ignore')
 SEED = 10
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Script for computing the embeddings of a corpus.")
-    parser.add_argument('--corpus_path', type=str, required=True, help='Path to the JSON corpus data')
-    parser.add_argument('--encoder_id', type=str, default='facebook/contriever', help='Model identifier for the encoder')
-    parser.add_argument('--max_length_encoder', type=int, default=512, help='Maximum sequence length for the encoder')
-    parser.add_argument('--normalize_embeddings', type=str2bool, default=False, help='Whether to normalize embeddings')
-    parser.add_argument('--lower_case', type=str2bool, default=False, help='Whether to lower case the corpus text')
-    parser.add_argument('--do_normalize_text', type=str2bool, default=True, help='Whether to normalize the corpus text')
-    parser.add_argument('--output_dir', type=str, default='data/corpus/embeddings/', help='Output directory for saving embeddings')
-    parser.add_argument('--prefix_name', type=str, default='contriever', help='Initial part of the name of the saved embeddings')
-    parser.add_argument('--batch_size', type=int, default=512, help='Batch size for embedding documents')
-    parser.add_argument('--save_every', type=int, default=500, help='Save embeddings every N batches')
-    
-    args = parser.parse_args()
-    return args
+    parser = argparse.ArgumentParser(description="Script for computing corpus embeddings.")
+    parser.add_argument('--corpus_path', type=str, required=True)
+    parser.add_argument('--encoder_id', type=str, default='facebook/contriever')
+    parser.add_argument('--max_length_encoder', type=int, default=512)
+    parser.add_argument('--normalize_embeddings', type=str2bool, default=False)
+    parser.add_argument('--output_dir', type=str, default='data/corpus/embeddings/')
+    parser.add_argument('--prefix_name', type=str, default='contriever')
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--save_every', type=int, default=100)
+    parser.add_argument('--max_memory_usage', type=float, default=0.8)
+    return parser.parse_args()
 
 def initialize_retriever(args: argparse.Namespace, logger: ExperimentLogger) -> Retriever:
-    """Initialize the encoder and retriever with logging."""
     try:
         logger.log_step_start("Initializing retriever")
-        start_time = time.time()
-
         config = AutoConfig.from_pretrained(args.encoder_id)
         encoder = Encoder(config).eval()
         tokenizer = AutoTokenizer.from_pretrained(args.encoder_id)
+        
         retriever = Retriever(
             device=device, 
             tokenizer=tokenizer, 
             query_encoder=encoder, 
             max_length=args.max_length_encoder,
-            norm_doc_emb=args.normalize_embeddings,
-            lower_case=args.lower_case,
-            do_normalize_text=args.do_normalize_text
+            norm_doc_emb=args.normalize_embeddings
         )
 
-        logger.log_step_end("Initializing retriever", start_time)
+        logger.log_step_end("Retriever initialization")
         return retriever
 
     except Exception as e:
-        logger.log_error(e, "Error initializing retriever")
+        logger.log_error(e, "Retriever initialization failed")
+        raise
+
+def compute_embeddings_with_memory_tracking(
+    retriever: Retriever,
+    corpus: List[Dict],
+    args: argparse.Namespace,
+    logger: ExperimentLogger
+) -> None:
+    try:
+        batch_size = args.batch_size
+        total_batches = (len(corpus) + batch_size - 1) // batch_size
+        
+        for batch_idx in tqdm(range(total_batches)):
+            # Check memory usage and adjust batch size
+            if torch.cuda.is_available():
+                current_memory = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated()
+                if current_memory > args.max_memory_usage:
+                    batch_size = max(1, batch_size // 2)
+                    logger.log_metric("batch_size_adjusted", batch_size)
+
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, len(corpus))
+            batch_corpus = corpus[start_idx:end_idx]
+
+            # Compute embeddings for batch
+            retriever.encode_corpus(
+                batch_corpus,
+                batch_size=batch_size,
+                output_dir=args.output_dir,
+                prefix_name=f"{args.prefix_name}_{end_idx}",
+                save_every=1  # Save each batch
+            )
+
+            # Memory cleanup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+    except Exception as e:
+        logger.log_error(e, "Error computing embeddings")
         raise
 
 def main():
     args = parse_arguments()
-
-    # Initialize logger
-    logger = ExperimentLogger(
-        experiment_name="corpus_embeddings",
-        base_log_dir="logs"
-    )
+    logger = ExperimentLogger("corpus_embeddings", "logs")
 
     try:
         with logger:
-            # Log experiment parameters
             logger.log_experiment_params(vars(args))
-            
-            # Log system information
             logger.log_system_info()
 
-            # Load corpus with progress bar
+            # Load corpus
             logger.log_step_start("Loading corpus")
             corpus = read_json(args.corpus_path)
-            logger.log_step_end("Loading corpus", time.time())
-            logger.log_metric("corpus_size", len(corpus))
-            logger.experiment_logger.info(f"Corpus loaded with {len(corpus)} documents")
+            logger.log_step_end("Corpus loading")
 
             # Initialize retriever
             retriever = initialize_retriever(args, logger)
-            logger.experiment_logger.info("Retriever initialized successfully")
 
-            # Create output directory if it doesn't exist
+            # Create output directory
             os.makedirs(args.output_dir, exist_ok=True)
 
-            # Compute embeddings with progress tracking
-            logger.log_step_start("Computing embeddings")
-            retriever.encode_corpus(
-                corpus, 
-                batch_size=args.batch_size, 
-                output_dir=args.output_dir,
-                prefix_name=args.prefix_name,
-                save_every=args.save_every,
-                logger=logger  # Pass logger to encode_corpus
-            )
-            logger.log_step_end("Computing embeddings", time.time())
-
-            # Log final metrics
-            logger.log_metric("total_batches_processed", len(corpus) // args.batch_size)
-            logger.log_metric("final_save_checkpoint", len(corpus) - 1)
+            # Compute embeddings with memory tracking
+            compute_embeddings_with_memory_tracking(retriever, corpus, args, logger)
 
     except Exception as e:
-        logger.log_error(e, "Error in main execution")
+        logger.log_error(e, "Main execution failed")
         raise
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
 if __name__ == '__main__':
-    seed_everything(SEED)
     main()

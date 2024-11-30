@@ -1,15 +1,14 @@
-import os
-import yaml
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from datetime import datetime
+import os
 
 @dataclass
 class ClusteringConfig:
     """Configuration for clustering experiment."""
     
-     # Experiment identification
+    # Experiment identification
     experiment_name: str = "clustering_experiment"
     experiment_id: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d_%H%M%S"))
     
@@ -23,6 +22,8 @@ class ClusteringConfig:
     cluster_seed: int = 42
     use_scaler: bool = True
     min_cluster_size: int = 3
+    min_docs_per_cluster: int = 2
+    max_docs_per_category: int = 3
     
     # Embeddings configuration
     compute_new_embeddings: bool = True
@@ -36,32 +37,45 @@ class ClusteringConfig:
     use_bm25: bool = False
     use_adore: bool = False
     use_random: bool = False
+    use_test: bool = False
     
     # Processing configuration
     batch_size: int = 32
     use_gpu: bool = True
-
     normalize_embeddings: bool = True
     lower_case: bool = False 
     do_normalize_text: bool = True
     
+    # Noise injection configuration
+    use_random_docs: bool = False
+    random_doc_ratio: float = 0.2
+    noise_ratio: float = 0.0
+    
     # Output configuration 
     output_dir: str = field(default_factory=lambda: f"experiments/experiment1_clustering/results/{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     save_intermediates: bool = True
-   
+    save_every: int = 250
+    save_checkpoints: bool = True
+
     @property
     def corpus_path(self) -> Path:
-        """Get appropriate corpus path based on configuration."""
         if self.use_random:
             return self.processed_dir / "corpus_with_random_at60.json"
         elif self.use_adore:
             return self.processed_dir / "corpus_with_adore_at200.json"
-        else:
-            return self.processed_dir / "corpus_with_contriever_at150.json"
+        return self.processed_dir / "corpus_with_contriever_at150.json"
     
     @property
-    def queries_path(self) -> Path:
+    def train_dataset_path(self) -> Path:
         return self.base_data_dir / "10k_train_dataset.json"
+    
+    @property
+    def test_dataset_path(self) -> Path:
+        return self.base_data_dir / "test_dataset.json"
+    
+    @property
+    def data_path(self) -> Path:
+        return self.test_dataset_path if self.use_test else self.train_dataset_path
         
     @property
     def search_results_path(self) -> Path:
@@ -69,70 +83,14 @@ class ClusteringConfig:
             return self.base_data_dir / "10k_random_results_at60.pkl"
         elif self.use_adore:
             return self.base_data_dir / "adore_search_results_at200.pkl"
-        else:
-            return self.base_data_dir / "contriever_search_results_at150.pkl"
-    
-    # Processing configuration
-    batch_size: int = 32
-    use_gpu: bool = True
-    
-    # Random document injection
-    use_random_docs: bool = False
-    random_doc_ratio: float = 0.2
+        elif self.use_bm25:
+            return self.base_data_dir / "bm25_test_search_results_at250.pkl"
+        return self.base_data_dir / "contriever_search_results_at150.pkl"
     
     @property
     def random_doc_source(self) -> Path:
         return self.base_data_dir / "10k_random_results_at60.pkl"
     
-    # Output configuration 
-    output_dir: str = field(default_factory=lambda: f"experiments/experiment1_clustering/results/{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    save_intermediates: bool = True
-
-    @classmethod
-    def load(cls, config_path: str) -> "ClusteringConfig":
-        """Load configuration from YAML file."""
-        with open(config_path, 'r') as f:
-            config_dict = yaml.safe_load(f)
-        return cls(**config_dict)
-    
-    def save(self, config_path: str):
-        """Save configuration to YAML file."""
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        with open(config_path, 'w') as f:
-            yaml.dump(self.__dict__, f, default_flow_style=False)
-            
-    def validate(self):
-        """Validate configuration parameters."""
-        if self.num_clusters < 2:
-            raise ValueError("num_clusters must be at least 2")
-            
-        if not self.compute_new_embeddings and not self.embeddings_path:
-            self.embeddings_path = os.path.join(self.embeddings_output_dir, "document_embeddings.npy")
-            self.compute_new_embeddings = True
-
-        # Validate file existence     
-        if not self.compute_new_embeddings and not os.path.exists(self.embeddings_path):
-            raise ValueError(f"Embeddings path does not exist: {self.embeddings_path}")
-        
-        # Validate file existence
-        if not self.corpus_path.exists():
-            raise ValueError(f"Corpus path does not exist: {self.corpus_path}")
-            
-        if not self.queries_path.exists():
-            raise ValueError(f"Queries path does not exist: {self.queries_path}")
-            
-        if not self.search_results_path.exists():
-            raise ValueError(f"Search results path does not exist: {self.search_results_path}")
-            
-        if self.use_random_docs and not self.random_doc_source.exists():
-            raise ValueError(f"Random document source does not exist: {self.random_doc_source}")
-        
-    def __post_init__(self):
-        """Post-initialization validation and setup."""
-        self.validate()
-        os.makedirs(self.output_dir, exist_ok=True)
-        os.makedirs(self.embeddings_output_dir, exist_ok=True)
-
     # Batch size management
     batch_size: int = 32
     min_batch_size: int = 1
@@ -160,3 +118,57 @@ class ClusteringConfig:
                 5000,
                 int(self.clustering_batch_size / self.batch_size_reduction_factor)
             )
+
+    def validate(self):
+        """Validate configuration parameters."""
+        if self.num_clusters < 2:
+            raise ValueError("num_clusters must be at least 2")
+            
+        if not self.compute_new_embeddings and not self.embeddings_path:
+            self.embeddings_path = os.path.join(self.embeddings_output_dir, "document_embeddings.npy")
+            self.compute_new_embeddings = True
+
+        if not self.compute_new_embeddings and not os.path.exists(self.embeddings_path):
+            raise ValueError(f"Embeddings path does not exist: {self.embeddings_path}")
+        
+        if not self.corpus_path.exists():
+            raise ValueError(f"Corpus not found: {self.corpus_path}")
+            
+        if not self.data_path.exists():
+            raise ValueError(f"Dataset not found: {self.data_path}")
+            
+        if not self.search_results_path.exists():
+            raise ValueError(f"Search results not found: {self.search_results_path}")
+            
+        if self.use_random_docs and not self.random_doc_source.exists():
+            raise ValueError(f"Random document source not found: {self.random_doc_source}")
+    
+    def __post_init__(self):
+        """Post-initialization validation and setup."""
+        self.validate()
+        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.embeddings_output_dir, exist_ok=True)
+
+# Factory for common configurations
+class ClusteringConfigFactory:
+    @staticmethod
+    def get_base_config() -> ClusteringConfig:
+        """Get base clustering configuration."""
+        return ClusteringConfig()
+    
+    @staticmethod
+    def get_random_config() -> ClusteringConfig:
+        """Get configuration with random document injection."""
+        return ClusteringConfig(
+            use_random_docs=True,
+            random_doc_ratio=0.3,
+            noise_ratio=0.2
+        )
+        
+    @staticmethod
+    def get_test_config() -> ClusteringConfig:
+        """Get configuration for test dataset."""
+        return ClusteringConfig(
+            use_test=True,
+            use_bm25=True
+        )

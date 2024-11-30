@@ -124,7 +124,6 @@ class ExperimentLogger:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     
-    # Keep all existing methods
     def _setup_output_filtering(self):
         """Configure output filtering rules."""
         self.skip_patterns = [
@@ -207,7 +206,7 @@ class ExperimentLogger:
         )
 
     def log_system_info(self):
-        """Log system information with minimal console output."""
+        """Log system information with minimal output."""
         try:
             system_info = {
                 "cpu_usage": f"{psutil.cpu_percent()}%",

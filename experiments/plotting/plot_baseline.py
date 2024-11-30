@@ -13,12 +13,10 @@ class BaselinePlotter:
         self.plots_dir.mkdir(parents=True, exist_ok=True)
         
     def plot_results(self, results: List[Dict]):
-        """Plot results with error handling."""
         if not results:
             logging.warning("No results to plot for baseline experiment")
             return
 
-        # Add default metrics if missing
         processed_results = []
         for result in results:
             if result.get('success', False):
@@ -30,7 +28,8 @@ class BaselinePlotter:
                     'total_examples': metrics.get('total_examples', 0),
                     'avg_response_time': metrics.get('avg_response_time', 0),
                     'avg_context_length': metrics.get('avg_context_length', 0),
-                    'description': config.get('description', 'Unknown'),
+                    'noise_ratio': metrics.get('noise_ratio', 0),
+                    'noise_type': config.get('args', {}).get('noise_type', 'none'),
                     'retriever': config.get('args', {}).get('retriever', 'Unknown')
                 }
                 processed_results.append(processed_result)
@@ -41,8 +40,9 @@ class BaselinePlotter:
 
         metrics_df = pd.DataFrame(processed_results)
         self._plot_accuracy_comparison(metrics_df)
-        self._plot_retrieval_statistics(metrics_df)
+        self._plot_noise_impact(metrics_df)
         self._plot_performance_metrics(metrics_df)
+        self._plot_comparative_analysis(metrics_df)
 
     def _plot_accuracy_comparison(self, df: pd.DataFrame):
         try:
@@ -61,27 +61,19 @@ class BaselinePlotter:
             logging.error(f"Error plotting accuracy comparison: {str(e)}")
             plt.close()
 
-    def _plot_retrieval_statistics(self, df: pd.DataFrame):
+    def _plot_noise_impact(self, df: pd.DataFrame):
         try:
             plt.figure(figsize=(12, 6))
-            metrics = ['accuracy', 'total_examples']
-            available_metrics = [m for m in metrics if m in df.columns]
-            
-            if available_metrics and 'retriever' in df.columns:
-                df_melted = pd.melt(df,
-                                  id_vars=['retriever'],
-                                  value_vars=available_metrics,
-                                  var_name='Metric',
-                                  value_name='Score')
-                
-                sns.barplot(data=df_melted, x='retriever', y='Score', hue='Metric')
-                plt.title('Retrieval Metrics Comparison')
-                plt.xticks(rotation=45)
+            if all(col in df.columns for col in ['noise_ratio', 'accuracy', 'noise_type']):
+                sns.scatterplot(data=df, x='noise_ratio', y='accuracy', hue='noise_type', style='retriever')
+                plt.title('Impact of Noise on Accuracy')
+                plt.xlabel('Noise Ratio')
+                plt.ylabel('Accuracy')
                 plt.tight_layout()
-                plt.savefig(self.plots_dir / 'retrieval_metrics.png', dpi=300)
+                plt.savefig(self.plots_dir / 'noise_impact.png', dpi=300)
             plt.close()
         except Exception as e:
-            logging.error(f"Error plotting retrieval statistics: {str(e)}")
+            logging.error(f"Error plotting noise impact: {str(e)}")
             plt.close()
 
     def _plot_performance_metrics(self, df: pd.DataFrame):
@@ -105,4 +97,18 @@ class BaselinePlotter:
             plt.close()
         except Exception as e:
             logging.error(f"Error plotting performance metrics: {str(e)}")
+            plt.close()
+
+    def _plot_comparative_analysis(self, df: pd.DataFrame):
+        try:
+            plt.figure(figsize=(12, 8))
+            if all(col in df.columns for col in ['retriever', 'accuracy', 'noise_type']):
+                g = sns.FacetGrid(df, col='noise_type', height=6)
+                g.map_dataframe(sns.barplot, x='retriever', y='accuracy')
+                g.fig.suptitle('Comparative Analysis: Retriever Performance by Noise Type')
+                plt.tight_layout()
+                plt.savefig(self.plots_dir / 'comparative_analysis.png', dpi=300)
+            plt.close()
+        except Exception as e:
+            logging.error(f"Error plotting comparative analysis: {str(e)}")
             plt.close()
