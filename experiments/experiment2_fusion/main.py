@@ -1,36 +1,30 @@
 import os
 import sys
-import torch
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional
 from datetime import datetime
-from tqdm import tqdm
-import argparse
-import json
-import warnings
-import logging
-import gc
-
-
-
-# Add project root to system path
-project_root = str(Path(__file__).parent.parent.parent)
-sys.path.append(project_root)
-
+import torch
+from src.utils import read_corpus_json
 from src.experiment_logger import ExperimentLogger
 from src.utils import seed_everything
 from src.llm import LLM
 from src.prompt_dataset import PromptDataset
 from src.rag_fusion_utils import RAGFusionRanker
 from .config import FusionConfig, FusionConfigFactory
-from .utils import FusionExperimentUtils
+from .utils import FusionExperimentUtils  
+
+import argparse
+import json
+import gc
+import tqdm
+import warnings
+import logging
+
+# Define project_root
+project_root = str(Path(__file__).parent.parent.parent)
 
 
 class FusionExperiment:
-    """
-    Implements experiment workflow for testing RAG-Fusion approaches.
-    """
-    
     def __init__(
         self,
         config: FusionConfig,
@@ -44,93 +38,74 @@ class FusionExperiment:
             base_log_dir=str(Path(project_root) / "logs")
         )
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Initialize utilities
         self.utils = FusionExperimentUtils()
-        
+
     def setup(self):
-        """Set up experiment components."""
         try:
             self.logger.log_step_start("Setup")
-            
-            # Initialize LLM
+
             self.llm = LLM(
                 self.config.llm_id,
                 self.device,
                 quantization_bits=4,
                 model_max_length=self.config.model_max_length
             )
-            
-            # Load retrieval results
+
             self.retriever_results = self.utils.load_retrieval_results(
                 str(self.config.contriever_results_path),
-                str(self.config.bm25_results_path),
+                str(self.config.bm25_results_path) if self.config.use_bm25 else None,
+                self.config.use_fusion,
                 self.logger
             )
-            
-            # Initialize fusion ranker
-            self.fusion_ranker = self.utils.initialize_fusion_ranker(
-                strategy=self.config.fusion_strategy,
-                k=self.config.fusion_k,
-                normalize_scores=self.config.normalize_scores,
-                weights={
-                    'contriever': self.config.contriever_weight,
-                    'bm25': self.config.bm25_weight
-                },
-                logger=self.logger
-            )
-            
-            # Load dataset
+
+            if self.config.use_fusion:
+                self.fusion_ranker = RAGFusionRanker(
+                    strategy=self.config.fusion_strategy,
+                    k=self.config.fusion_k,
+                    normalize_scores=self.config.normalize_scores,
+                    score_weights=self.config.fusion_weights
+                )
+
             self.dataset = self._load_dataset()
-            
             self.logger.log_step_end("Setup")
-            
+
         except Exception as e:
             self.logger.log_error(e, "Error in experiment setup")
             raise
-            
+
     def _load_dataset(self) -> PromptDataset:
-        """Load and prepare dataset."""
-        # Load corpus
-        from src.utils import read_corpus_json
-        corpus = read_corpus_json(str(self.config.corpus_path))
-        
-        # Perform fusion on search results
-        fused_results = self.fusion_ranker.fuse_search_results(self.retriever_results)
-        
-        # Inject random documents if configured
-        if self.config.use_random_docs:
-            fused_results = self.utils.inject_random_documents(
-                fused_results,
-                str(self.config.random_doc_source),
-                self.config.random_doc_ratio,
-                self.logger
+        try:
+            corpus = read_corpus_json(str(self.config.corpus_path))
+
+            if self.config.use_fusion:
+                search_results = self.fusion_ranker.fuse_search_results(self.retriever_results)
+            else:
+                search_results = self.retriever_results['contriever']
+
+            return PromptDataset(
+                corpus=corpus,
+                data_path=str(self.config.train_dataset_path),
+                tokenizer=self.llm.tokenizer,
+                max_tokenized_length=self.config.model_max_length - 2,
+                search_results=search_results,
+                num_documents_in_context=self.config.num_documents_in_context
             )
-        
-        return PromptDataset(
-            corpus=corpus,
-            data_path=str(self.config.train_dataset_path),
-            tokenizer=self.llm.tokenizer,
-            max_tokenized_length=self.config.model_max_length - 2,
-            search_results=fused_results,
-            num_documents_in_context=self.config.num_documents_in_context
-        )
-    
+
+        except Exception as e:
+            self.logger.log_error(e, "Error loading dataset")
+            raise
+
     def run(self):
-        """Run the fusion experiment with memory optimization."""
         try:
             self.logger.log_step_start("Experiment execution")
-            
-            # Monitor initial GPU memory
+
             if torch.cuda.is_available():
                 gpu = torch.cuda.current_device()
                 initial_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
                 self.config.adjust_batch_sizes(initial_memory)
-            
-            # Log configuration
+
             self.logger.log_experiment_params(self.config.to_dict())
-            
-            # Create dataloader 
+
             dataloader = torch.utils.data.DataLoader(
                 self.dataset,
                 batch_size=self.config.batch_size,
@@ -138,67 +113,62 @@ class FusionExperiment:
                 num_workers=8,
                 pin_memory=True
             )
-            
-            # Run generation
+
             results = []
             for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
-                # Monitor memory during processing
                 if torch.cuda.is_available():
                     current_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
                     self.config.adjust_batch_sizes(current_memory)
 
-                # Perform fusion ranking in smaller batches
-                fused_results = self.fusion_ranker.fuse_batch(
-                    batch,
-                    batch_size=self.config.fusion_batch_size
-                )
-                
-                # Generate answers
+                if self.config.use_fusion:
+                    fused_results = self.fusion_ranker.fuse_batch(
+                        batch['documents'],
+                        batch['scores'], 
+                        batch_size=self.config.fusion_batch_size
+                    )
+                else:
+                    fused_results = batch['documents']
+
                 prompts = [
                     self.utils.format_fusion_prompt(q, docs)
-                    for q, docs in zip(batch['query'], fused_results)
+                    for q, docs in zip(batch['query'], fused_results)  
                 ]
-                
+
                 generated_outputs = self.llm.generate(
                     prompts,
                     max_new_tokens=self.config.max_new_tokens
                 )
-                
-                # Process outputs
+
                 batch_results = self._process_batch_outputs(
                     batch, generated_outputs, fused_results
                 )
                 results.extend(batch_results)
-                
-                # Save checkpoint if needed
+
                 if self.config.save_intermediates and (batch_idx + 1) % self.config.save_every == 0:
                     self._save_checkpoint(results, batch_idx + 1)
-                
-                # Memory cleanup
-                if torch.cuda.is_available():
+
+                if torch.cuda.is_available():  
                     torch.cuda.empty_cache()
                 gc.collect()
-                
-                # Monitor memory threshold
+
                 if self.logger.check_memory_threshold():
                     self.config.batch_size = max(1, self.config.batch_size // 2)
-            
-            # Analyze results and save
+                    self.config.fusion_batch_size = max(10, self.config.fusion_batch_size // 2)
+
             metrics = self.utils.analyze_fusion_results(results, self.logger)
-            
-            output_dir = Path(self.config.output_dir) / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path(self.config.output_dir) / f"run_{timestamp}"
             self.utils.save_fusion_artifacts(
                 results,
-                metrics,
+                metrics, 
                 self.fusion_ranker.get_fusion_info(),
                 str(output_dir),
                 self.logger
             )
-            
+
             self.logger.log_step_end("Experiment execution")
             return results, metrics
-            
+
         except Exception as e:
             self.logger.log_error(e, "Error during experiment execution")
             raise
@@ -206,49 +176,21 @@ class FusionExperiment:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
-            
-    def _run_generation(
-        self, 
-        dataloader: torch.utils.data.DataLoader
-    ) -> List[Dict[str, Any]]:
-        """Run generation on batches."""
-        results = []
-        
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
-            # Generate answers
-            prompts = batch['prompt']
-            generated_outputs = self.llm.generate(
-                prompts,
-                max_new_tokens=self.config.max_new_tokens
-            )
-            
-            # Process outputs
-            batch_results = self._process_batch_outputs(batch, generated_outputs)
-            results.extend(batch_results)
-            
-            # Save intermediate results if configured
-            if self.config.save_intermediates and (batch_idx + 1) % self.config.save_every == 0:
-                self._save_checkpoint(results, batch_idx + 1)
-                
-        return results
-    
+
     def _process_batch_outputs(
-    self,
-    batch: Dict[str, Any],
-    outputs: List[str],
-    fused_results: List[Dict[str, Any]]
+        self,
+        batch: Dict[str, Any],
+        outputs: List[str],
+        fused_results: Dict[str, List[Dict]]
     ) -> List[Dict[str, Any]]:
-        """Process generation outputs with memory monitoring."""
         processed_results = []
         answer_string = "### Response:" if 'mpt' in self.config.llm_id else "Answer:"
         
         for idx, output in enumerate(outputs):
             try:
-                # Extract answer text
                 start_idx = output.find(answer_string) + len(answer_string)
                 answer = output[start_idx:].strip()
                 
-                # Create result with fusion info
                 result = {
                     'query': batch['query'][idx],
                     'generated_answer': answer,
@@ -266,16 +208,14 @@ class FusionExperiment:
                 self.logger.log_error(e, f"Error processing batch item {idx}")
                 continue
                 
-            # Clean up batch tensors
             if torch.cuda.is_available():
                 for k, v in batch.items():
                     if isinstance(v, torch.Tensor):
                         del v
         
         return processed_results
-    
+
     def _save_checkpoint(self, results: List[Dict], batch_idx: int):
-        """Save intermediate results checkpoint."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         checkpoint_dir = Path(self.config.output_dir) / "checkpoints"
         checkpoint_dir.mkdir(exist_ok=True)
@@ -283,11 +223,10 @@ class FusionExperiment:
         checkpoint_path = checkpoint_dir / f"checkpoint_{batch_idx}_{timestamp}.json"
         with open(checkpoint_path, 'w') as f:
             json.dump(results, f, indent=2)
-            
+        
         self.logger.experiment_logger.info(f"Saved checkpoint at batch {batch_idx}")
 
 def parse_arguments():
-    """Parse command line arguments for fusion experiment."""
     parser = argparse.ArgumentParser(description="Run fusion experiment")
     
     parser.add_argument(
@@ -328,16 +267,11 @@ def main(args=None):
         # Run experiment
         try:
             args = parse_arguments() if args is None else argparse.Namespace(**args)
-            config = FusionConfigFactory.get_config_for_strategy(args.strategy)
-            experiment = FusionExperiment(config)
-            
-            # Run phases sequentially with checkpoint detection
-            experiment.run_retrieval_phase()
-            experiment.run_fusion_phase()     # Specific to fusion
-            experiment.run_generation_phase()
-            metrics = experiment.run_evaluation_phase()
-            
-            return experiment.results, metrics
+            config = FusionConfigFactory.get_config_for_strategy(args.strategy, args.use_random)
+            experiment = FusionExperiment(config, "fusion_experiment", FusionExperimentLogger())
+            experiment.setup()
+            results, metrics = experiment.run()
+            return results, metrics
         except Exception as e:
             logging.error(f"Error in fusion experiment: {str(e)}", exc_info=True)
             raise

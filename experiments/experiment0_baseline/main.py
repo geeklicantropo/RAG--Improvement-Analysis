@@ -2,22 +2,18 @@ import os
 import sys
 import torch
 from pathlib import Path
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, List, Any, Tuple, Optional, Union
 from datetime import datetime
-from tqdm import tqdm
 import argparse
-import warnings
-import logging
 import json
+import logging
 import gc
-import numpy as np
 from torch.utils.data import DataLoader
 
 from experiments.checkpoint_utils import (
     save_checkpoint,
-    load_checkpoints, 
-    get_last_checkpoint_batch,
-    merge_checkpoint_results
+    load_checkpoints,
+    get_last_checkpoint_batch
 )
 
 from experiments.experiment0_baseline.config import BaselineConfig, BaselineConfigFactory
@@ -26,6 +22,8 @@ from src.utils import seed_everything, read_corpus_json, read_pickle
 from src.llm import LLM
 from src.prompt_dataset import PromptDataset
 import matplotlib.pyplot as plt
+from tqdm import tqdm
+import random
 
 class ExperimentBase:
     """Base class for all experiments with checkpoint handling"""
@@ -56,14 +54,28 @@ class ExperimentBase:
             json.dump(data, f, indent=2)
 
 class BaselineExperiment(ExperimentBase):
-    def __init__(self, config: BaselineConfig, logger: Optional[ExperimentLogger] = None):
+    def __init__(self, config: BaselineConfig, logger: Optional[ExperimentLogger] = None, output_dir: Optional[str] = None):
         self.config = config
         self.logger = logger or ExperimentLogger("baseline", str(Path(__file__).parent.parent.parent / "logs"))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.results = {"contriever": None, "bm25": None, "random": None}
-        self.output_dir = Path(config.output_dir)  # Add output_dir attribute
+        self.output_dir = Path(output_dir or config.output_dir) 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._setup_memory_management()
+        
+        # Initialize LLM during setup
+        self.llm = self._initialize_llm()
+
+    def _initialize_llm(self):
+        """Initialize the LLM with proper configuration."""
+        quantization_bits = 8 if self.config.use_8bit_quantization else None
+        llm = LLM(
+            model_id=self.config.llm_id,
+            device=self.device,
+            quantization_bits=quantization_bits,
+            model_max_length=self.config.model_max_length
+        )
+        return llm
 
     def _setup_memory_management(self):
         if torch.cuda.is_available():
@@ -72,28 +84,113 @@ class BaselineExperiment(ExperimentBase):
             torch.cuda.set_per_process_memory_fraction(self.config.gpu_memory_utilization)
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
-    def run_retrieval_phase(self):
+    def _load_corpus(self, file_path: Union[str, Path]) -> List[Dict]:
         try:
-            self.logger.log_step_start("Retrieval Phase")
-            
-            # Contriever Retrieval
-            self.logger.log_step_start("Contriever Retrieval")
-            contriever_results = self._run_retrieval("contriever")
-            self._validate_retrieval_results(contriever_results, "contriever")
-            self._cleanup_memory()
-            
-            # BM25 Retrieval
-            self.logger.log_step_start("BM25 Retrieval")
-            bm25_results = self._run_retrieval("bm25")
-            self._validate_retrieval_results(bm25_results, "bm25")
-            self._cleanup_memory()
-            
-            self.logger.log_step_end("Retrieval Phase")
-            return contriever_results, bm25_results
-            
+            return read_corpus_json(str(file_path))
         except Exception as e:
-            self.logger.log_error(e, "Error in retrieval phase")
+            self.logger.error(f"Error loading corpus from {file_path}: {str(e)}")
             raise
+
+    def merge_generation_checkpoints(self):
+        """Merge all generation checkpoints after verifying completeness."""
+        checkpoint_dir = self.output_dir / "checkpoints"
+        
+        if not checkpoint_dir.exists():
+            return []
+            
+        # Get sorted checkpoint files
+        checkpoint_files = sorted(
+            checkpoint_dir.glob("generation_checkpoint_*.json"), 
+            key=lambda p: int(p.stem.split('_')[-1]))
+            
+        actual_batch_count = len(checkpoint_files)
+        
+        # Check for incomplete checkpoints
+        if actual_batch_count < self.config.total_batches:
+            self.logger.experiment_logger.warning(
+                f"Found {actual_batch_count}/{self.config.total_batches} checkpoints. "
+                "Resuming from last checkpoint."
+            )
+            if checkpoint_files:
+                last_checkpoint = checkpoint_files[-1]
+                with open(last_checkpoint) as f:
+                    return json.load(f)
+            return []
+            
+        # Merge all checkpoints
+        all_results = []
+        for checkpoint_file in checkpoint_files:
+            with open(checkpoint_file) as f:
+                batch_results = json.load(f)
+                all_results.extend(batch_results)
+                
+        return all_results
+
+    def run_pipeline(self):
+        """Suppress debug output and run the experiment pipeline."""
+        with self.logger.experiment_logger.handlers[0]:  # Suppress non-essential output
+            # Run phases sequentially
+            self.run_retrieval_phase()
+            self.run_generation_phase()
+            metrics = self.run_evaluation_phase()
+            return metrics
+
+    def inject_noise_into_contexts(
+    self,
+    corpus: List[Dict],
+    search_results: List[Tuple[List[int], List[float]]],
+    noise_ratio: float,
+    seed: int = 42
+    ) -> List[Tuple[List[int], List[float]]]:
+        try:
+            if self.logger:
+                self.logger.log_step_start("Injecting noise into contexts")
+
+            random.seed(seed)
+            noisy_results = []
+
+            # Fix the tqdm usage here
+            for doc_indices, scores in tqdm(search_results, desc="Injecting Noise"):
+                num_noise_docs = max(1, int(len(doc_indices) * noise_ratio))
+                noise_indices = random.sample(range(len(corpus)), num_noise_docs)
+                doc_indices = doc_indices[:-num_noise_docs] + noise_indices
+                scores = scores[:-num_noise_docs] + [0.0] * len(noise_indices)
+                noisy_results.append((doc_indices, scores))
+
+            if self.logger:
+                self.logger.log_metric("num_noisy_results", len(noisy_results))
+                self.logger.log_step_end("Injecting noise into contexts")
+
+            return noisy_results
+
+        except Exception as e:
+            if self.logger:
+                self.logger.log_error(e, "Error injecting noise into contexts")
+            raise
+
+    def run_retrieval_phase(self):
+        # Load the training corpus
+        train_corpus = self._load_corpus(self.config.train_dataset_path)
+
+        # Use the train_corpus for retrieval 
+        contriever_results = self._run_retrieval("contriever")
+        bm25_results = self._run_retrieval("bm25")
+        
+        # Inject noise if required
+        if self.config.noise_ratio > 0.0:
+            self.logger.log_step_start("Injecting noise into retrieval contexts")
+            contriever_results = self.inject_noise_into_contexts(
+                train_corpus, contriever_results, self.config.noise_ratio
+            )
+            bm25_results = self.inject_noise_into_contexts(
+                train_corpus, bm25_results, self.config.noise_ratio
+            )
+            self.logger.log_step_end("Injecting noise into retrieval contexts")
+
+        # Save retrieval results and proceed
+        self._validate_retrieval_results(contriever_results, "contriever")
+        self._validate_retrieval_results(bm25_results, "bm25")
+        return contriever_results, bm25_results
 
     def run_evaluation_phase(self):
         try:
@@ -102,8 +199,19 @@ class BaselineExperiment(ExperimentBase):
             
             for retriever_type in ["contriever", "bm25", "random"]:
                 self.logger.log_step_start(f"Evaluating {retriever_type}")
+                
+                # Ensure results exist before evaluating
+                if retriever_type not in self.results or not self.results[retriever_type]:
+                    self.logger.experiment_logger.warning(f"No results found for {retriever_type}")
+                    metrics[retriever_type] = {
+                        'accuracy': 0,
+                        'total_examples': 0,
+                        'correct_answers': 0
+                    }
+                    continue
+                    
                 metrics[retriever_type] = self._evaluate_results(
-                    self.results[retriever_type], 
+                    self.results[retriever_type],
                     retriever_type
                 )
                 self._cleanup_memory()
@@ -130,12 +238,25 @@ class BaselineExperiment(ExperimentBase):
         )
 
     def _run_retrieval(self, retriever_type: str) -> List[Tuple[List[int], List[float]]]:
+        """Run retrieval for the specified retriever type.
+        
+        Args:
+            retriever_type: Type of retriever to use ('contriever', 'bm25', or 'random')
+            
+        Returns:
+            List of tuples containing document IDs and scores
+        """
+        search_results_path = None
+        
         if retriever_type == "contriever":
             search_results_path = self.config.contriever_results_path
         elif retriever_type == "bm25":
             search_results_path = self.config.bm25_results_path
         else:  # random
             search_results_path = self.config.random_results_path
+                
+        if not Path(search_results_path).exists():
+            raise ValueError(f"Search results not found: {search_results_path}")
             
         return read_pickle(str(search_results_path))
 
@@ -145,38 +266,27 @@ class BaselineExperiment(ExperimentBase):
         self.logger.log_metric(f"{retriever_type}_retrieval_count", len(results))
 
     def _load_dataset(self, retriever_type: str) -> PromptDataset:
-        """
-        Loads the dataset for the given retriever type with all necessary configurations.
-
-        Args:
-            retriever_type (str): The type of retriever (e.g., "BM25", "Contriever").
-
-        Returns:
-            PromptDataset: An instance of the dataset prepared for the experiment.
-        """
         try:
-            # Read corpus and run retrieval for search results
             corpus = read_corpus_json(str(self.config.corpus_path))
             search_results = self._run_retrieval(retriever_type)
 
-            # Prepare dataset arguments
             dataset_kwargs = {
                 "corpus": corpus,
                 "data_path": str(self.config.data_path),
                 "tokenizer": self.llm.tokenizer,
-                "max_tokenized_length": self.config.model_max_length - 2,  # Adjust for special tokens
+                "max_tokenized_length": self.config.model_max_length - 2,
                 "search_results": search_results,
                 "num_documents_in_context": self.config.num_documents_in_context,
                 "gold_position": self.config.gold_position,
                 "get_documents_without_answer": self.config.get_documents_without_answer,
-                "max_doc_length": self.config.max_doc_length,  # Pass document truncation length
+                "max_doc_length": self.config.max_doc_length,
+                "logger": self.logger
             }
 
-            # Ensure the PromptDataset constructor accepts all arguments
             return PromptDataset(**dataset_kwargs)
 
         except Exception as e:
-            self.logger.log_error(e, f"Error loading dataset for {retriever_type}")
+            self.logger.error(f"Error loading dataset for {retriever_type}: {str(e)}")
             raise
 
     def _create_dataloader(self, dataset: PromptDataset) -> DataLoader:
@@ -193,39 +303,32 @@ class BaselineExperiment(ExperimentBase):
         )
 
     def run_generation_phase(self):
+        """Run generation phase with test dataset."""
         try:
             self.logger.log_step_start("Generation Phase")
-            
-            # Check for existing generation phase checkpoint
-            checkpoint = self._get_phase_checkpoint("generation")
-            if checkpoint:
-                self.logger.experiment_logger.info("Resuming from generation checkpoint")
-                self.results = checkpoint
-                return merge_checkpoint_results(self.results)
-            
-            # Check for batch-level checkpoints
-            checkpoint_dir = self.output_dir / "checkpoints" / "batches"
-            if checkpoint_dir.exists():
-                existing_results = load_checkpoints(checkpoint_dir)
-                if existing_results:
-                    self.logger.experiment_logger.info(f"Resuming from batch checkpoint {len(existing_results)}")
-                    self.results = merge_checkpoint_results(existing_results)
-                    return self.results
-            
-            # No checkpoints found, run full generation
-            self.llm = self._initialize_llm()
-            dataset = self._load_dataset()
-            dataloader = self._create_dataloader(dataset)
-            results = self._run_generation(dataloader)
-            
-            # Save final phase checkpoint
-            self._save_phase_checkpoint("generation", results)
-            
-            return merge_checkpoint_results(results)
-            
+
+            # Check for existing generation results or merge checkpoints
+            if not self.results.get('generation'):
+                self.results['generation'] = self.merge_generation_checkpoints()
+
+            # If no previous results exist, run from scratch 
+            if not self.results['generation']:
+                # Use test_dataset_path instead of test_dataset
+                test_corpus = read_corpus_json(str(self.config.test_dataset_path))
+                dataset = self._load_dataset(test_corpus)
+                dataloader = self._create_dataloader(dataset)
+                results = self._run_generation(dataloader)
+
+                # Save final phase checkpoint
+                self._save_phase_checkpoint("generation", results)
+                self.results['generation'] = results
+
+            return self.results['generation']
+
         except Exception as e:
             self.logger.log_error(e, "Error in generation phase")
             raise
+
 
     def _run_generation(self, dataloader: DataLoader) -> List[Dict]:
         results = []
@@ -241,33 +344,44 @@ class BaselineExperiment(ExperimentBase):
             if (batch_idx + 1) % self.config.save_every == 0:
                 save_checkpoint(results, batch_idx + 1, Path(self.config.output_dir))
                 results = []  # Clear processed results after checkpoint
-                
+                 
         if results:  # Save any remaining results
             save_checkpoint(results, len(dataloader), Path(self.config.output_dir))
             
         return load_checkpoints(Path(self.config.output_dir) / "checkpoints")
 
     def _process_batch(self, batch: Dict) -> List[Dict]:
-        """Process batches with improved error handling and checkpointing."""
-        results = []
-        for batch_idx, batch in enumerate(tqdm(DataLoader, desc="Generating")):
-            try:
-                batch_results = self._process_single_batch(batch)
-                results.extend(batch_results)
-                
-                if (batch_idx + 1) % self.config.save_every == 0:
-                    self._save_checkpoint(results, batch_idx + 1)
+        try:
+            results = []
+            prompts = batch['prompt']
+            outputs = self.llm.generate(prompts, max_new_tokens=self.config.max_new_tokens)
+
+            for idx, output in enumerate(outputs):
+                try:
+                    answer_string = "### Response:" if 'mpt' in self.config.llm_id else "Answer:"
+                    start_idx = output.find(answer_string) + len(answer_string)
                     
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    self._handle_oom_error(batch_idx)
+                    # Convert tensors to native Python types
+                    doc_indices = batch['document_indices'][idx].cpu().numpy().tolist()
+                    prompt_tokens = int(batch['prompt_tokens_len'][idx])
+                    
+                    result = {
+                        'query': batch['query'][idx],
+                        'generated_answer': output[start_idx:].strip(),
+                        'document_indices': doc_indices,
+                        'prompt_tokens_len': prompt_tokens
+                    }
+                    results.append(result)
+                    
+                except Exception as e:
+                    self.logger.log_error(e, f"Error processing batch item {idx}")
                     continue
-                raise
-            except Exception as e:
-                self.logger.log_error(e, f"Error processing batch {batch_idx}")
-                continue
-                
-        return results
+
+            return results
+
+        except Exception as e:
+            self.logger.log_error(e, "Error processing batch")
+            return []
 
     def _process_single_batch(self, batch: Dict) -> List[Dict]:
         prompts = batch['prompt']
@@ -276,7 +390,7 @@ class BaselineExperiment(ExperimentBase):
         self._cleanup_batch_tensors(batch)
         return results
 
-    def _process_batch_outputs(self, batch: Dict[str, Any], outputs: List[str]) -> List[Dict[str, Any]]:
+    def _process_batch_outputs(self, batch: Dict[str, Any], outputs: List[str]) -> List[Dict[str, Any]]: 
         processed_results = []
         answer_string = "### Response:" if 'mpt' in self.config.llm_id else "Answer:"
         
@@ -320,7 +434,15 @@ class BaselineExperiment(ExperimentBase):
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
-    def _evaluate_results(self, results: List[Dict], retriever_type: str) -> Dict:
+    
+    def _evaluate_results(self, results: List[Dict], retriever_type: str) -> Dict[str, float]:
+        if not results:
+            return {
+                'accuracy': 0,
+                'total_examples': 0, 
+                'correct_answers': 0
+            }
+        
         metrics = self._compute_metrics(results)
         self._save_results(results, metrics, retriever_type)
         return metrics
@@ -398,20 +520,47 @@ class BaselineExperiment(ExperimentBase):
         except Exception as e:
             self.logger.log_error(e, "Error plotting baseline comparisons")
 
-def main(args=None):
+def main(experiment_args=None):
     try:
-        args = parse_arguments() if args is None else argparse.Namespace(**args)
-        config = BaselineConfigFactory.get_config_for_retriever(args.retriever)
+        # Set up args if not passed
+        if isinstance(experiment_args, dict):
+            parser = argparse.ArgumentParser()
+            parser.add_argument('--retriever', type=str)
+            parser.add_argument('--output_dir', type=str)
+            namespace = parser.parse_args([])  # Avoid parsing args directly
+            for k, v in experiment_args.items():
+                setattr(namespace, k, v)
+            experiment_args = namespace
+        else:
+            experiment_args = parse_arguments()
+
+        # Load baseline config
+        config = BaselineConfigFactory.get_config_for_retriever(experiment_args.retriever) 
         
-        experiment = BaselineExperiment(config)
-        
-        # Run phases sequentially
-        experiment.run_retrieval_phase()
-        experiment.run_generation_phase()
-        metrics = experiment.run_evaluation_phase()
-        
-        return experiment.results, metrics
-        
+        # Load global config and set GPU memory settings
+        try:
+            with open("experiments/experiments_config.json") as f:
+                global_config = json.load(f)['global']
+                config.gpu_memory_utilization = global_config.get('max_memory_usage', 0.8)
+        except Exception as e:
+            logging.error(f"Error loading global config: {str(e)}")
+            raise
+            
+        # Initialize and run experiment
+        try:
+            experiment = BaselineExperiment(config, output_dir=experiment_args.output_dir)
+            
+            # Run phases sequentially
+            experiment.run_retrieval_phase()
+            experiment.run_generation_phase()
+            metrics = experiment.run_evaluation_phase()
+            
+            return experiment.results, metrics
+            
+        except Exception as e:
+            logging.error(f"Error in experiment execution: {str(e)}")
+            raise
+            
     except Exception as e:
         logging.error(f"Error in baseline experiment: {str(e)}", exc_info=True)
         raise

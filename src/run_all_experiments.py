@@ -11,6 +11,7 @@ from tqdm import tqdm
 import json
 import pandas as pd
 import torch
+import gc
 
 # Ensure project root is in path
 project_root = Path(__file__).parent.parent
@@ -500,48 +501,62 @@ def parse_arguments():
 
 def main():
     """Main entry point for running all experiments."""
-    # Configure logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
     try:
-        # Parse arguments
         args = parse_arguments()
         
-        # Create experiment pipeline
+        # Load global config and set GPU memory settings
+        try:
+            with open("experiments/experiments_config.json") as f:
+                global_config = json.load(f)['global']
+        except Exception as e:
+            logging.error(f"Error loading global config: {str(e)}")
+            raise
+            
+        # Create and configure pipeline
         pipeline = ExperimentPipeline(args.output_dir)
         
-        # Configure experiments based on arguments
         experiments_to_run = {
             'baseline': not args.skip_baseline,
             'clustering': not args.skip_clustering,
-            'fusion': not args.skip_fusion,
-            'categories': not args.skip_categories
+            'fusion': False,
+            'categories': False
         }
         
-        # Update experiment configurations
         pipeline.set_experiment_flags(experiments_to_run)
         pipeline.set_plotting_enabled(args.save_plots)
         
+        # Set experiment-specific configurations
         if not args.skip_clustering:
             pipeline.cluster_sizes = args.cluster_sizes
-        if not args.skip_fusion:
-            pipeline.fusion_strategies = args.fusion_strategies
-        if not args.skip_categories:
-            pipeline.category_types = args.category_types
-            
+            if hasattr(global_config, 'clustering'):
+                pipeline.clustering_config = global_config['clustering']
+        
+        # Initialize logger and experiment setup
+        logger = ExperimentLogger(
+            experiment_name=f"experiment_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            base_log_dir="logs"
+        )
+
         # Run pipeline
-        pipeline.run_pipeline()
+        with logger:
+            logger.log_experiment_params(vars(args))
+            logger.log_system_info()
+            pipeline.run_pipeline()
             
     except Exception as e:
         logging.error(f"Error in experiment pipeline: {str(e)}", exc_info=True)
         raise
     finally:
-        # Ensure all output is flushed
         sys.stdout.flush()
         sys.stderr.flush()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
 if __name__ == "__main__":
     main()

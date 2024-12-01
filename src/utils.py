@@ -6,9 +6,15 @@ import pickle
 import random
 import argparse
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union, Any
 import logging
+from pathlib import Path
+from datetime import datetime
+from tqdm import tqdm
+import gc
+from experiment_logger import ExperimentLogger
 
+# Seed for reproducibility
 def seed_everything(seed=10):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -19,7 +25,7 @@ def seed_everything(seed=10):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
-
+# String-to-boolean converter
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -29,134 +35,155 @@ def str2bool(v):
         return False
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
-    
 
-def read_pickle(file_path: str):
-    with open(file_path, "rb") as reader:
-        data = pickle.load(reader)
-    return data
+# Setup standardized logging
+def setup_logger(experiment_name: str) -> logging.Logger:
+    logger = logging.getLogger(experiment_name)
+    logger.setLevel(logging.INFO)
 
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
 
-def write_pickle(data, file_path: str):
-    with open(file_path, "wb") as writer:
-        pickle.dump(data, writer)
+    # File handler
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fh = logging.FileHandler(log_dir / f"{experiment_name}_{timestamp}.log")
+    fh.setLevel(logging.DEBUG)
 
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
 
-def read_json(file_path: str):
-    with open(file_path, "rb") as reader:
-        data = json.load(reader)
-    return data
+    # Formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
 
+    logger.addHandler(fh)
+    logger.addHandler(ch)
 
-def write_json(data, file_path: str):
-    with open(file_path, "w") as writer:
-        json.dump(data, writer)
+    return logger
 
-
-def read_corpus_json(data_path: str, subset_to_full_idx_map: Optional[Dict[int, int]] = None) -> List[Dict]:
-    """
-    Reads documents from a JSON file silently, without debug output.
-    
-    Args:
-        data_path (str): Path to the JSON file containing the corpus documents.
-        subset_to_full_idx_map (Optional[Dict[int, int]]): Mapping from subset to full corpus indices.
-        
-    Returns:
-        List[Dict]: List of corpus documents with adjusted indices.
-    """
-    corpus = []
+# Enhanced JSON utilities
+def save_json(data: Any, file_path: str) -> None:
+    logger = logging.getLogger()
+    logger.info(f"Saving JSON to {file_path}")
     try:
-        with open(data_path, "rb") as f:
-            # Use a list comprehension instead of iterative appending to reduce output
-            data = list(ijson.items(f, "item"))
-            
-        # Process all documents at once silently
-        corpus = [
-            {
-                **record,
-                'full_corpus_idx': (subset_to_full_idx_map[idx] if subset_to_full_idx_map 
-                                  else idx)
-            }
-            for idx, record in enumerate(data)
-        ]
-        return corpus
-        
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, "w") as f:
+            json.dump(data, f, indent=2)
     except Exception as e:
-        logging.error(f"Error reading corpus from {data_path}: {str(e)}")
+        logger.error(f"Error saving JSON to {file_path}: {str(e)}")
         raise
 
+def read_json(file_path: str) -> Any:
+    logger = logging.getLogger()
+    logger.info(f"Reading JSON from {file_path}")
+    try:
+        with open(file_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Error reading JSON from {file_path}: {str(e)}")
+        raise
 
-def read_subset_corupus_with_map(
-    full_to_subset_path: str,
-    subset_to_full_path: str,
-    corpus_path: str
-) -> Tuple[List[Dict], Dict[int, int]]:
-    full_to_subset_idx_map = read_pickle(full_to_subset_path)
-    subset_to_full_idx_map = read_pickle(subset_to_full_path)
-    corpus = read_corpus_json(corpus_path, subset_to_full_idx_map)
-    return corpus, full_to_subset_idx_map
+# Memory-optimized corpus reading
+def read_corpus_json(data_path: str, batch_size: int = 1000) -> List[Dict]:
+    logger = logging.getLogger()
+    logger.info(f"Reading corpus from {data_path}")
+    corpus = []
 
+    try:
+        with open(data_path, "r") as f:
+            parser = ijson.items(f, "item")
+            batch = []
 
-def read_corpus_with_random():
-    full_to_subset_path = "data/mappings/full_to_subset_random_at60_in_corpus.pkl"
-    subset_to_full_path = "data/mappings/subset_to_full_random_at60_in_corpus.pkl"
-    corpus_path = "data/processed/corpus_with_random_at60.json"
-    return read_subset_corupus_with_map(
-        full_to_subset_path,
-        subset_to_full_path,
-        corpus_path
-    )
+            for record in tqdm(parser, desc="Loading corpus in batches"):
+                batch.append(record)
+                if len(batch) >= batch_size:
+                    corpus.extend(batch)
+                    batch = []
+                    gc.collect()
 
+            if batch:
+                corpus.extend(batch)
 
-def read_corpus_with_adore():
-    full_to_subset_path = "data/mappings/full_to_subset_adore_at200_in_corpus.pkl"
-    subset_to_full_path = "data/mappings/subset_to_full_adore_at200_in_corpus.pkl"
-    corpus_path = "data/processed/corpus_with_adore_at200.json"
-    return read_subset_corupus_with_map(
-        full_to_subset_path,
-        subset_to_full_path,
-        corpus_path
-    )
+        logger.info(f"Loaded {len(corpus)} documents.")
+        return corpus
+    except Exception as e:
+        logger.error(f"Error reading corpus from {data_path}: {str(e)}")
+        raise
 
+# Add the missing read_pickle function
+def read_pickle(file_path: str) -> Any:
+    """Reads a pickle file and returns its contents."""
+    try:
+        with open(file_path, 'rb') as f:
+            return pickle.load(f)
+    except Exception as e:
+        logger = logging.getLogger()
+        logger.error(f"Error reading pickle file from {file_path}: {str(e)}")
+        raise
 
-def read_corpus_with_contriever():
-    full_to_subset_path = "data/mappings/full_to_subset_contriever_at150_in_corpus.pkl"
-    subset_to_full_path = "data/mappings/subset_to_full_contriever_at150_in_corpus.pkl"
-    corpus_path = "data/processed/corpus_with_contriever_at150.json"
-    return read_subset_corupus_with_map(
-        full_to_subset_path,
-        subset_to_full_path,
-        corpus_path
-    )
+# Dynamic context creation with noise injection
+def create_dynamic_context(
+    context_ids: List[int],
+    noise_ids: List[int],
+    noise_ratio: float,
+    logger: Optional[logging.Logger] = None
+) -> List[int]:
+    if logger is None:
+        logger = logging.getLogger()
+    
+    logger.info("Creating dynamic context with noise injection.")
+    try:
+        num_noise = int(len(context_ids) * noise_ratio)
+        if num_noise == 0:
+            return context_ids
 
+        noise_positions = random.sample(range(len(context_ids)), num_noise)
+        selected_noise = random.sample(noise_ids, num_noise)
 
-def read_corpus_with_random_and_contriever():
-    full_to_subset_path = "data/mappings/full_to_subset_random_contriever_in_corpus.pkl"
-    subset_to_full_path = "data/mappings/subset_to_full_random_contriever_in_corpus.pkl"
-    corpus_path = "data/processed/corpus_with_random_contriever.json"
-    return read_subset_corupus_with_map(
-        full_to_subset_path,
-        subset_to_full_path,
-        corpus_path
-    )
+        for pos, noise_id in zip(noise_positions, selected_noise):
+            context_ids[pos] = noise_id
 
+        logger.info(f"Injected {num_noise} noise documents.")
+        return context_ids
+    except Exception as e:
+        logger.error(f"Error in dynamic context creation: {str(e)}")
+        raise
 
-def read_test_corpus_with_random_and_bm25():
-    full_to_subset_path = "data/mappings/full_to_subset_test_random_bm25_in_corpus.pkl"
-    subset_to_full_path = "data/mappings/subset_to_full_test_random_bm25_in_corpus.pkl"
-    corpus_path = "data/processed/test_corpus_with_random_bm25.json"
-    return read_subset_corupus_with_map(
-        full_to_subset_path,
-        subset_to_full_path,
-        corpus_path
-    )
+# Validate retrieval results
+def validate_retrieval_results(
+    results: List[Tuple[List[int], List[float]]],
+    corpus_size: int,
+    logger: Optional[logging.Logger] = None
+) -> bool:
+    if logger is None:
+        logger = logging.getLogger()
 
-def read_test_corpus_with_random_and_contriever():
-    full_to_subset_path = "data/mappings/full_to_subset_test_random_contriever_in_corpus.pkl"
-    subset_to_full_path = "data/mappings/subset_to_full_test_random_contriever_in_corpus.pkl"
-    corpus_path = "data/processed/test_corpus_with_random_contriever.json"
-    return read_subset_corupus_with_map(
-        full_to_subset_path,
-        subset_to_full_path,
-        corpus_path
-    )
+    try:
+        logger.info("Validating retrieval results.")
+        for doc_ids, scores in results:
+            if len(doc_ids) != len(scores):
+                raise ValueError("Mismatch in lengths of document IDs and scores.")
+            if not all(isinstance(doc_id, int) and 0 <= doc_id < corpus_size for doc_id in doc_ids):
+                raise ValueError("Invalid document IDs found.")
+        logger.info("Retrieval results validation passed.")
+        return True
+    except Exception as e:
+        logger.error(f"Error in validating retrieval results: {str(e)}")
+        return False
+
+# Memory cleanup
+def clear_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+# Optimal batch size computation
+def compute_batch_size(total_items: int, max_memory_gb: float = 0.8) -> int:
+    if not torch.cuda.is_available():
+        return 32  # Default batch size for CPU
+    total_memory = torch.cuda.get_device_properties(0).total_memory
+    memory_per_item = total_memory / total_items
+    optimal_batch_size = int((total_memory * max_memory_gb) / memory_per_item)
+    return max(1, min(optimal_batch_size, 128))

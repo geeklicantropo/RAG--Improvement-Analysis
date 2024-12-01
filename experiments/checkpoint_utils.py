@@ -1,19 +1,30 @@
-#src/utils/checkpoint_utils.py
 import os
 import json
 from pathlib import Path
 from typing import List, Dict, Any
 from datetime import datetime
+import torch
+
+def _make_serializable(obj):
+    if torch.is_tensor(obj):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: _make_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [_make_serializable(item) for item in obj]
+    return obj
 
 def save_checkpoint(results: List[Dict], batch_idx: int, output_dir: Path) -> None:
-    checkpoint_dir = output_dir / "checkpoints/batches"
+    checkpoint_dir = output_dir / "checkpoints" 
     checkpoint_dir.mkdir(exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     checkpoint_path = checkpoint_dir / f"results_checkpoint_batch_{batch_idx}_{timestamp}.json"
     
+    serializable_results = _make_serializable(results)
+    
     with open(checkpoint_path, 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(serializable_results, f, indent=2)
 
 def load_checkpoints(checkpoint_dir: Path) -> List[Dict]:
     if not checkpoint_dir.exists():

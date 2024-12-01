@@ -24,12 +24,14 @@ from experiments.checkpoint_utils import (
 )
 
 from src.experiment_logger import ExperimentLogger
-from src.utils import seed_everything
+from src.utils import seed_everything, read_corpus_json, read_pickle
 from src.llm import LLM
 from src.prompt_dataset import PromptDataset
 from src.cluster_utils import DocumentClusterer
 from .config import ClusteringConfig, ClusteringConfigFactory
 from .utils import ClusteringExperimentUtils
+from src.compute_corpus_embeddings import compute_embeddings_with_memory_tracking
+from experiments.experiment1_clustering.utils import ClusteringExperimentUtils
 
 class ClusteringExperiment:
     def __init__(
@@ -44,6 +46,9 @@ class ClusteringExperiment:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._setup_memory_management()
 
+        # Initialize LLM (e.g., Llama, Meta-llama)
+        self.llm = LLM(model_id=config.llm_id, device=self.device)  # Ensure LLM initialization
+
     def _setup_memory_management(self):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -56,29 +61,25 @@ class ClusteringExperiment:
         try:
             self.logger.log_step_start("Embedding Phase")
             
-            # Check for existing embeddings checkpoint
-            checkpoint = self._get_phase_checkpoint("embeddings")
-            if checkpoint:
-                self.logger.experiment_logger.info("Using existing embeddings")
-                self.embeddings = np.load(checkpoint['embeddings_path'])
-                return self.embeddings
-            
-            # Compute new embeddings
-            utils = ClusteringExperimentUtils()
-            self.embeddings = utils.compute_embeddings(
-                corpus=self._load_corpus(),
-                output_dir=self.config.embeddings_output_dir,
-                logger=self.logger,
-                batch_size=self.config.batch_size
+            # Load training dataset to compute embeddings
+            train_corpus = read_corpus_json(self.config.train_dataset)  # Load the training dataset
+
+            # Compute embeddings for the training data
+            self.embeddings = compute_embeddings_with_memory_tracking(
+                corpus=train_corpus, 
+                subset_indices=list(range(len(train_corpus))),  # Or sample your corpus
+                args=self.config,  # Include your config settings
+                logger=self.logger
             )
-            
-            # Save checkpoint
+
+            # Save embeddings to disk
             embeddings_path = Path(self.config.embeddings_output_dir) / f"embeddings_{datetime.now().strftime('%Y%m%d_%H%M%S')}.npy"
             np.save(embeddings_path, self.embeddings)
+            
             self._save_phase_checkpoint("embeddings", {'embeddings_path': str(embeddings_path)})
-            
+
+            self.logger.log_step_end("Embedding Phase")
             return self.embeddings
-            
         except Exception as e:
             self.logger.log_error(e, "Error in embedding phase")
             raise
@@ -106,6 +107,13 @@ class ClusteringExperiment:
             
             # Perform clustering
             self.clusters = self.clusterer.fit_clusters(self.embeddings)
+            
+            # Handle noise injection into clusters if required
+            if self.config.inject_noise:
+                self.logger.log_step_start("Injecting Noise into Clusters")
+                self.clusters = self._inject_noise_into_clusters(self.clusters, self._load_corpus())
+                self.logger.log_step_end("Completed Noise Injection")
+
             self._save_phase_checkpoint("clustering", self.clusters)
             
             return self.clusters
@@ -127,7 +135,7 @@ class ClusteringExperiment:
                 return merge_checkpoint_results(self.results)
             
             # Initialize LLM
-            self.llm = self._initialize_llm()
+            self.llm = self._initialize_llm()  # Ensure LLM initialization before using
             
             # Create dataset with clustered documents
             dataset = self._create_dataset()
@@ -144,20 +152,32 @@ class ClusteringExperiment:
             raise
 
     def run_evaluation_phase(self):
-        """Evaluate clustering experiment results."""
+        """Evaluate clustering experiment results using test dataset."""
         try:
             self.logger.log_step_start("Evaluation Phase")
-            
-            utils = ClusteringExperimentUtils()
-            metrics = utils.analyze_clustering_results(self.results, self.logger)
-            
-            # Save metrics
-            metrics_path = self.output_dir / "metrics.json"
-            with open(metrics_path, "w") as f:
-                json.dump(metrics, f, indent=2)
-            
-            return metrics
-            
+
+            # Load test dataset
+            train_corpus = read_corpus_json(str(self.config.train_dataset_path))
+
+            # Initialize ClusteringEvaluation
+            clustering_utils = ClusteringExperimentUtils(logger=self.logger)
+
+            # Analyze clustering results (this could be expanded to include more metrics)
+            cluster_analysis = clustering_utils.analyze_clustering_results(self.clusters, logger=self.logger)
+
+            # Calculate clustering quality metrics
+            clustering_metrics = clustering_utils.calculate_cluster_quality_metrics(
+                embeddings=self.embeddings,  # Embeddings used in clustering
+                cluster_labels=np.array([label for cluster in self.clusters.values() for label in [cluster['cluster_id']] * len(cluster['documents'])])
+            )
+
+            # Log clustering evaluation results
+            self.logger.log_metric("clustering_metrics", clustering_metrics)
+            self.logger.log_metric("cluster_analysis", cluster_analysis)
+
+            self.logger.log_step_end("Evaluation Phase")
+            return clustering_metrics
+
         except Exception as e:
             self.logger.log_error(e, "Error in evaluation phase")
             raise
@@ -171,10 +191,12 @@ class ClusteringExperiment:
             model_max_length=self.config.model_max_length
         )
 
-    def _load_corpus(self):
-        """Load corpus from existing file."""
-        from src.utils import read_corpus_json
-        return read_corpus_json(str(self.config.corpus_path))
+    def _load_corpus(self, file_path: Path) -> List[Dict]:
+        try:
+            return read_corpus_json(str(file_path))
+        except Exception as e:
+            self.logger.error(f"Error loading corpus from {file_path}: {str(e)}")
+            raise
 
     def _create_dataset(self) -> PromptDataset:
         """Create dataset with clustered documents."""
@@ -215,14 +237,14 @@ class ClusteringExperiment:
             if (batch_idx + 1) % self.config.save_every == 0:
                 save_checkpoint(results, batch_idx + 1, self.output_dir)
                 results = []  # Clear processed results after checkpoint
-                
+                 
         if results:  # Save any remaining results
             save_checkpoint(results, len(dataloader), self.output_dir)
             
         return load_checkpoints(self.output_dir / "checkpoints")
 
     def _process_batch(self, batch: Dict) -> List[Dict]:
-        """Process batch with memory optimization."""
+        """Process batch with memory optimization.""" 
         try:
             prompts = batch['prompt']
             outputs = self.llm.generate(prompts, max_new_tokens=self.config.max_new_tokens)
@@ -275,7 +297,7 @@ class ClusteringExperiment:
             return json.load(f)
 
     def _save_phase_checkpoint(self, phase: str, data: Dict):
-        """Save phase-specific checkpoint."""
+        """Save phase-specific checkpoint.""" 
         checkpoint_dir = self.output_dir / "checkpoints" / phase
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
@@ -284,6 +306,22 @@ class ClusteringExperiment:
         
         with open(checkpoint_path, 'w') as f:
             json.dump(data, f, indent=2)
+
+    def _inject_noise_into_clusters(self, cluster_results: List[Dict], corpus: List[Dict]) -> List[Dict]:
+        """Inject noise into clusters."""
+        noisy_clusters = []
+        for cluster in cluster_results:
+            cluster_docs = cluster["documents"]
+            noise_docs = self._sample_noise(corpus, len(cluster_docs))
+            noisy_clusters.append({
+                "cluster_id": cluster["cluster_id"],
+                "documents": cluster_docs + noise_docs
+            })
+        return noisy_clusters
+
+    def _sample_noise(self, corpus: List[Dict], num_samples: int) -> List[Dict]:
+        """Sample noise documents from the corpus.""" 
+        return np.random.choice(corpus, num_samples, replace=False).tolist()
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run clustering experiment")
@@ -301,48 +339,34 @@ def parse_arguments():
     )
     return parser.parse_args()
 
-def main(args=None):
+def main(experiment_args=None):
     try:
-        # Set up args
-        if isinstance(args, dict):
+        if experiment_args is None:
+            args = parse_arguments()
+        elif isinstance(experiment_args, dict):
             parser = argparse.ArgumentParser()
             parser.add_argument('--num_clusters', type=int)
-            namespace = parser.parse_args([])
-            for k, v in args.items():
-                setattr(namespace, k, v)
-            args = namespace
+            args = parser.parse_args([])
+            for k, v in experiment_args.items():
+                setattr(args, k, v)
         else:
-            args = parse_arguments()
+            args = experiment_args
 
-        # Run experiment
-        try:
-            config = ClusteringConfigFactory.get_config_for_type('clustering')
-            config.num_clusters = args.num_clusters
-            experiment = ClusteringExperiment(config)
-            
-            # Run phases sequentially with checkpoint detection
-            experiment.run_embedding_phase()  # Specific to clustering
-            experiment.run_clustering_phase() # Specific to clustering  
-            experiment.run_generation_phase()
-            metrics = experiment.run_evaluation_phase()
-            
-            return experiment.results, metrics
-        except Exception as e:
-            logging.error(f"Error in clustering experiment: {str(e)}", exc_info=True)
-            raise
-        finally:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-                        
+        config = ClusteringConfig()
+        config.num_clusters = args.num_clusters
+        experiment = ClusteringExperiment(config)
+        
+        # Run phases sequentially
+        experiment.run_embedding_phase()
+        experiment.run_clustering_phase()
+        experiment.run_generation_phase()
+        metrics = experiment.run_evaluation_phase()
+        
+        return experiment.results, metrics
+
     except Exception as e:
-        logging.error(f"Error in clustering experiment: {str(e)}", exc_info=True) 
+        logging.error(f"Error in clustering experiment: {str(e)}")
         raise
-    finally:
-        # Final cleanup
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
 
 if __name__ == "__main__":
     main()

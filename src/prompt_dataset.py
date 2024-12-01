@@ -1,768 +1,495 @@
-import os
-import json
-import random
-import hashlib
-from typing import List, Tuple, Dict, Any, Optional, Set
-from pathlib import Path
+# Dataset Management
 from torch.utils.data import Dataset
-from transformers import AutoTokenizer
-import logging
-import warnings
-import gc
 
-import normalize_text
-from normalize_answers import *
-from cluster_utils import DocumentClusterer
+# Typing and Utilities
+from typing import List, Dict, Tuple, Optional, Any
+from collections import defaultdict
+
+# File and Path Handling
+from pathlib import Path
+
+# Core Libraries
+import torch
+import logging
+import json
+import gc
+import numpy as np
+
+# Progress Tracking
+from tqdm import tqdm
+
+# Project-Specific Utilities
+from normalize_answers import is_answer_in_text
 from src.experiment_logger import ExperimentLogger
+from src.cluster_utils import DocumentClusterer
 
 class PromptDataset(Dataset):
-    """Dataset class for managing and organizing document data into structured prompts."""
-    
     def __init__(
         self,
         corpus: List[Dict],
         data_path: str,
-        tokenizer: AutoTokenizer,
+        tokenizer: 'PreTrainedTokenizer',
         max_tokenized_length: int,
-        search_results: List[Tuple[List[str], List[float]]],
-        full_to_subset_idx_map: Optional[Dict[int, int]] = None,
-        do_normalize_query: bool = False,
-        num_documents_in_context: int = 5,
+        search_results: List[Any],
+        num_documents_in_context: int,
         gold_position: Optional[int] = None,
-        randomize_gold_position: bool = False,
         get_documents_without_answer: bool = False,
         max_doc_length: Optional[int] = None,
-        use_clustering: bool = False,
-        num_clusters: Optional[int] = None,
-        cluster_seed: int = 42,
-        category_info: Optional[Dict[str, Any]] = None,
-        noise_config: Optional[Dict[str, Any]] = None,
-        experiment_type: str = "baseline",
-        output_dir: Optional[str] = None,
+        do_normalize_query: bool = True,
+        logger: Optional[logging.Logger] = None
+    ):
+        self.corpus = corpus
+        self.tokenizer = tokenizer
+        self.max_tokenized_length = max_tokenized_length
+        self.search_results = search_results
+        self.num_documents_in_context = num_documents_in_context
+        self.gold_position = gold_position
+        self.get_documents_without_answer = get_documents_without_answer
+        self.max_doc_length = max_doc_length
+        self.do_normalize_query = do_normalize_query
+        self.logger = logger or logging.getLogger(__name__)
+        
+        self.prompts = []
+        self._load_examples(data_path)
+        self._create_prompts()
+
+    def __len__(self) -> int:
+        return len(self.prompts)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if idx >= len(self.prompts):
+            raise IndexError("Index out of range")
+            
+        item = self.prompts[idx]
+        doc_indices = item['document_indices']
+        
+        # Handle empty document indices
+        if not doc_indices:
+            doc_indices = [0] * self.num_documents_in_context
+        # Handle padding if fewer documents than expected
+        elif len(doc_indices) < self.num_documents_in_context:
+            # Use first document index for padding if list not empty
+            pad_idx = doc_indices[0] if doc_indices else 0
+            doc_indices.extend([pad_idx] * (self.num_documents_in_context - len(doc_indices)))
+        # Truncate if more documents than expected
+        elif len(doc_indices) > self.num_documents_in_context:
+            doc_indices = doc_indices[:self.num_documents_in_context]
+            
+        return {
+            'prompt': item['prompt'],
+            'query': item['query'],
+            'document_indices': torch.tensor(doc_indices, dtype=torch.long),
+            'prompt_tokens_len': len(self.tokenizer.encode(item['prompt']))
+        }
+
+    def _load_examples(self, data_path: str):
+        try:
+            with open(data_path) as f:
+                self.examples = json.load(f)
+        except Exception as e:
+            self.logger.error(f"Error loading examples from {data_path}: {str(e)}")
+            raise
+
+    def _create_prompts(self):
+        for idx, example in enumerate(self.examples):
+            try:
+                doc_indices, scores = self.search_results[idx]
+                if not isinstance(doc_indices, (list, tuple)):
+                    doc_indices = [doc_indices]
+                if not isinstance(scores, (list, tuple)):
+                    scores = [scores]
+
+                selected_docs = []
+                for doc_idx, score in zip(doc_indices, scores):
+                    if len(selected_docs) >= self.num_documents_in_context:
+                        break
+
+                    if doc_idx >= len(self.corpus):
+                        continue
+
+                    doc = self.corpus[doc_idx]
+                    if self.max_doc_length:
+                        doc['text'] = doc['text'][:self.max_doc_length]
+
+                    if not self.get_documents_without_answer or not self._contains_answer(doc['text'], example['answers']):
+                        selected_docs.append({
+                            'text': doc['text'],
+                            'score': score,
+                            'idx': doc_idx
+                        })
+
+                if self.gold_position is not None:
+                    selected_docs = self._insert_gold_document(selected_docs, example['idx_gold_in_corpus'])
+
+                prompt = self._format_prompt(example['question'], selected_docs)
+                if self._validate_prompt(prompt):
+                    self.prompts.append({
+                        'prompt': prompt,
+                        'document_indices': [d['idx'] for d in selected_docs],
+                        'scores': [d['score'] for d in selected_docs],
+                        'query': example['question'],
+                        'example_id': example.get('id', idx),
+                        'answers': example['answers']
+                    })
+
+            except Exception as e:
+                self.logger.error(f"Error processing example {idx}: {str(e)}")
+                continue
+
+    def _format_prompt(self, query: str, docs: List[Dict]) -> str:
+        prompt = [f"Question: {query}\n\nContext:"]
+        for idx, doc in enumerate(docs, 1):
+            prompt.append(f"\nDocument [{idx}]: {doc['text']}")
+        prompt.append("\nAnswer:")
+        return "\n".join(prompt)
+
+    def _validate_prompt(self, prompt: str) -> bool:
+        tokens = self.tokenizer.encode(prompt)
+        return len(tokens) <= self.max_tokenized_length
+
+    def _contains_answer(self, text: str, answers: List[str]) -> bool:
+        return any(answer.lower() in text.lower() for answer in answers)
+
+    def _insert_gold_document(self, docs: List[Dict], gold_idx: int) -> List[Dict]:
+        gold_doc = {
+            'text': self.corpus[gold_idx]['text'],
+            'score': 1.0,
+            'idx': gold_idx
+        }
+        docs.insert(self.gold_position, gold_doc)
+        return docs
+    
+class BaseDataset(Dataset):
+    def __init__(
+        self,
+        corpus: List[Dict],
+        data_path: str,
+        tokenizer: 'PreTrainedTokenizer',
+        max_tokenized_length: int,
+        debug_output_dir: Optional[str] = None,
         logger: Optional[ExperimentLogger] = None
     ):
-        super().__init__()
         self.corpus = corpus
         self.data_path = data_path
         self.tokenizer = tokenizer
         self.max_tokenized_length = max_tokenized_length
-        self.search_results = search_results
-        self.full_to_subset_idx_map = full_to_subset_idx_map
-        self.do_normalize_query = do_normalize_query
-        self.num_documents_in_context = num_documents_in_context
-        self.gold_position = gold_position
-        self.randomize_gold_position = randomize_gold_position
-        self.get_documents_without_answer = get_documents_without_answer
-        self.max_doc_length = max_doc_length
-        self.use_clustering = use_clustering
-        self.clusterer = (
-            DocumentClusterer(num_clusters, cluster_seed) if use_clustering else None
-        )
-        self.category_info = category_info
-        self.noise_config = noise_config or {}
-        self.experiment_type = experiment_type
-        self.output_dir = Path(output_dir) if output_dir else None
-        self.logger = logger or ExperimentLogger("prompt_dataset", "logs")
-
-        self.document_info = []  # Store document metadata for logging
-        self._validate_initialization_parameters()
-        self.preprocess_search_results()
-        self._load_data()
-
-    def _validate_initialization_parameters(self):
-        """Validates initialization parameters with logging."""
-        self.logger.log_step_start("Validating parameters")
-        try:
-            if self.num_documents_in_context <= 0:
-                raise ValueError("num_documents_in_context must be positive")
-            
-            if self.gold_position is not None:
-                if self.gold_position < 0 or self.gold_position >= self.num_documents_in_context:
-                    raise ValueError(f"Invalid gold position: {self.gold_position}")
-            
-            if self.gold_position is not None and self.randomize_gold_position:
-                raise ValueError("Cannot set both gold_position and randomize_gold_position")
-
-            self.logger.log_step_end("Parameter validation successful")
-        except Exception as e:
-            self.logger.log_error(e, "Parameter validation failed")
-            raise
-
-    def preprocess_search_results(self):
-        """Preprocess and validate search results with logging."""
-        self.logger.log_step_start("Preprocessing search results")
-        try:
-            if not self.search_results:
-                raise ValueError("No search results available")
-
-            processed_results = []
-            for result in self.search_results:
-                if isinstance(result, tuple) and len(result) == 2:
-                    doc_ids, scores = result
-                    processed_results.append((
-                        [str(doc_id) for doc_id in doc_ids],
-                        [float(score) for score in scores]
-                    ))
-
-            self.search_results = processed_results
-            self.logger.log_metric("processed_results_count", len(processed_results))
-            self.logger.log_step_end("Search results preprocessing")
-        except Exception as e:
-            self.logger.log_error(e, "Search results preprocessing failed")
-            raise
-
-    def save_prompts(self):
-        """Save prompts in both JSON and text formats with logging."""
-        if not self.output_dir:
-            self.logger.experiment_logger.warning("No output directory specified")
-            return
-
-        self.logger.log_step_start("Saving prompts")
-        try:
-            prompt_dir = self.output_dir / "prompts"
-            prompt_dir.mkdir(parents=True, exist_ok=True)
-
-            # Save as JSON
-            prompts_data = {
-                'example_id': self.example_ids,
-                'prompts': self.prompts,
-                'document_metadata': [
-                    {
-                        'indices': indices,
-                        'gold_position': gold_pos,
-                        'cluster_info': self.cluster_assignments.get(str(doc_idx)) if self.use_clustering else None,
-                    }
-                    for indices, gold_pos in self.document_info
-                ]
-            }
-            json_path = prompt_dir / f"{self.experiment_type}_prompts.json"
-            with open(json_path, 'w') as f:
-                json.dump(prompts_data, f, indent=2)
-
-            # Save as text for debugging
-            text_path = prompt_dir / f"{self.experiment_type}_prompts.txt"
-            with open(text_path, 'w') as f:
-                for idx, prompt in enumerate(self.prompts):
-                    f.write(f"Example {self.example_ids[idx]}\n")
-                    f.write("-" * 80 + "\n")
-                    f.write(prompt + "\n\n")
-
-            self.logger.log_metric("saved_prompts_count", len(self.prompts))
-            self.logger.log_step_end("Prompts saved successfully")
-        except Exception as e:
-            self.logger.log_error(e, "Error saving prompts")
-            raise
-
-    def _inject_noise_documents(
-        self,
-        formatted_docs: List[str],
-        doc_indices: List[int]
-    ) -> Tuple[List[str], List[int]]:
-        """Inject noise documents based on configuration."""
-        if not self.noise_config:
-            return formatted_docs, doc_indices
-
-        self.logger.log_step_start("Injecting noise documents")
-        try:
-            num_noise = self.noise_config.get('num_noise_docs', 0)
-            noise_type = self.noise_config.get('noise_type', 'random')
-            
-            if noise_type == 'random':
-                noise_docs, noise_indices = self._get_random_documents(num_noise)
-            else:
-                noise_docs, noise_indices = self._get_distractor_documents(num_noise)
-            
-            # Mix documents based on configuration
-            insert_positions = self.noise_config.get('insert_positions', None)
-            if insert_positions:
-                for pos, (doc, idx) in zip(insert_positions, zip(noise_docs, noise_indices)):
-                    formatted_docs.insert(pos, doc)
-                    doc_indices.insert(pos, idx)
-            else:
-                formatted_docs.extend(noise_docs)
-                doc_indices.extend(noise_indices)
-
-            self.logger.log_metric(f"noise_{noise_type}_count", num_noise)
-            self.logger.log_step_end("Noise injection complete")
-            return formatted_docs[:self.num_documents_in_context], doc_indices[:self.num_documents_in_context]
-        except Exception as e:
-            self.logger.log_error(e, "Error injecting noise documents")
-            return formatted_docs, doc_indices
-
-    def _get_random_documents(self, num_docs: int) -> Tuple[List[str], List[int]]:
-        """Get random documents from corpus."""
-        available_indices = list(range(len(self.corpus)))
-        selected_indices = random.sample(available_indices, min(num_docs, len(available_indices)))
-        
-        docs = []
-        indices = []
-        for idx in selected_indices:
-            doc_info = self.corpus[idx]
-            text = doc_info.get("text", "")
-            if self.max_doc_length:
-                text = text[:self.max_doc_length]
-            doc_str = f"Document [{idx}](Title: {doc_info.get('title', '')}) {text}"
-            docs.append(doc_str)
-            indices.append(idx)
-        
-        return docs, indices
-
-    def build_experiment_prompt(
-        self,
-        query: str,
-        docs: List[str],
-        experiment_type: str
-    ) -> str:
-        """Build prompt based on experiment type."""
-        self.logger.log_step_start(f"Building {experiment_type} prompt")
-        try:
-            if experiment_type == 'baseline':
-                prompt = self.build_qa_prompt(query, '\n'.join(docs))
-            elif experiment_type == 'clustering':
-                prompt = self.build_clustered_prompt(query, docs)
-            elif experiment_type == 'noise':
-                prompt = self.build_noise_aware_prompt(query, docs)
-            else:
-                raise ValueError(f"Unknown experiment type: {experiment_type}")
-                
-            self.logger.log_step_end("Prompt building complete")
-            return prompt
-        except Exception as e:
-            self.logger.log_error(e, "Error building prompt")
-            raise
-
-    def build_clustered_prompt(self, query: str, docs: List[str]) -> str:
-        """Build prompt for clustered documents."""
-        clusters = {}
-        for doc, cluster_id in zip(docs, self.cluster_assignments.values()):
-            if cluster_id not in clusters:
-                clusters[cluster_id] = []
-            clusters[cluster_id].append(doc)
-        
-        context = []
-        for cluster_id, cluster_docs in sorted(clusters.items()):
-            context.append(f"\nCluster {cluster_id}:")
-            context.extend(cluster_docs)
-        
-        return self.build_qa_prompt(query, '\n'.join(context))
-
-    def build_noise_aware_prompt(self, query: str, docs: List[str]) -> str:
-        """Build prompt with awareness of noise documents."""
-        context = []
-        for idx, doc in enumerate(docs):
-            prefix = "[NOISE] " if idx in self.noise_config.get('noise_indices', []) else ""
-            context.append(prefix + doc)
-        
-        return self.build_qa_prompt(query, '\n'.join(context))
-
-    def _load_data(self):
-        """Loads and processes data from file with logging."""
-        self.logger.log_step_start("Loading data")
-        try:
-            with open(self.data_path, "r") as fin:
-                data = json.load(fin)
-            self.process_file_data(data)
-            self.logger.log_step_end("Data loading complete")
-        except Exception as e:
-            self.logger.log_error(e, f"Error loading data from {self.data_path}")
-            raise
-
-    def process_file_data(self, data: List[Dict]):
-        """Processes dataset examples with logging."""
-        self.logger.log_step_start("Processing file data")
-        self.example_ids = []
-        self.queries = []
+        self.debug_dir = Path(debug_output_dir) if debug_output_dir else None
+        self.logger = logger or ExperimentLogger("dataset", "logs")
+        self.examples = self._load_examples()
         self.prompts = []
-        self.gold_document_idxs = []
-        self.excluded_samples_ids = []
-        self.preprocessed_data = []
-        self.prompt_tokens_lengths = []
-        self.cluster_assignments = {} if self.use_clustering else None
-
-        for idx, example in enumerate(data):
-            try:
-                example_id = str(example['example_id'])
-                gold_document_idx = str(example['idx_gold_in_corpus'])
-                answers = example['answers']
-
-                formatted_documents, document_indices = self.prepare_documents_for_prompt(
-                    idx, gold_document_idx, answers
-                )
-
-                if len(formatted_documents) != self.num_documents_in_context:
-                    self.logger.log_metric("skipped_insufficient_docs", 1)
-                    continue
-
-                documents_str = self._format_documents_for_prompt(formatted_documents, document_indices)
-                query = example['question']
-                if self.do_normalize_query:
-                    query = normalize_text.normalize(query)
-
-                prompt = self.build_experiment_prompt(query, formatted_documents, self.experiment_type)
-
-                # Check token length
-                tokens = self.tokenizer.tokenize(prompt)
-                tokens_len = len(tokens)
-                if tokens_len >= self.max_tokenized_length:
-                    self.excluded_samples_ids.append((idx, example_id))
-                    self.logger.log_metric("excluded_length_exceeded", 1)
-                    continue
-
-                self.preprocessed_data.append((formatted_documents, document_indices))
-                self.example_ids.append(example_id)
-                self.queries.append(query)
-                self.prompts.append(prompt)
-                self.gold_document_idxs.append(gold_document_idx)
-                self.prompt_tokens_lengths.append(tokens_len)
-                
-                # Save document metadata for logging
-                self.document_info.append((document_indices, self.gold_position))
-
-            except Exception as e:
-                self.logger.log_error(e, f"Error processing example {idx}")
-                continue
-
-        self.logger.log_metric("total_processed", len(self.example_ids))
-        self.logger.log_metric("total_excluded", len(self.excluded_samples_ids))
-        self.logger.log_step_end("File data processing complete")
-
-    def _get_documents(self, indices: List[int], answers: List[str], gold_document_idx: Optional[int], gold_position: Optional[int]) -> Tuple[List[str], List[int]]:
-        """Get documents based on configuration."""
-        if self.get_documents_without_answer:
-            return self._get_answerless_documents_from_indices(
-                indices, answers, gold_document_idx, gold_position
-            )
-        else:
-            return self._get_documents_from_indices(indices)
-
-    def _get_documents_from_indices(self, indices: List[int]) -> Tuple[List[str], List[int]]:
-        """Get documents from corpus by indices."""
-        formatted_documents = []
-        document_indices = []
-        seen_hashes = set()
         
-        for idx in indices:
-            if self.full_to_subset_idx_map:
-                if idx not in self.full_to_subset_idx_map:
-                    continue
-                idx = self.full_to_subset_idx_map[idx]
-                
-            if 0 <= idx < len(self.corpus):
-                doc_info = self.corpus[idx]
-                text = doc_info.get("text", "")
-                if self.max_doc_length:
-                    text = text[:self.max_doc_length]
-                    
-                # Avoid duplicates using hash
-                doc_hash = hashlib.sha256(text.encode()).hexdigest()
-                if doc_hash in seen_hashes:
-                    continue
-                seen_hashes.add(doc_hash)
-                
-                doc_str = f"Document [{idx}](Title: {doc_info.get('title', '')}) {text}"
-                formatted_documents.append(doc_str)
-                document_indices.append(idx)
+        if self.debug_dir:
+            self.debug_dir.mkdir(parents=True, exist_ok=True)
 
-                if len(formatted_documents) == self.num_documents_in_context:
-                    break
-
-        return formatted_documents, document_indices
-
-    def _format_documents_for_prompt(self, formatted_documents: List[str], document_indices: List[int]) -> str:
-        """Format documents for prompt based on configuration."""
-        if self.use_clustering and self.cluster_assignments:
-            return self._format_clustered_documents(formatted_documents, document_indices)
-        elif self.category_info:
-            return self._format_categorized_documents(formatted_documents, document_indices)
-        else:
-            return '\n'.join(formatted_documents)
-        
-    def prepare_documents_for_prompt(
-        self, 
-        example_idx: int, 
-        gold_document_idx: int, 
-        answers: List[str]
-    ) -> Tuple[List[str], List[int]]:
-        """Prepares documents for prompt creation with logging."""
-        self.logger.log_step_start(f"Preparing documents for example {example_idx}")
+    def _load_examples(self) -> List[Dict]:
+        self.logger.log_step_start("Loading examples")
         try:
-            indices = self._get_indices(example_idx)
-            updated_indices, gold_position = self._insert_gold_document_idx(
-                indices, gold_document_idx
-            )
-
-            formatted_documents, document_indices = self._get_documents(
-                updated_indices, answers, gold_document_idx, gold_position
-            )
-
-            if self.use_clustering and formatted_documents:
-                self._update_cluster_assignments(formatted_documents, document_indices)
-
-            # Add noise documents if configured
-            if self.noise_config:
-                formatted_documents, document_indices = self._inject_noise_documents(
-                    formatted_documents, document_indices
-                )
-
-            self.logger.log_metric("documents_prepared", len(formatted_documents))
-            self.logger.log_step_end("Document preparation complete")
-            return formatted_documents, document_indices
+            with open(self.data_path) as f:
+                examples = json.load(f)
+            self.logger.log_metric("num_examples", len(examples))
+            self.logger.log_step_end("Examples loaded")
+            return examples
         except Exception as e:
-            self.logger.log_error(e, "Error preparing documents")
+            self.logger.log_error(e, "Error loading examples")
             raise
 
-    def _get_indices(self, example_idx: int) -> List[int]:
-        """Get document indices with validation and logging."""
-        self.logger.log_step_start(f"Getting indices for example {example_idx}")
-        try:
-            if not self.search_results:
-                raise ValueError("No search results available")
-                
-            if example_idx >= len(self.search_results):
-                raise ValueError(f"Example index {example_idx} out of range")
-
-            indices, scores = self.search_results[example_idx]
-            valid_indices = []
-            max_corpus_idx = len(self.corpus) - 1
-                
-            for idx in indices:
-                corpus_idx = int(idx)
-                    
-                if self.full_to_subset_idx_map is not None:
-                    if corpus_idx not in self.full_to_subset_idx_map:
-                        continue
-                    corpus_idx = self.full_to_subset_idx_map[corpus_idx]
-                        
-                if 0 <= corpus_idx <= max_corpus_idx:
-                    valid_indices.append(corpus_idx)
-                    
-            if len(valid_indices) < self.num_documents_in_context:
-                self._fill_missing_indices(valid_indices, max_corpus_idx)
-
-            self.logger.log_metric("valid_indices_found", len(valid_indices))
-            self.logger.log_step_end("Index retrieval complete")
-            return valid_indices[:self.num_documents_in_context]
-        except Exception as e:
-            self.logger.log_error(e, "Error getting indices")
-            raise
-
-    def _fill_missing_indices(self, valid_indices: List[int], max_idx: int):
-        """Fill missing indices to reach required context size."""
-        current_indices = set(valid_indices)
-        additional_needed = self.num_documents_in_context - len(valid_indices)
+    def save_debug_info(self, example_id: str, info: Dict):
+        if not self.debug_dir:
+            return
         
-        additional_indices = []
-        for i in range(max_idx + 1):
-            if len(additional_indices) >= additional_needed:
-                break
-            if i not in current_indices:
-                additional_indices.append(i)
-                
-        valid_indices.extend(additional_indices[:additional_needed])
+        debug_file = self.debug_dir / f"example_{example_id}.json"
+        with open(debug_file, 'w') as f:
+            json.dump(info, f, indent=2)
+            
+        text_file = self.debug_dir / f"example_{example_id}.txt"
+        with open(text_file, 'w') as f:
+            f.write(f"Query: {info['query']}\n\n")
+            f.write("Documents:\n")
+            for idx, doc in enumerate(info.get('documents', []), 1):
+                f.write(f"\nDocument [{idx}]")
+                if 'type' in doc:
+                    f.write(f" ({doc['type']})")
+                if 'cluster' in doc:
+                    f.write(f" [Cluster {doc['cluster']}]")
+                f.write(f":\n{doc['text']}\n")
+            f.write(f"\nPrompt:\n{info['prompt']}\n")
 
-    def _insert_gold_document_idx(
-        self,
-        indices: List[int],
-        gold_document_idx: int
-    ) -> Tuple[List[int], int]:
-        """Insert gold document at specified or random position."""
-        gold_position = None
-        
-        if self.gold_position is not None:
-            gold_position = self.gold_position
-        elif self.randomize_gold_position:
-            gold_position = random.randint(0, self.num_documents_in_context - 1)
-            
-        if gold_position is not None:
-            indices = indices[:gold_position] + [gold_document_idx] + indices[gold_position:]
-            
-        return indices, gold_position
-
-    def _update_cluster_assignments(
-        self,
-        formatted_documents: List[str],
-        document_indices: List[int]
-    ):
-        """Update cluster assignments with logging."""
-        self.logger.log_step_start("Updating cluster assignments")
-        try:
-            texts = [doc.split(') ', 1)[1] if ') ' in doc else doc for doc in formatted_documents]
-            assignments = self.clusterer.fit_predict(texts, document_indices)
-            self.cluster_assignments.update(assignments)
-            
-            self.logger.log_metric("clusters_updated", len(assignments))
-            self.logger.log_step_end("Cluster assignments updated")
-        except Exception as e:
-            self.logger.log_error(e, "Error updating cluster assignments")
-            raise
-
-    def _get_distractor_documents(self, num_docs: int) -> Tuple[List[str], List[int]]:
-        """Get distractor documents that don't contain the answer."""
-        available_docs = []
-        available_indices = []
-        
-        for idx, doc in enumerate(self.corpus):
-            if not any(is_answer_in_text(doc['text'], ans) for ans in self.answers):
-                available_docs.append(doc)
-                available_indices.append(idx)
-                
-        selected_indices = random.sample(
-            range(len(available_docs)),
-            min(num_docs, len(available_docs))
-        )
-        
-        docs = []
-        indices = []
-        for idx in selected_indices:
-            doc_info = available_docs[idx]
-            text = doc_info.get("text", "")
-            if self.max_doc_length:
-                text = text[:self.max_doc_length]
-            doc_str = f"Document [{available_indices[idx]}](Title: {doc_info.get('title', '')}) {text}"
-            docs.append(doc_str)
-            indices.append(available_indices[idx])
-            
-        return docs, indices
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Get dataset item with complete metadata."""
-        formatted_docs, document_indices = self.preprocessed_data[idx]
-        
-        item = {
-            "example_id": self.example_ids[idx],
-            "query": self.queries[idx],
-            "prompt": self.prompts[idx],
-            "document_indices": document_indices,
-            "gold_document_idx": self.gold_document_idxs[idx],
-            "prompt_tokens_len": self.prompt_tokens_lengths[idx]
-        }
-        
-        if self.use_clustering and self.cluster_assignments:
-            item["cluster_assignments"] = {
-                str(doc_idx): self.cluster_assignments.get(str(doc_idx))
-                for doc_idx in document_indices
-            }
-            
-        if self.noise_config:
-            item["noise_info"] = {
-                "num_noise_docs": self.noise_config.get('num_noise_docs', 0),
-                "noise_type": self.noise_config.get('noise_type', 'random'),
-                "noise_indices": [i for i, idx in enumerate(document_indices) 
-                                if idx in self.noise_config.get('noise_indices', [])]
-            }
-            
-        return item
+    def cleanup(self):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
     def __len__(self) -> int:
-        return len(self.example_ids)
+        return len(self.prompts)
 
-class MixedDocumentsDataset(PromptDataset):
-    """Dataset for handling mixed document sources with enhanced logging."""
-    
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return self.prompts[idx]
+
+class MixedDocumentsDataset(BaseDataset):
     def __init__(
-        self, 
+        self,
         corpus: List[Dict],
-        data_path: str,  
-        tokenizer: AutoTokenizer,
+        data_path: str,
+        tokenizer: 'PreTrainedTokenizer',
         max_tokenized_length: int,
         retriever_search_results: List[Tuple[List[int], List[float]]],
         random_search_results: List[Tuple[List[int], List[float]]],
         documents_disposition_info: Dict[str, Any],
         full_to_subset_idx_map: Optional[Dict[int, int]] = None,
-        do_normalize_query: bool = False,
+        do_normalize_query: bool = True,
         gold_position: Optional[int] = None,
-        randomize_gold_position: bool = False,
         get_documents_without_answer: bool = False,
-        logger: Optional[ExperimentLogger] = None
+        use_clustering: bool = False,
+        num_clusters: Optional[int] = None,
+        noise_config: Optional[Dict] = None,
+        **kwargs
     ):
+        super().__init__(corpus, data_path, tokenizer, max_tokenized_length, **kwargs)
         self.retriever_search_results = retriever_search_results
         self.random_search_results = random_search_results
         self.documents_disposition_info = documents_disposition_info
-        self.logger = logger or ExperimentLogger("mixed_documents_dataset", "logs")
+        self.full_to_subset_idx_map = full_to_subset_idx_map
+        self.do_normalize_query = do_normalize_query
+        self.gold_position = gold_position
+        self.get_documents_without_answer = get_documents_without_answer
+        self.use_clustering = use_clustering
+        self.noise_config = noise_config or {}
+        
+        self.clusterer = DocumentClusterer(num_clusters) if use_clustering else None
+        self._create_prompts()
 
-        required_keys = ['num_retrieved_documents', 'num_random_documents', 'put_retrieved_first']
-        if not all(key in documents_disposition_info for key in required_keys):
-            raise ValueError("Missing required keys in documents_disposition_info")
+    def _cluster_documents(self, docs: List[Dict]) -> List[Dict]:
+        if not docs:
+            return docs
+            
+        texts = [doc["text"] for doc in docs]
+        cluster_ids = self.clusterer.fit_predict(texts)
+        
+        for doc, cluster_id in zip(docs, cluster_ids):
+            doc["cluster_id"] = int(cluster_id)
+            doc["type"] = "retrieved_clustered"
+            
+        return docs
 
-        num_documents_in_context = (
-            documents_disposition_info['num_retrieved_documents'] +
-            documents_disposition_info['num_random_documents']
-        )
+    def _inject_noise(self, docs: List[Dict]) -> List[Dict]:
+        noise_ratio = self.noise_config.get("ratio", 0.2)
+        noise_type = self.noise_config.get("type", "random")
+        
+        num_noise = int(len(docs) * noise_ratio)
+        if num_noise == 0:
+            return docs
+            
+        noise_indices = np.random.choice(len(docs), num_noise, replace=False)
+        
+        for idx in noise_indices:
+            if noise_type == "random":
+                random_doc = np.random.choice(self.corpus)
+                docs[idx] = {
+                    "idx": random_doc.get("idx", -1),
+                    "text": random_doc["text"],
+                    "score": 0.0,
+                    "type": "noise_random"
+                }
+            elif noise_type == "adversarial":
+                original_text = docs[idx]["text"]
+                noisy_text = self._add_adversarial_noise(original_text)
+                docs[idx]["text"] = noisy_text
+                docs[idx]["type"] = "noise_adversarial"
+                
+        return docs
 
-        super().__init__(
-            corpus=corpus,
-            data_path=data_path,
-            tokenizer=tokenizer,
-            max_tokenized_length=max_tokenized_length,
-            search_results=None,
-            full_to_subset_idx_map=full_to_subset_idx_map,
-            do_normalize_query=do_normalize_query,
-            num_documents_in_context=num_documents_in_context,
-            gold_position=gold_position,
-            randomize_gold_position=randomize_gold_position,
-            get_documents_without_answer=get_documents_without_answer,
-            logger=logger
-        )
+    def _add_adversarial_noise(self, text: str) -> str:
+        words = text.split()
+        num_words = len(words)
+        num_changes = max(1, int(num_words * 0.1))
+        change_indices = np.random.choice(num_words, num_changes, replace=False)
+        
+        for idx in change_indices:
+            if np.random.random() < 0.5:
+                words[idx] = np.random.choice(self.noise_config.get("word_pool", ["the", "a", "an"]))
+            else:
+                words[idx] = words[idx] + "'"
+                
+        return " ".join(words)
+
+    def _randomize_document_order(self, docs: List[Dict]) -> List[Dict]:
+        if self.gold_position is not None:
+            gold_doc = docs[self.gold_position]
+            other_docs = docs[:self.gold_position] + docs[self.gold_position+1:]
+            np.random.shuffle(other_docs)
+            other_docs.insert(self.gold_position, gold_doc)
+            return other_docs
+        
+        shuffled = docs.copy()
+        np.random.shuffle(shuffled)
+        return shuffled
+
+
+    def _create_prompts(self):
+        self.logger.log_step_start("Creating mixed document prompts")
+        try:
+            for example_idx, example in enumerate(tqdm(self.examples, desc="Processing examples")):
+                try:
+                    # Get and validate retriever results
+                    doc_indices, scores = self.retriever_search_results[example_idx]
+                    if isinstance(doc_indices, int):
+                        doc_indices = [doc_indices] 
+                        scores = [scores]
+                    
+                    # Process retrieved documents
+                    retrieved_docs = []
+                    for idx, score in zip(doc_indices, scores):
+                        if len(retrieved_docs) >= self.documents_disposition_info["num_retrieved_documents"]:
+                            break
+                            
+                        if self.full_to_subset_idx_map:
+                            idx = self.full_to_subset_idx_map.get(idx, idx)
+                            
+                        if idx >= len(self.corpus):
+                            continue
+                            
+                        doc = self.corpus[idx].copy()  
+                        if not self.get_documents_without_answer or not is_answer_in_text(doc['text'], example['answers']):
+                            retrieved_docs.append({
+                                "text": doc['text'],
+                                "score": float(score),
+                                "idx": idx,
+                                "type": "retrieved"
+                            })
+
+                    # Process random documents
+                    random_docs = self._get_random_documents(example_idx)
+                    
+                    # Apply clustering if enabled
+                    if self.use_clustering:
+                        retrieved_docs = self._cluster_documents(retrieved_docs)
+                    
+                    # Inject noise if configured
+                    if self.noise_config:
+                        retrieved_docs = self._inject_noise(retrieved_docs)
+                    
+                    # Mix documents according to disposition
+                    docs = self._mix_documents(retrieved_docs, random_docs)
+                    
+                    # Handle gold document if specified
+                    if self.gold_position is not None:
+                        docs = self._insert_gold_document(docs, example["idx_gold_in_corpus"])
+                            
+                    # Randomize order if requested
+                    if self.documents_disposition_info.get("randomize_order", False):
+                        docs = self._randomize_document_order(docs)
+                    
+                    prompt = self._format_prompt(example["question"], docs)
+                    if self._validate_prompt(prompt):
+                        prompt_info = {
+                            "prompt": prompt,
+                            "query": example["question"], 
+                            "example_id": example.get("id", example_idx),
+                            "document_indices": [d["idx"] for d in docs],
+                            "document_types": [d.get("type", "unknown") for d in docs],
+                            "cluster_ids": [d.get("cluster_id") for d in docs if "cluster_id" in d],
+                            "scores": [d["score"] for d in docs]
+                        }
+                        self.prompts.append(prompt_info)
+                        
+                        debug_info = {
+                            "query": example["question"],
+                            "documents": [{
+                                "text": d["text"],
+                                "type": d.get("type", "unknown"),
+                                "cluster": d.get("cluster_id"),
+                                "score": d["score"]
+                            } for d in docs],
+                            "prompt": prompt
+                        }
+                        self.save_debug_info(example.get("id", example_idx), debug_info)
+                    
+                    if len(self.prompts) % 1000 == 0:
+                        self.cleanup()
+                            
+                except Exception as e:
+                    self.logger.error(f"Error processing example {example_idx}: {str(e)}")
+                    continue
+                    
+            self.logger.log_step_end("Prompts created")
+            
+        except Exception as e:
+            self.logger.log_error(e, "Error creating prompts")
+            raise
+
+    def _get_retrieved_documents(self, example_idx: int, answers: List[str]) -> List[Dict]:
+        doc_indices, scores = self.retriever_search_results[example_idx]
+        retrieved_docs = []
+        
+        for idx, score in zip(doc_indices, scores):
+            if self.full_to_subset_idx_map:
+                idx = self.full_to_subset_idx_map.get(idx, idx)
+            
+            if idx >= len(self.corpus):
+                continue
+                
+            doc = self.corpus[idx]
+            if self.get_documents_without_answer:
+                if not is_answer_in_text(doc["text"], answers):
+                    retrieved_docs.append({
+                        "idx": idx,
+                        "text": doc["text"],
+                        "score": score
+                    })
+            else:
+                retrieved_docs.append({
+                    "idx": idx,
+                    "text": doc["text"],
+                    "score": score
+                })
+                
+        return retrieved_docs[:self.documents_disposition_info["num_retrieved_documents"]]
+
+    def _get_random_documents(self, example_idx: int) -> List[Dict]:
+        doc_indices, scores = self.random_search_results[example_idx]
+        random_docs = []
+        
+        for idx, score in zip(doc_indices, scores):
+            if self.full_to_subset_idx_map:
+                idx = self.full_to_subset_idx_map.get(idx, idx)
+            
+            if idx >= len(self.corpus):
+                continue
+                
+            doc = self.corpus[idx]
+            random_docs.append({
+                "idx": idx,
+                "text": doc["text"],
+                "score": score
+            })
+            
+        return random_docs[:self.documents_disposition_info["num_random_documents"]]
 
     def _mix_documents(
-        self, 
-        retrieved_indices: List[int], 
-        random_indices: List[int]
-    ) -> List[int]:
-        """Mix retrieved and random documents with logging."""
-        self.logger.log_step_start("Mixing documents")
-        try:
-            num_retrieved = self.documents_disposition_info['num_retrieved_documents']    
-            num_random = self.documents_disposition_info['num_random_documents']
-            put_retrieved_first = self.documents_disposition_info['put_retrieved_first']
-
-            if put_retrieved_first:
-                indices = retrieved_indices[:num_retrieved] + random_indices[:num_random]
-            else:
-                indices = random_indices[:num_random] + retrieved_indices[:num_retrieved][::-1]
-
-            self.logger.log_metric("mixed_documents_count", len(indices))
-            self.logger.log_step_end("Document mixing complete")
-            return indices
-        except Exception as e:
-            self.logger.log_error(e, "Error mixing documents")
-            raise
-
-    def _get_indices(self, example_idx: int) -> List[int]:
-        """Get indices from both retrieved and random results."""
-        self.logger.log_step_start(f"Getting mixed indices for example {example_idx}")
-        try:
-            retrieved_indices, _ = self.retriever_search_results[example_idx]
-            random_indices, _ = self.random_search_results[example_idx]
-            mixed_indices = self._mix_documents(retrieved_indices, random_indices)
-            
-            self.logger.log_metric("total_indices", len(mixed_indices))
-            self.logger.log_step_end("Mixed indices retrieval complete")
-            return mixed_indices
-        except Exception as e:
-            self.logger.log_error(e, "Error getting mixed indices")
-            raise
-
-
-class MultiCorpusDataset(PromptDataset):
-    """Dataset for handling multiple document corpora with enhanced logging."""
-    
-    def __init__(
         self,
-        corpus: List[Dict],
-        data_path: str,
-        tokenizer: AutoTokenizer,
-        max_tokenized_length: int,
-        search_results: List[Tuple[List[str], List[float]]],
-        documents_other_corpus: List[str],
-        search_results_other_corpus: List[Tuple[List[int], List[float]]],
-        documents_disposition_info: Dict[str, Any],
-        full_to_subset_idx_map: Optional[Dict[int, int]] = None,
-        do_normalize_query: bool = False,
-        gold_position: Optional[int] = None,
-        randomize_gold_position: bool = False,
-        get_documents_without_answer: bool = False,
-        logger: Optional[ExperimentLogger] = None
-    ):
-        self.documents_other_corpus = documents_other_corpus
-        self.search_results_other_corpus = search_results_other_corpus
-        self.documents_disposition_info = documents_disposition_info
-        self.logger = logger or ExperimentLogger("multi_corpus_dataset", "logs")
-        required_keys = ['num_main_documents', 'num_other_documents', 'put_main_first']
-        if not all(key in documents_disposition_info for key in required_keys):
-            raise ValueError("Missing keys in documents_disposition_info")
+        retrieved_docs: List[Dict],
+        random_docs: List[Dict]
+    ) -> List[Dict]:
+        if self.documents_disposition_info["put_retrieved_first"]:
+            return retrieved_docs + random_docs
+        return random_docs + retrieved_docs
 
-        num_documents_in_context = (
-            documents_disposition_info['num_main_documents'] + 
-            documents_disposition_info['num_other_documents']
-        )
+    def _insert_gold_document(self, docs: List[Dict], gold_idx: int) -> List[Dict]:
+        gold_doc = {
+            "idx": gold_idx,
+            "text": self.corpus[gold_idx]["text"],
+            "score": 1.0
+        }
+        docs.insert(self.gold_position, gold_doc)
+        return docs
 
-        super().__init__(
-            corpus=corpus,
-            data_path=data_path,
-            tokenizer=tokenizer,
-            max_tokenized_length=max_tokenized_length,
-            search_results=search_results,
-            full_to_subset_idx_map=full_to_subset_idx_map,
-            do_normalize_query=do_normalize_query,
-            num_documents_in_context=num_documents_in_context,
-            gold_position=gold_position,
-            randomize_gold_position=randomize_gold_position,
-            get_documents_without_answer=get_documents_without_answer,
-            logger=logger
-        )
+    def _format_prompt(self, query: str, docs: List[Dict]) -> str:
+        prompt = [f"Query: {query}\n\nContext:"]
+        for idx, doc in enumerate(docs, 1):
+            prompt.append(f"Document [{idx}]: {doc['text']}")
+        prompt.append("\nAnswer:")
+        return "\n".join(prompt)
 
-    def prepare_documents_for_prompt(
-        self, 
-        example_idx: int, 
-        gold_document_idx: int, 
-        answers: List[str]
-    ) -> Tuple[List[str], List[int]]:
-        """Prepare documents from multiple corpora."""
-        indices_main_corpus = self._get_indices(example_idx)
-        indices_main_corpus, gold_position = self._insert_gold_document_idx(
-            indices_main_corpus, gold_document_idx
-        )
-        documents_main_corpus, document_indices_main_corpus = self._get_documents(
-            indices_main_corpus, answers, gold_document_idx, gold_position
-        )
-
-        indices_other_corpus, _ = self.search_results_other_corpus[example_idx]
-        documents_other_corpus, document_indices_other_corpus = self._get_documents_from_indices_other_corpus(
-            indices_other_corpus
-        )
-
-        merged_documents, merged_document_indices = self._merge_documents(
-            documents_main_corpus, documents_other_corpus,
-            document_indices_main_corpus, document_indices_other_corpus
-        )
-        return merged_documents, merged_document_indices
-
-    def _merge_documents(
-        self, 
-        documents_main: List[str], 
-        documents_other: List[str], 
-        indices_main: List[int], 
-        indices_other: List[int]
-    ) -> Tuple[List[str], List[int]]:
-        """Merge documents from both corpora."""
-        num_main = self.documents_disposition_info.get('num_main_documents', len(documents_main))
-        num_other = self.documents_disposition_info.get('num_other_documents', len(documents_other))
-        put_main_first = self.documents_disposition_info.get('put_main_first', True)
-
-        if put_main_first:
-            merged_documents = documents_main[:num_main] + documents_other[:num_other]
-            merged_document_indices = indices_main[:num_main] + indices_other[:num_other]
-        else:
-            merged_documents = documents_other[:num_other] + documents_main[:num_main][::-1]
-            merged_document_indices = indices_other[:num_other] + indices_main[:num_main][::-1]
-
-        return merged_documents, merged_document_indices
-
-    def _get_documents_from_indices_other_corpus(
-        self,
-        indices: List[int]
-    ) -> Tuple[List[str], List[int]]:
-        """Get documents from secondary corpus."""
-        try:
-            formatted_documents = []
-            document_indices = []
-            
-            for idx in indices:
-                if 0 <= idx < len(self.documents_other_corpus):
-                    doc_info = self.documents_other_corpus[idx]
-                    text = doc_info.get("text", "")
-                    if self.max_doc_length:
-                        text = text[:self.max_doc_length]
-                    doc_str = f"Document [{idx}](Title: {doc_info.get('title', '')}) {text}"
-                    formatted_documents.append(doc_str)
-                    document_indices.append(idx)
-                    
-                if len(formatted_documents) == self.documents_disposition_info.get('num_other_documents', 0):
-                    break
-
-            return formatted_documents, document_indices
-            
-        except Exception as e:
-            self.logger.log_error(e, "Error accessing multi-corpus documents")
-            return [], []
+    def _validate_prompt(self, prompt: str) -> bool:
+        tokens = self.tokenizer.tokenize(prompt)
+        return len(tokens) <= self.max_tokenized_length

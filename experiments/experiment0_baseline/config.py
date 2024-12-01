@@ -3,11 +3,13 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 from datetime import datetime
 import os
+import json
+from src.utils import read_pickle
 
 @dataclass
 class BaselineConfig:
     """Configuration for baseline RAG experiment."""
-    
+        
     # Model Configuration
     llm_id: str = "meta-llama/Llama-2-7b-chat-hf"
     model_max_length: int = 2048 
@@ -15,7 +17,7 @@ class BaselineConfig:
     max_new_tokens: int = 15
     
     # Memory Management
-    gpu_memory_utilization: float = 0.7
+    gpu_memory_utilization: float = 0.8
     empty_cache_every_n_batches: int = 1
     gradient_checkpointing: bool = True
     cpu_offload: bool = True
@@ -38,6 +40,7 @@ class BaselineConfig:
     normalize_embeddings: bool = False
     use_test: bool = False
     random_doc_percentage: Optional[float] = None
+    noise_ratio: float = 0.2  # New parameter for noise injection
     
     # Data Paths
     base_data_dir: Path = Path("data")
@@ -76,6 +79,29 @@ class BaselineConfig:
     @property
     def random_results_path(self) -> Path:
         return self.base_data_dir / "10k_random_results_at60.pkl"
+    
+    @property
+    def data_paths(self) -> Dict[str, Path]:
+        return {
+            'train': self.train_dataset_path,
+            'test': self.test_dataset_path,
+            'corpus': self.corpus_path,
+            'contriever_results': self.contriever_results_path,
+            'bm25_results': self.bm25_results_path,
+            'random_results': self.random_results_path
+        }
+    
+    @property
+    def total_batches(self) -> int:
+        """Calculate total number of batches based on dataset size."""
+        if not hasattr(self, '_total_batches'):
+            try:
+                with open(self.data_path) as f:
+                    dataset = json.load(f)
+                self._total_batches = (len(dataset) + self.batch_size - 1) // self.batch_size
+            except Exception as e:
+                return 0
+        return self._total_batches
 
     def __post_init__(self):
         self._validate_parameters()
@@ -84,43 +110,81 @@ class BaselineConfig:
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
     def _validate_parameters(self):
-        """
-        Validate the parameters of the BaselineConfig to ensure consistency and that
-        required files and directories exist.
-        """
-        # Validate number of documents in context
+        """Validate configuration parameters."""
         if self.num_documents_in_context <= 0:
             raise ValueError("num_documents_in_context must be positive")
         
-        # Validate gold position if specified
         if self.gold_position is not None and (
-            self.gold_position < 0 or self.gold_position >= self.num_documents_in_context
+            self.gold_position < 0 or 
+            self.gold_position >= self.num_documents_in_context
         ):
             raise ValueError("gold_position must be within the document context range")
         
-        # Ensure the corpus path exists
+        self._validate_paths()
+        self._validate_search_results()
+
+    def _validate_paths(self):
+        """Validate required data paths exist."""
         if not self.corpus_path.exists():
             raise ValueError(f"Corpus file not found: {self.corpus_path}")
-        
-        # Dynamically select the appropriate search results path
-        search_results_path = (
-            self.contriever_results_path if not self.use_bm25 and not self.use_random else
-            self.bm25_results_path if self.use_bm25 else
-            self.random_results_path
-        )
-        
-        # Ensure the selected search results path exists
+            
+        if not self.data_path.exists():
+            raise ValueError(f"Dataset not found: {self.data_path}")
+            
+        search_results_path = self._get_search_results_path()
         if not search_results_path.exists():
-            raise ValueError(f"Search results file not found: {search_results_path}")
+            raise ValueError(f"Search results not found: {search_results_path}")
+
+    def _validate_search_results(self) -> bool:
+        """Validate search results have proper format."""
+        try:
+            search_results_path = self._get_search_results_path()
+            if not search_results_path.exists():
+                raise ValueError(f"Search results file not found: {search_results_path}")
+
+            results = read_pickle(str(search_results_path))
+
+            if not isinstance(results, list):
+                raise ValueError("Search results must be a list")
+
+            # Validate first result structure
+            if not results:
+                raise ValueError("Empty search results")
+
+            # Allow both tuple and list formats
+            first_result = results[0]
+            if isinstance(first_result, (tuple, list)) and len(first_result) == 2:
+                doc_ids, scores = first_result
+                if len(doc_ids) == len(scores):
+                    return True
+                    
+            raise ValueError("Invalid search result format")
+
+        except Exception as e:
+            raise ValueError(f"Invalid search results: {str(e)}")
+    
+    def _get_search_results_path(self) -> Path:
+        """Get appropriate search results path based on configuration."""
+        if self.use_bm25:
+            return self.bm25_results_path
+        elif self.use_random:
+            return self.random_results_path
+        return self.contriever_results_path
     
     def _create_directories(self):
+        """Create required output directories."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
     def to_dict(self) -> Dict[str, Any]:
-        return {k: str(v) if isinstance(v, Path) else v for k, v in self.__dict__.items()}
+        """Convert configuration to dictionary."""
+        return {
+            k: str(v) if isinstance(v, Path) else v 
+            for k, v in self.__dict__.items()
+        }
         
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'BaselineConfig':
+        """Create configuration from dictionary."""
         for key, value in config_dict.items():
             if isinstance(value, str) and (key.endswith('_path') or key.endswith('_dir')):
                 config_dict[key] = Path(value)
@@ -135,10 +199,16 @@ class BaselineConfig:
                                 int(self.batch_size * self.batch_size_reduction_factor))
         elif current_memory_usage < 0.6:
             self.batch_size = min(self.max_batch_size,
-                                int(self.batch_size / self.batch_size_reduction_factor)) 
+                                int(self.batch_size / self.batch_size_reduction_factor))
 
+    @staticmethod
+    def load_from_json(config_path: str) -> 'BaselineConfig':
+        """Load configuration from a JSON file."""
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+        return BaselineConfig.from_dict(config_dict)
 
-# Default configurations for different scenarios
+# Factory for common configurations
 class BaselineConfigFactory:
     @staticmethod 
     def get_config_for_retriever(retriever_type: str) -> BaselineConfig:
@@ -179,6 +249,7 @@ class BaselineConfigFactory:
         return BaselineConfig(
             use_random=True,
             random_doc_percentage=0.4,
+            noise_ratio=0.3,  
             num_documents_in_context=7, 
             get_documents_without_answer=True,
             use_test=False

@@ -63,6 +63,33 @@ class ExperimentLogger:
             
             self._setup_output_filtering()
 
+    def load_config(self, config_path: str) -> Dict[str, Any]:
+        """Load experiment configuration from JSON file."""
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+            self.experiment_logger.info(f"Loaded config from {config_path}")
+            return config
+        except Exception as e:
+            self.log_error(e, f"Error loading config from {config_path}")
+            raise
+
+    def validate_config(self, config: Dict[str, Any]) -> None:
+        """Validate experiment configuration."""
+        required_keys = ['llm_config', 'data_paths', 'output_dir']
+        for key in required_keys:
+            if key not in config:
+                raise ValueError(f"Missing required config key: {key}")
+
+        # Add more specific validation checks as needed
+        self.experiment_logger.info("Config validation successful")
+
+    def setup_logging(self, config: Dict[str, Any]) -> None:
+        """Set up logging based on configuration."""
+        log_level = config.get('log_level', 'INFO')
+        self.experiment_logger.setLevel(getattr(logging, log_level))
+        self.system_logger.setLevel(getattr(logging, log_level))
+
     def track_memory_usage(self) -> Dict[str, float]:
         """Track current memory usage statistics."""
         stats = {
@@ -88,18 +115,20 @@ class ExperimentLogger:
         
         return stats
 
-    def check_memory_threshold(self, threshold: float = 0.9) -> bool:
-        """Check if memory usage exceeds threshold."""
+    def check_memory_threshold(self, config: Dict[str, Any]) -> bool:
+        """Check if memory usage exceeds configured thresholds."""
         stats = self.track_memory_usage()
         
-        if stats['ram_percent'] / 100 > threshold:
+        cpu_threshold = config['global'].get('cpu_memory_threshold', 0.9)
+        if stats['ram_percent'] / 100 > cpu_threshold:
             self._log_memory_warning('CPU', stats['ram_percent'])
             return True
             
         if torch.cuda.is_available():
+            gpu_threshold = config['global'].get('gpu_memory_threshold', 0.9)
             for i in range(torch.cuda.device_count()):
                 gpu_used = torch.cuda.memory_allocated(i) / torch.cuda.max_memory_allocated(i)
-                if gpu_used > threshold:
+                if gpu_used > gpu_threshold:
                     self._log_memory_warning('GPU', gpu_used * 100, device=i)
                     return True
                     
@@ -190,10 +219,9 @@ class ExperimentLogger:
         
         return logger
         
-    def log_experiment_params(self, params: Dict[str, Any]):
-        """Log experiment parameters."""
-        if isinstance(params, dict):
-            self.experiment_logger.debug(f"Experiment Parameters: {json.dumps(params, indent=2)}")
+    def log_experiment_params(self, config: Dict[str, Any]):
+        """Log experiment parameters from config."""
+        self.experiment_logger.debug(f"Experiment Parameters: {json.dumps(config, indent=2)}")
         
     def log_progress(self, iterable, desc: str = "", **kwargs):
         """Create a progress bar with minimal output."""

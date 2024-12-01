@@ -265,14 +265,11 @@ def main(args=None):
         try:
             args = parse_arguments() if args is None else argparse.Namespace(**args)
             config = CategoriesConfigFactory.get_config_for_type(args.config_type)
-            experiment = CategoriesExperiment(config)
-            
-            # Run phases sequentially with checkpoint detection
-            experiment.run_retrieval_phase()
-            experiment.run_categorization_phase() # Specific to categories
-            experiment.run_generation_phase()
-            metrics = experiment.run_evaluation_phase()
-            
+            experiment = CategoriesExperiment(config, "categories_experiment")
+            experiment.setup()
+            results, metrics = experiment.run()
+            return results, metrics
+                
         except Exception as e:
             logging.error(f"Error in categories experiment: {str(e)}", exc_info=True)
             raise
@@ -289,3 +286,6 @@ def main(args=None):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
+
+if __name__ == "__main__":
+    main()
