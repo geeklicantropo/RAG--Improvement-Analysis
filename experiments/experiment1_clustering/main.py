@@ -1,372 +1,296 @@
 import os
 import sys
-import torch
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional
-from datetime import datetime
+import torch
 from tqdm import tqdm
-import argparse
-import json
-import warnings
 import logging
-import gc
-import numpy as np
+from datetime import datetime
 
-# Add project root to system path
-project_root = str(Path(__file__).parent.parent.parent)
-sys.path.append(project_root)
-
-from experiments.checkpoint_utils import (
-    save_checkpoint,
-    load_checkpoints, 
-    get_last_checkpoint_batch,
-    merge_checkpoint_results
-)
-
+from src.utils import seed_everything, clear_memory
 from src.experiment_logger import ExperimentLogger
-from src.utils import seed_everything, read_corpus_json, read_pickle
 from src.llm import LLM
-from src.prompt_dataset import PromptDataset
-from src.cluster_utils import DocumentClusterer
-from .config import ClusteringConfig, ClusteringConfigFactory
-from .utils import ClusteringExperimentUtils
-from src.compute_corpus_embeddings import compute_embeddings_with_memory_tracking
-from experiments.experiment1_clustering.utils import ClusteringExperimentUtils
+from src.document_classifier import DocumentClassifier
+from src.llm_evaluator import LLMEvaluator
+from .config import ClusteringConfig
+from experiments.evaluation.noise_impact import NoiseImpactEvaluator
 
 class ClusteringExperiment:
     def __init__(
         self,
         config: ClusteringConfig,
+        experiment_name: str,
         logger: Optional[ExperimentLogger] = None
     ):
         self.config = config
-        self.logger = logger or ExperimentLogger("clustering", str(Path(__file__).parent.parent.parent / "logs"))
+        self.experiment_name = experiment_name
+        self.logger = logger or ExperimentLogger(
+            experiment_name=experiment_name,
+            base_log_dir=str(Path(__file__).parent.parent.parent / "logs")
+        )
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.output_dir = Path(config.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self._setup_memory_management()
-
-        # Initialize LLM (e.g., Llama, Meta-llama)
-        self.llm = LLM(model_id=config.llm_id, device=self.device)  # Ensure LLM initialization
-
-    def _setup_memory_management(self):
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
-            torch.cuda.set_per_process_memory_fraction(self.config.gpu_memory_utilization)
-        os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-
-    def run_embedding_phase(self):
-        """Compute document embeddings phase."""
-        try:
-            self.logger.log_step_start("Embedding Phase")
-            
-            # Load training dataset to compute embeddings
-            train_corpus = read_corpus_json(self.config.train_dataset)  # Load the training dataset
-
-            # Compute embeddings for the training data
-            self.embeddings = compute_embeddings_with_memory_tracking(
-                corpus=train_corpus, 
-                subset_indices=list(range(len(train_corpus))),  # Or sample your corpus
-                args=self.config,  # Include your config settings
-                logger=self.logger
-            )
-
-            # Save embeddings to disk
-            embeddings_path = Path(self.config.embeddings_output_dir) / f"embeddings_{datetime.now().strftime('%Y%m%d_%H%M%S')}.npy"
-            np.save(embeddings_path, self.embeddings)
-            
-            self._save_phase_checkpoint("embeddings", {'embeddings_path': str(embeddings_path)})
-
-            self.logger.log_step_end("Embedding Phase")
-            return self.embeddings
-        except Exception as e:
-            self.logger.log_error(e, "Error in embedding phase")
-            raise
+        self.llm = LLM(api_key=os.getenv("GEMINI_TOKEN"))
+        self.evaluator = LLMEvaluator(self.llm)
+        self.doc_classifier = DocumentClassifier(self.llm)
+        self.noise_evaluator = NoiseImpactEvaluator(self.evaluator)
 
     def run_clustering_phase(self):
-        """Perform document clustering phase."""
+        """Run clustering with systematic testing of configurations."""
+        self.logger.log_step_start("Clustering Phase")
         try:
-            self.logger.log_step_start("Clustering Phase")
+            test_configs = self._generate_test_configs()
+            results = []
             
-            # Check for clustering checkpoint
-            checkpoint = self._get_phase_checkpoint("clustering")
-            if checkpoint:
-                self.logger.experiment_logger.info("Using existing clusters")
-                self.clusters = checkpoint
-                return self.clusters
-            
-            # Initialize clusterer
-            self.clusterer = DocumentClusterer(
-                num_clusters=self.config.num_clusters,
-                random_seed=self.config.cluster_seed,
-                use_scaler=self.config.use_scaler,
-                min_cluster_size=self.config.min_cluster_size,
-                logger=self.logger
-            )
-            
-            # Perform clustering
-            self.clusters = self.clusterer.fit_clusters(self.embeddings)
-            
-            # Handle noise injection into clusters if required
-            if self.config.inject_noise:
-                self.logger.log_step_start("Injecting Noise into Clusters")
-                self.clusters = self._inject_noise_into_clusters(self.clusters, self._load_corpus())
-                self.logger.log_step_end("Completed Noise Injection")
-
-            self._save_phase_checkpoint("clustering", self.clusters)
-            
-            return self.clusters
+            for config in tqdm(test_configs, desc="Testing configurations"):
+                cluster_results = self._run_cluster_test(config)
+                position_results = self._test_positions(cluster_results)
+                noise_results = self._test_noise_injection(cluster_results)
+                combination_results = self._test_document_combinations(cluster_results)
+                
+                # Evaluate using Gemini
+                evaluation = self.evaluator.evaluate_clusters(
+                    cluster_results, 
+                    position_results,
+                    noise_results,
+                    combination_results
+                )
+                
+                results.append({
+                    "config": config,
+                    "clustering": cluster_results,
+                    "positions": position_results,
+                    "noise": noise_results,
+                    "combinations": combination_results,
+                    "evaluation": evaluation
+                })
+                
+                clear_memory()
+                
+            self._save_results(results)
+            self.logger.log_step_end("Clustering Phase")
+            return results
             
         except Exception as e:
             self.logger.log_error(e, "Error in clustering phase")
             raise
 
-    def run_generation_phase(self):
-        """Run generation phase with clustering-aware prompts."""
-        try:
-            self.logger.log_step_start("Generation Phase")
-            
-            # Check for generation checkpoint
-            checkpoint = self._get_phase_checkpoint("generation")
-            if checkpoint:
-                self.logger.experiment_logger.info("Using existing generation results")
-                self.results = checkpoint
-                return merge_checkpoint_results(self.results)
-            
-            # Initialize LLM
-            self.llm = self._initialize_llm()  # Ensure LLM initialization before using
-            
-            # Create dataset with clustered documents
-            dataset = self._create_dataset()
-            dataloader = self._create_dataloader(dataset)
-            
-            # Run generation
-            results = self._run_generation(dataloader)
-            self._save_phase_checkpoint("generation", results)
-            
-            return merge_checkpoint_results(results)
-            
-        except Exception as e:
-            self.logger.log_error(e, "Error in generation phase")
-            raise
-
-    def run_evaluation_phase(self):
-        """Evaluate clustering experiment results using test dataset."""
-        try:
-            self.logger.log_step_start("Evaluation Phase")
-
-            # Load test dataset
-            train_corpus = read_corpus_json(str(self.config.train_dataset_path))
-
-            # Initialize ClusteringEvaluation
-            clustering_utils = ClusteringExperimentUtils(logger=self.logger)
-
-            # Analyze clustering results (this could be expanded to include more metrics)
-            cluster_analysis = clustering_utils.analyze_clustering_results(self.clusters, logger=self.logger)
-
-            # Calculate clustering quality metrics
-            clustering_metrics = clustering_utils.calculate_cluster_quality_metrics(
-                embeddings=self.embeddings,  # Embeddings used in clustering
-                cluster_labels=np.array([label for cluster in self.clusters.values() for label in [cluster['cluster_id']] * len(cluster['documents'])])
-            )
-
-            # Log clustering evaluation results
-            self.logger.log_metric("clustering_metrics", clustering_metrics)
-            self.logger.log_metric("cluster_analysis", cluster_analysis)
-
-            self.logger.log_step_end("Evaluation Phase")
-            return clustering_metrics
-
-        except Exception as e:
-            self.logger.log_error(e, "Error in evaluation phase")
-            raise
-
-    def _initialize_llm(self):
-        """Initialize LLM with memory optimization settings."""
-        return LLM(
-            model_id=self.config.llm_id,
-            device=self.device,
-            quantization_bits=4,
-            model_max_length=self.config.model_max_length
-        )
-
-    def _load_corpus(self, file_path: Path) -> List[Dict]:
-        try:
-            return read_corpus_json(str(file_path))
-        except Exception as e:
-            self.logger.error(f"Error loading corpus from {file_path}: {str(e)}")
-            raise
-
-    def _create_dataset(self) -> PromptDataset:
-        """Create dataset with clustered documents."""
-        return PromptDataset(
-            corpus=self._load_corpus(),
-            data_path=str(self.config.data_path),
-            tokenizer=self.llm.tokenizer,
-            max_tokenized_length=self.config.model_max_length - 2,
-            use_clustering=True,
-            cluster_assignments=self.clusters
-        )
-
-    def _create_dataloader(self, dataset: PromptDataset) -> torch.utils.data.DataLoader:
-        """Create dataloader with memory monitoring."""
-        if torch.cuda.is_available():
-            current_memory = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated()
-            self.config.adjust_batch_sizes(current_memory)
-            
-        return torch.utils.data.DataLoader(
-            dataset,
-            batch_size=self.config.batch_size,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True
-        )
-
-    def _run_generation(self, dataloader: torch.utils.data.DataLoader) -> List[Dict]:
-        results = []
-        last_checkpoint = get_last_checkpoint_batch(self.output_dir / "checkpoints")
+    def _generate_test_configs(self) -> List[Dict]:
+        """Generate systematic test configurations."""
+        configs = []
         
-        for batch_idx, batch in enumerate(tqdm(dataloader)):
-            if batch_idx <= last_checkpoint:
+        # Test different cluster sizes
+        for n_clusters in [3, 5, 7, 10]:
+            # Test different document positions
+            for doc_positions in ['near', 'mid', 'far']:
+                # Test different noise ratios
+                for noise_ratio in [0.0, 0.1, 0.2]:
+                    configs.append({
+                        "n_clusters": n_clusters,
+                        "doc_positions": doc_positions,
+                        "noise_ratio": noise_ratio
+                    })
+                    
+        return configs
+
+    def _run_cluster_test(self, config: Dict) -> Dict:
+        """Run clustering test with given configuration."""
+        self.logger.log_step_start(f"Testing clusters={config['n_clusters']}")
+        
+        clusters = self.clusterer.fit_clusters(
+            self.embeddings,
+            n_clusters=config['n_clusters']
+        )
+        
+        # Categorize documents in clusters
+        categorized = self.doc_classifier.categorize_documents(clusters)
+        
+        self.logger.log_step_end(f"Clusters={config['n_clusters']}")
+        return {
+            "clusters": clusters,
+            "categories": categorized
+        }
+
+    def _test_positions(self, cluster_results: Dict) -> Dict:
+        """Test impact of document positions."""
+        self.logger.log_step_start("Testing positions")
+        
+        positions = ['near', 'mid', 'far']
+        position_results = {}
+        
+        for pos in positions:
+            # Rearrange documents based on position
+            docs = self._position_documents(
+                cluster_results['clusters'],
+                position=pos
+            )
+            
+            # Evaluate with LLM
+            eval_results = self.evaluator.evaluate_positioned_docs(docs)
+            position_results[pos] = eval_results
+            
+        self.logger.log_step_end("Position testing")
+        return position_results
+
+    def _test_noise_injection(self, cluster_results: Dict) -> Dict:
+        """Test impact of noise injection."""
+        self.logger.log_step_start("Testing noise")
+        
+        noise_ratios = [0.1, 0.2, 0.3]
+        noise_results = {}
+        
+        for ratio in noise_ratios:
+            # Inject noise
+            noisy_clusters = self._inject_noise(
+                cluster_results['clusters'],
+                ratio=ratio
+            )
+            
+            # Evaluate with LLM
+            eval_results = self.evaluator.evaluate_noisy_clusters(noisy_clusters)
+            noise_results[ratio] = eval_results
+            
+        self.logger.log_step_end("Noise testing")
+        return noise_results
+
+    def _test_document_combinations(self, cluster_results: Dict) -> Dict:
+        """Test impact of different document combinations."""
+        self.logger.log_step_start("Testing document combinations")
+        
+        # Gold + Random
+        gold_random = self._combine_docs(
+            cluster_results['clusters'], 
+            cluster_results['clusters'],
+            mode='gold_random'
+        )
+        gold_random_eval = self.evaluator.evaluate_doc_combination(gold_random)
+        
+        # Gold + Distracting  
+        gold_distracting = self._combine_docs(
+            cluster_results['clusters'],
+            cluster_results['clusters'], 
+            mode='gold_distracting'
+        )
+        gold_distracting_eval = self.evaluator.evaluate_doc_combination(gold_distracting)
+        
+        # Random + Distracting
+        random_distracting = self._combine_docs(
+            cluster_results['clusters'],
+            cluster_results['clusters'],
+            mode='random_distracting' 
+        )
+        random_distracting_eval = self.evaluator.evaluate_doc_combination(random_distracting)
+        
+        combination_results = {
+            'gold_random': gold_random_eval,
+            'gold_distracting': gold_distracting_eval,
+            'random_distracting': random_distracting_eval
+        }
+        
+        self.logger.log_step_end("Document combination testing")
+        return combination_results
+
+    def _save_results(self, results: List[Dict]):
+        """Save experiment results."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path(self.config.output_dir) / timestamp
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        for phase in ['clustering', 'positions', 'noise', 'combinations']:
+            phase_results = {
+                config['n_clusters']: result[phase]
+                for result in results
+                for config in [result['config']]
+            }
+            
+            output_path = output_dir / f"{phase}_results.json"
+            self.utils.save_json(phase_results, output_path)
+
+    def _position_documents(
+        self, 
+        clusters: Dict[int, List[int]], 
+        position: str
+    ) -> Dict[int, List[int]]:
+        """Rearrange documents based on specified position."""
+        positioned_clusters = {}
+        for cluster_id, doc_ids in clusters.items():
+            gold_idx = self._find_gold_document(doc_ids)
+            if gold_idx is None:
+                positioned_clusters[cluster_id] = doc_ids
                 continue
                 
-            batch_results = self._process_batch(batch)
-            results.extend(batch_results)
+            new_doc_ids = doc_ids.copy()
+            gold_doc = new_doc_ids.pop(gold_idx)
             
-            if (batch_idx + 1) % self.config.save_every == 0:
-                save_checkpoint(results, batch_idx + 1, self.output_dir)
-                results = []  # Clear processed results after checkpoint
-                 
-        if results:  # Save any remaining results
-            save_checkpoint(results, len(dataloader), self.output_dir)
+            if position == 'near':
+                new_doc_ids.insert(0, gold_doc)
+            elif position == 'mid':
+                mid = len(new_doc_ids) // 2
+                new_doc_ids.insert(mid, gold_doc)
+            else:  # 'far'
+                new_doc_ids.append(gold_doc)
+                
+            positioned_clusters[cluster_id] = new_doc_ids
             
-        return load_checkpoints(self.output_dir / "checkpoints")
+        return positioned_clusters
 
-    def _process_batch(self, batch: Dict) -> List[Dict]:
-        """Process batch with memory optimization.""" 
-        try:
-            prompts = batch['prompt']
-            outputs = self.llm.generate(prompts, max_new_tokens=self.config.max_new_tokens)
-            
-            processed_results = []
-            answer_string = "### Response:" if 'mpt' in self.config.llm_id else "Answer:"
-            
-            for idx, output in enumerate(outputs):
-                try:
-                    start_idx = output.find(answer_string) + len(answer_string)
-                    
-                    result = {
-                        'query': batch['query'][idx],
-                        'generated_answer': output[start_idx:].strip(),
-                        'cluster_assignments': batch['cluster_assignments'][idx],
-                        'document_indices': [int(i) for i in batch['document_indices'][idx]],
-                        'prompt_tokens_len': int(batch['prompt_tokens_len'][idx])
-                    }
-                    processed_results.append(result)
-                    
-                except Exception as e:
-                    self.logger.log_error(e, f"Error processing batch item {idx}")
-                    continue
-                    
-            # Memory cleanup
-            if torch.cuda.is_available():
-                for k, v in batch.items():
-                    if isinstance(v, torch.Tensor):
-                        del v
-                torch.cuda.empty_cache()
-            
-            return processed_results
-            
-        except Exception as e:
-            self.logger.log_error(e, f"Error processing batch")
-            return []
+    def _find_gold_document(self, doc_ids: List[int]) -> Optional[int]:
+        """Find index of document containing answer."""
+        for idx, doc_id in enumerate(doc_ids):
+            doc = self.corpus[doc_id]
+            if any(answer in doc['text'] for answer in self.gold_answers):
+                return idx
+        return None
 
-    def _get_phase_checkpoint(self, phase: str) -> Optional[Dict]:
-        """Check for phase-specific checkpoint."""
-        checkpoint_dir = self.output_dir / "checkpoints" / phase
-        if not checkpoint_dir.exists():
-            return None
-            
-        checkpoints = list(checkpoint_dir.glob("*.json"))
-        if not checkpoints:
-            return None
-            
-        latest = max(checkpoints, key=lambda p: p.stat().st_mtime)
-        with open(latest) as f:
-            return json.load(f)
-
-    def _save_phase_checkpoint(self, phase: str, data: Dict):
-        """Save phase-specific checkpoint.""" 
-        checkpoint_dir = self.output_dir / "checkpoints" / phase
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        checkpoint_path = checkpoint_dir / f"{phase}_checkpoint_{timestamp}.json"
-        
-        with open(checkpoint_path, 'w') as f:
-            json.dump(data, f, indent=2)
-
-    def _inject_noise_into_clusters(self, cluster_results: List[Dict], corpus: List[Dict]) -> List[Dict]:
-        """Inject noise into clusters."""
-        noisy_clusters = []
-        for cluster in cluster_results:
-            cluster_docs = cluster["documents"]
-            noise_docs = self._sample_noise(corpus, len(cluster_docs))
-            noisy_clusters.append({
-                "cluster_id": cluster["cluster_id"],
-                "documents": cluster_docs + noise_docs
-            })
+    def _inject_noise(
+        self, 
+        clusters: Dict[int, List[int]], 
+        ratio: float
+    ) -> Dict[int, List[int]]:
+        """Inject random documents as noise."""
+        noisy_clusters = {}
+        for cluster_id, doc_ids in clusters.items():
+            num_noise = max(1, int(len(doc_ids) * ratio))
+            noise_ids = self.utils.sample_noise_docs(num_noise, exclude=doc_ids)
+            noisy_clusters[cluster_id] = doc_ids + noise_ids
         return noisy_clusters
 
-    def _sample_noise(self, corpus: List[Dict], num_samples: int) -> List[Dict]:
-        """Sample noise documents from the corpus.""" 
-        return np.random.choice(corpus, num_samples, replace=False).tolist()
+    def _combine_docs(
+        self,
+        clusters1: Dict[int, List[int]],
+        clusters2: Dict[int, List[int]],
+        mode: str
+    ) -> Dict[int, List[int]]:
+        """Combine documents from two clusterings."""
+        combined_clusters = {}
+        for c1, docs1 in clusters1.items():
+            for c2, docs2 in clusters2.items():
+                cluster_id = f"{c1}_{c2}"
+                
+                if mode == 'gold_random':
+                    gold_docs = [d for d in docs1 if self._is_gold_doc(d)]
+                    random_docs = self.utils.sample_docs(len(docs2), exclude=docs1)
+                    combined_clusters[cluster_id] = gold_docs + random_docs
+                elif mode == 'gold_distracting':
+                    gold_docs = [d for d in docs1 if self._is_gold_doc(d)]
+                    distracting_docs = [d for d in docs2 if not self._is_gold_doc(d)]
+                    combined_clusters[cluster_id] = gold_docs + distracting_docs
+                else:  #'random_distracting'
+                    random_docs = self.utils.sample_docs(len(docs1), exclude=docs1)
+                    distracting_docs = [d for d in docs2 if not self._is_gold_doc(d)]
+                    combined_clusters[cluster_id] = random_docs + distracting_docs
+                        
+        return combined_clusters
+                     
+    def _is_gold_doc(self, doc_id: int) -> bool:
+        """Check if document contains answer."""
+        return any(answer in self.corpus[doc_id]['text'] for answer in self.gold_answers)
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Run clustering experiment")
-    parser.add_argument(
-        '--num_clusters',
-        type=int,
-        default=5,
-        help='Number of clusters'
-    )
-    parser.add_argument(
-        '--output_dir',
-        type=str,
-        default='experiments/experiment1_clustering/results',
-        help='Output directory for results'
-    )
-    return parser.parse_args()
-
-def main(experiment_args=None):
-    try:
-        if experiment_args is None:
-            args = parse_arguments()
-        elif isinstance(experiment_args, dict):
-            parser = argparse.ArgumentParser()
-            parser.add_argument('--num_clusters', type=int)
-            args = parser.parse_args([])
-            for k, v in experiment_args.items():
-                setattr(args, k, v)
-        else:
-            args = experiment_args
-
-        config = ClusteringConfig()
-        config.num_clusters = args.num_clusters
-        experiment = ClusteringExperiment(config)
-        
-        # Run phases sequentially
-        experiment.run_embedding_phase()
-        experiment.run_clustering_phase()
-        experiment.run_generation_phase()
-        metrics = experiment.run_evaluation_phase()
-        
-        return experiment.results, metrics
-
-    except Exception as e:
-        logging.error(f"Error in clustering experiment: {str(e)}")
-        raise
+def main():
+    config = ClusteringConfig()
+    experiment = ClusteringExperiment(config, "clustering_experiment")
+    results = experiment.run_clustering_phase()
+    return results
 
 if __name__ == "__main__":
+    seed_everything(10)
     main()

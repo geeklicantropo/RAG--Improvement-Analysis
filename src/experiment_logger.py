@@ -256,11 +256,11 @@ class ExperimentLogger:
             self.log_error(e, "Error logging system info")
 
     def log_error(self, error: Exception, additional_info: Optional[str] = None):
-        """Log errors prominently."""
+        """Log errors.""" 
         error_msg = f"Error: {str(error)}"
         if additional_info:
             error_msg += f"\nInfo: {additional_info}"
-        self.system_logger.error(error_msg, exc_info=True)
+        self.experiment_logger.error(error_msg, exc_info=True)
 
     def log_metric(self, metric_name: str, value: Any):
         """Log metrics with controlled output."""
@@ -271,11 +271,10 @@ class ExperimentLogger:
             self.experiment_logger.debug(f"{metric_name}")
 
     def log_step_start(self, step_name: str) -> float:
-        """Log step start with timing and memory stats."""
+        """Log step start with timing."""
         start_time = time.time()
         self.step_start_times[step_name] = start_time
-        self.track_memory_usage()  # Add memory tracking
-        self.experiment_logger.info(f"Starting: {step_name}")
+        self.experiment_logger.info(f"Starting: {step_name}")  
         return start_time
 
     def log_step_end(self, step_name: str, start_time: Optional[float] = None) -> None:
@@ -287,6 +286,10 @@ class ExperimentLogger:
         memory_stats = self.track_memory_usage() 
         self.experiment_logger.info(f"Completed: {step_name} ({duration:.2f}s)")
         self.step_start_times.pop(step_name, None)
+
+    def info(self, message: str):
+        """Log info message."""
+        self.experiment_logger.info(message)
 
     def save_metrics(self):
         """Save metrics and memory stats to file."""

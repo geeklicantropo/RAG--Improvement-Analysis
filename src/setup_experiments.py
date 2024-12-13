@@ -2,8 +2,17 @@ import os
 import sys
 from pathlib import Path
 import logging
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import datetime
+from tqdm import tqdm
+
+from src.experiment_logger import ExperimentLogger
+from src.utils.file_utils import clear_memory
+
+import torch
+import google.generativeai as genai
+import numpy as np
+from transformers import AutoTokenizer
 
 class ExperimentSetup:
     def __init__(self, base_dir: str = "experiments"):
@@ -14,22 +23,11 @@ class ExperimentSetup:
     def _setup_logger(self) -> logging.Logger:
         logger = logging.getLogger("ExperimentSetup")
         logger.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         
-        formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        
-        # Console handler
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-        
-        # File handler
-        log_dir = Path("logs/setup")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(f"{log_dir}/setup_{self.timestamp}.log")
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
         
         return logger
 
@@ -43,12 +41,10 @@ class ExperimentSetup:
             'data/processed/corpus_with_contriever_at150.json'
         ]
         
-        for file_path in required_files:
+        for file_path in tqdm(required_files, desc="Validating data files"):
             if not Path(file_path).exists():
                 self.logger.error(f"Missing required file: {file_path}")
                 return False
-        
-        self.logger.info("All required data files present")
         return True
 
     def create_experiment_structure(self):
@@ -59,22 +55,21 @@ class ExperimentSetup:
             'experiment3_categories'
         ]
         
-        for exp in experiments:
+        for exp in tqdm(experiments, desc="Creating experiment structure"):
             exp_dir = self.base_dir / exp
-            exp_dir.mkdir(parents=True, exist_ok=True)
+            results_dir = exp_dir / "results"
+            checkpoint_dir = exp_dir / "checkpoints"
             
-            # Create results directory
-            (exp_dir / "results").mkdir(exist_ok=True)
+            for directory in [exp_dir, results_dir, checkpoint_dir]:
+                directory.mkdir(parents=True, exist_ok=True)
             
-            # Create __init__.py
             (exp_dir / "__init__.py").touch()
             
-            # Check/Create required files if they don't exist
-            self._ensure_file_exists(exp_dir / "config.py")
-            self._ensure_file_exists(exp_dir / "main.py")
-            self._ensure_file_exists(exp_dir / "utils.py")
-            
-            self.logger.info(f"Created/Verified structure for {exp}")
+            required_files = ["config.py", "main.py", "utils.py"]
+            for file in required_files:
+                path = exp_dir / file
+                if not path.exists():
+                    path.touch()
 
     def create_logging_structure(self):
         log_dirs = [
@@ -82,33 +77,48 @@ class ExperimentSetup:
             'logs/experiment_logs/clustering',
             'logs/experiment_logs/fusion',
             'logs/experiment_logs/categories',
-            'logs/system_logs'
+            'logs/system_logs',
+            'logs/memory_logs'
         ]
         
-        for log_dir in log_dirs:
+        for log_dir in tqdm(log_dirs, desc="Creating log directories"):
             Path(log_dir).mkdir(parents=True, exist_ok=True)
-            self.logger.info(f"Created log directory: {log_dir}")
 
-    def _ensure_file_exists(self, file_path: Path):
-        if not file_path.exists():
-            file_path.touch()
-            self.logger.info(f"Created file: {file_path}")
-
-    def setup(self):
-        self.logger.info("Starting experiment setup")
-        
-        if not self.validate_data_files():
-            self.logger.error("Data validation failed")
-            return False
-            
+    def validate_environment(self) -> bool:
         try:
+            if torch.cuda.is_available():
+                self.logger.info(f"Found GPU: {torch.cuda.get_device_name(0)}")
+            
+            api_key = os.getenv("GEMINI_TOKEN")
+            if not api_key:
+                self.logger.error("GEMINI_TOKEN not found in environment")
+                return False
+                
+            return True
+            
+        except ImportError as e:
+            self.logger.error(f"Missing required package: {str(e)}")
+            return False
+
+    def setup(self) -> bool:
+        try:
+            if not self.validate_environment():
+                return False
+                
+            if not self.validate_data_files():
+                return False
+                
             self.create_experiment_structure()
             self.create_logging_structure()
+            
             self.logger.info("Experiment setup completed successfully")
             return True
+            
         except Exception as e:
             self.logger.error(f"Setup failed: {str(e)}")
             return False
+        finally:
+            clear_memory()
 
 def main():
     setup = ExperimentSetup()

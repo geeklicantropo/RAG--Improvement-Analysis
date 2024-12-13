@@ -11,6 +11,9 @@ class ClusteringConfig:
     
     # Memory Management:
     gpu_memory_utilization: float = 0.8
+    memory_warning_threshold: float = 0.7
+    memory_error_threshold: float = 0.9
+    memory_logging_interval: int = 100
     
     # Experiment Identification
     experiment_name: str = "clustering_experiment"
@@ -21,6 +24,7 @@ class ClusteringConfig:
     embedding_model: str = "meta-llama/Llama-2-7b-chat-hf"  # New field for embedding model
     model_max_length: int = 4096
     max_new_tokens: int = 15
+    quantization_bits: Optional[int] = 8
 
     # Clustering Configuration
     num_clusters: int = 5
@@ -61,12 +65,13 @@ class ClusteringConfig:
 
     # Output and Batch Processing
     output_dir: Path = Path("experiments/experiment1_clustering/results")
-    batch_size: int = 32
+    batch_size: int = 32 
     min_batch_size: int = 1
     max_batch_size: int = 64
     batch_size_reduction_factor: float = 0.5
     clustering_batch_size: int = 1000
     save_every: int = 100
+    memory_usage_check_interval: int = 10
 
     @property
     def corpus_path(self) -> Path:
@@ -114,16 +119,16 @@ class ClusteringConfig:
 
     def adjust_batch_sizes(self, memory_usage: float):
         """Adjust batch sizes based on memory usage."""
-        if memory_usage > 0.9:
+        if memory_usage > self.memory_error_threshold:
             self.batch_size = max(
                 self.min_batch_size,
                 int(self.batch_size * self.batch_size_reduction_factor)
             )
             self.clustering_batch_size = max(
                 100,
-                int(self.clustering_batch_size * self.batch_size_reduction_factor)
+                int(self.clustering_batch_size * self.batch_size_reduction_factor)  
             )
-        elif memory_usage < 0.7:
+        elif memory_usage < self.memory_warning_threshold:
             self.batch_size = min(
                 self.max_batch_size,
                 int(self.batch_size / self.batch_size_reduction_factor)

@@ -1,236 +1,260 @@
-import torch
-import warnings
+import os
 import gc
-from typing import Union, List
-
-from transformers import (
-    AutoConfig, AutoTokenizer, AutoModelForCausalLM, 
-    BitsAndBytesConfig, StoppingCriteriaList, StoppingCriteria
-)
-from typing import List, Tuple, Optional
+import hashlib
+import json
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+import logging
+import google.generativeai as genai
+from tqdm import tqdm
+import torch
+import numpy as np
 
 class LLM:
-    """
-    A class for loading and generating text using a Language Model (LM) with support for quantization
-    and custom stopping criteria.
-    
-    Attributes:
-        model_id (str): Identifier for the model to load.
-        device (str): Device to run the model on, e.g. 'cuda'.
-        quantization_bits (Optional[int]): Number of bits for quantization, supports 4 or 8 bits.
-        stop_list (Optional[List[str]]): List of tokens where generation should stop.
-        model_max_length (int): Maximum length of the model inputs.
-    """
     def __init__(
-        self, 
-        model_id: str, 
-        device: str = 'cuda', 
-        quantization_bits: Optional[int] = None, 
-        stop_list: Optional[List[str]] = None, 
-        model_max_length: int = 4096
+        self,
+        api_key: str,
+        model: str = "gemini-pro",
+        cache_dir: Optional[str] = "cache/llm_responses",
+        memory_threshold: float = 0.9,
+        max_retries: int = 3,
+        evaluation_threshold: float = 0.8
     ):
-        self.device = device
-        self.model_max_length = model_max_length
-
-        self.stop_list = stop_list
-        if stop_list is None:
-            self.stop_list = ['\nHuman:', '\n```\n', '\nQuestion:', '<|endoftext|>', '\n']
+        self.api_key = api_key
+        genai.configure(api_key=api_key)
         
-        self.bnb_config = self._set_quantization(quantization_bits)
-        self.model, self.tokenizer = self._initialize_model_tokenizer(model_id)
-        self.stopping_criteria = self._define_stopping_criteria()
+        # Configure Gemini model settings
+        generation_config = {
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "top_k": 40,
+            "max_output_tokens": 1024,
+        }
+        
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+        
+        self.model = genai.GenerativeModel(
+            model_name=model,
+            generation_config=generation_config,
+            safety_settings=safety_settings
+        )
+        self.eval_model = genai.GenerativeModel(
+            model_name=model,
+            generation_config=generation_config,
+            safety_settings=safety_settings
+        )
+        
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.memory_threshold = memory_threshold
+        self.max_retries = max_retries
+        self.evaluation_threshold = evaluation_threshold
+        self.logger = self._setup_logger()
 
-    def _set_quantization(self, quantization_bits: Optional[int]) -> Optional[BitsAndBytesConfig]:
-        """Configure quantization settings based on the specified number of bits."""
-        if quantization_bits in [4, 8]:
-            bnb_config = BitsAndBytesConfig()
-            if quantization_bits == 4:
-                bnb_config.load_in_4bit = True
-                bnb_config.bnb_4bit_quant_type = 'nf4'
-                bnb_config.bnb_4bit_use_double_quant = True
-                bnb_config.bnb_4bit_compute_dtype = torch.bfloat16
-            elif quantization_bits == 8:
-                bnb_config.load_in_8bit = True
-            return bnb_config
+        # Templates
+        self.generation_template = """
+        Question: {question}
+        Context: {context}
+        Task: Extract the precise answer from the context.
+        Answer:"""
+        
+        self.evaluation_template = """
+        You are an expert evaluator judging answer correctness.
+        
+        Question: {question}
+        Gold Answer: {gold_answer}
+        Generated Answer: {generated_answer}
+        
+        Task: Evaluate if the generated answer is correct. Consider:
+        1. Factual accuracy
+        2. Semantic equivalence
+        3. Completeness
+        
+        Provide your evaluation in the following format:
+        Score (0-100): <numerical score>
+        Correct (Yes/No): <yes/no>
+        Reasoning: <detailed explanation>
+        """
+        
+        self.similarity_template = """
+        Task: Evaluate the semantic similarity between these two answers on a scale of 0-100.
+        
+        Answer 1: {answer1}
+        Answer 2: {answer2}
+        
+        Provide:
+        Similarity Score (0-100): 
+        Explanation:
+        """
+
+    def evaluate_answer(
+        self,
+        question: str,
+        generated_answer: str,
+        gold_answer: str
+    ) -> Dict[str, Any]:
+        prompt = self.evaluation_template.format(
+            question=question,
+            gold_answer=gold_answer,
+            generated_answer=generated_answer
+        )
+        
+        cache_key = self._get_cache_key(prompt)
+        cached = self._check_cache(cache_key)
+        if cached:
+            return cached
+            
+        try:
+            response = self.eval_model.generate_content(prompt)
+            if not response.parts:
+                raise ValueError("Empty response from model")
+            response_text = response.parts[0].text
+            
+            # Parse evaluation response
+            lines = response_text.strip().split('\n')
+            score = float([l for l in lines if 'Score' in l][0].split(':')[1].strip())
+            correct = 'yes' in [l for l in lines if 'Correct' in l][0].lower()
+            reasoning = [l for l in lines if 'Reasoning' in l][0].split(':')[1].strip()
+            
+            similarity = self.compute_semantic_similarity(generated_answer, gold_answer)
+            
+            result = {
+                'score': score,
+                'correct': correct,
+                'reasoning': reasoning,
+                'semantic_similarity': similarity
+            }
+            
+            self._save_to_cache(cache_key, result)
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Evaluation failed: {str(e)}")
+            return {
+                'score': 0,
+                'correct': False,
+                'reasoning': f"Evaluation error: {str(e)}",
+                'semantic_similarity': 0
+            }
+
+    def compute_semantic_similarity(
+        self,
+        answer1: str,
+        answer2: str
+    ) -> float:
+        prompt = self.similarity_template.format(
+            answer1=answer1,
+            answer2=answer2
+        )
+        
+        cache_key = self._get_cache_key(prompt)
+        cached = self._check_cache(cache_key)
+        if cached:
+            return cached['similarity']
+            
+        try:
+            response = self.model.generate_content(prompt)
+            if not response.parts:
+                raise ValueError("Empty response from model")
+            response_text = response.parts[0].text
+            
+            # Extract similarity score from response
+            similarity = float(response_text.split('\n')[0].split(':')[1].strip())
+            self._save_to_cache(cache_key, {'similarity': similarity})
+            return similarity
+            
+        except Exception as e:
+            self.logger.error(f"Similarity computation failed: {str(e)}")
+            return 0.0
+
+    def generate(
+        self,
+        questions: Union[str, List[str]],
+        contexts: Union[str, List[str]],
+        batch_size: int = 8
+    ) -> List[str]:
+        if isinstance(questions, str):
+            questions = [questions]
+        if isinstance(contexts, str):
+            contexts = [contexts]
+
+        self.logger.info(f"Generating answers for {len(questions)} questions")
+        results = []
+        
+        for i in tqdm(range(0, len(questions), batch_size), desc="Generating"):
+            batch_questions = questions[i:i + batch_size]
+            batch_contexts = contexts[i:i + batch_size]
+            
+            batch_results = []
+            for q, c in zip(batch_questions, batch_contexts):
+                prompt = self.generation_template.format(question=q, context=c)
+                cache_key = self._get_cache_key(prompt)
+                
+                cached = self._check_cache(cache_key)
+                if cached:
+                    batch_results.append(cached['response'])
+                    continue
+                
+                for attempt in range(self.max_retries):
+                    try:
+                        response = self.model.generate_content(prompt)
+                        if not response.parts:
+                            raise ValueError("Empty response from model")
+                        response_text = response.parts[0].text
+                        self._save_to_cache(cache_key, {'response': response_text})
+                        batch_results.append(response_text)
+                        break
+                    except Exception as e:
+                        if attempt == self.max_retries - 1:
+                            self.logger.error(f"Generation failed: {str(e)}")
+                            batch_results.append("")
+                        else:
+                            self.logger.warning(f"Attempt {attempt+1} failed, retrying...")
+            
+            results.extend(batch_results)
+            self._cleanup_memory()
+            
+        return results
+
+    def _setup_logger(self) -> logging.Logger:
+        logger = logging.getLogger("LLM")
+        logger.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        ch = logging.StreamHandler()
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+        return logger
+
+    def _get_cache_key(self, text: str) -> str:
+        return hashlib.md5(text.encode()).hexdigest()
+
+    def _check_cache(self, cache_key: str) -> Optional[Dict]:
+        cache_file = self.cache_dir / f"{cache_key}.json"
+        if cache_file.exists():
+            with open(cache_file) as f:
+                return json.load(f)
         return None
 
-    def _get_optimal_device_map(self) -> dict:
-        """Calculate optimal device map based on available GPU memory."""
-        if not torch.cuda.is_available():
-            return "cpu"
-            
-        total_gpus = torch.cuda.device_count()
-        if total_gpus == 0:
-            return "cpu"
+    def _save_to_cache(self, cache_key: str, data: Dict):
+        cache_file = self.cache_dir / f"{cache_key}.json"
+        with open(cache_file, 'w') as f:
+            json.dump(data, f)
 
-        # Get available memory on each GPU
-        available_memory = []
-        for i in range(total_gpus):
-            total_mem = torch.cuda.get_device_properties(i).total_memory
-            used_mem = torch.cuda.memory_allocated(i)
-            available_mem = (total_mem - used_mem) / 1024**3  # Convert to GB
-            available_memory.append(available_mem)
-
-        # If very limited GPU memory, use CPU
-        if max(available_memory) < 2:  # Less than 2GB available
-            return "cpu"
-            
-        # Create balanced device map
-        device_map = "balanced"
-        return device_map
-
-    def _initialize_model_tokenizer(self, model_id: str) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
-        model_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        model_config.max_seq_len = self.model_max_length
-
-        # Split model across available GPU memory and CPU
-        device_map = self._get_optimal_device_map()
-        
-        model_kwargs = {
-            "trust_remote_code": True,
-            "config": model_config,
-            "torch_dtype": torch.float16,
-            "device_map": device_map,
-            "low_cpu_mem_usage": True,
-            "quantization_config": BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type='nf4'
-            )
-        }
-
-        model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
-        model.eval()
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_id,
-            padding_side="left",
-            truncation_side="left",
-            model_max_length=self.model_max_length
-        )
-        tokenizer.pad_token = tokenizer.eos_token
-        
-        return model, tokenizer
-        
-    def cleanup_memory(self):
-        """Clean up GPU memory after generation."""
+    def _cleanup_memory(self):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            
-    def get_memory_usage(self) -> dict[str, float]:
-        """Get current GPU memory usage stats."""
-        memory_stats = {}
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                allocated = torch.cuda.memory_allocated(i) / 1024**3
-                reserved = torch.cuda.memory_reserved(i) / 1024**3
-                memory_stats[f'gpu_{i}'] = {
-                    'allocated_gb': allocated,
-                    'reserved_gb': reserved,
-                    'utilization': torch.cuda.utilization(i)
-                }
-        return memory_stats
+            torch.cuda.synchronize()
 
-    def optimize_batch_size(self, initial_batch_size: int) -> int:
-        """Optimize batch size based on available memory."""
-        if not torch.cuda.is_available():
-            return initial_batch_size
-            
-        memory_stats = self.get_memory_usage()
-        min_available_gb = float('inf')
-        
-        for gpu_stats in memory_stats.values():
-            available = gpu_stats['reserved_gb'] - gpu_stats['allocated_gb']
-            min_available_gb = min(min_available_gb, available)
-            
-        if min_available_gb < 2:  # Less than 2GB available
-            return max(1, initial_batch_size // 2)
-        elif min_available_gb > 8:  # More than 8GB available
-            return min(initial_batch_size * 2, 64)
-            
-        return initial_batch_size
-
-    def generate(self, prompt: str, max_new_tokens: int = 15) -> List[str]:
-        """
-        Generates text based on the given prompt with memory optimization.
-        
-        Args:
-            prompt: Input text prompt for generation.
-        
-        Returns:
-            List[str]: The generated text responses.
-        """
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                
-                # Optimize batch size before processing
-                if isinstance(prompt, list):
-                    batch_size = len(prompt)
-                    optimal_batch_size = self.optimize_batch_size(batch_size)
-                    if optimal_batch_size < batch_size:
-                        # Split into smaller batches if necessary
-                        all_outputs = []
-                        for i in range(0, batch_size, optimal_batch_size):
-                            batch_prompts = prompt[i:i + optimal_batch_size]
-                            batch_outputs = self._generate_batch(
-                                batch_prompts,
-                                max_new_tokens
-                            )
-                            all_outputs.extend(batch_outputs)
-                            self.cleanup_memory()
-                        return all_outputs
-                    
-                return self._generate_batch(prompt, max_new_tokens)
-                
-        finally:
-            self.cleanup_memory()
-            
-    def _generate_batch(self, prompts: Union[str, List[str]], max_new_tokens: int) -> List[str]:
-        """Generate text for a single batch."""
-        inputs = self.tokenizer(
-            prompts, 
-            padding=True,
-            truncation=True,
-            max_length=self.model_max_length,
-            return_tensors="pt"
-        ).to(self.device)
-            
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                **inputs,
-                do_sample=False,
-                max_new_tokens=max_new_tokens,
-                repetition_penalty=1.1,
-                stopping_criteria=self.stopping_criteria,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-                
-        return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-    
-    def _define_stopping_criteria(self):
-        """Define stopping criteria for text generation."""
-        if not self.stop_list:
-            return StoppingCriteriaList()
-
-
-        class StopOnTokens(StoppingCriteria):
-            def __init__(self, tokenizer, stop_list):
-                super().__init__()
-                self.tokenizer = tokenizer
-                self.stop_token_ids = [
-                    tokenizer(stop_word, add_special_tokens=False)['input_ids']
-                    for stop_word in stop_list
-                ]
-
-            def __call__(self, input_ids, scores, **kwargs):
-                for stop_ids in self.stop_token_ids:
-                    if input_ids[0][-len(stop_ids):].tolist() == stop_ids:
-                        return True
-                return False
-
-        return StoppingCriteriaList([StopOnTokens(self.tokenizer, self.stop_list)])
-
+    def get_stats(self) -> Dict[str, Any]:
+        stats = {
+            'total_evaluations': len(os.listdir(self.cache_dir)),
+            'cache_size_mb': sum(f.stat().st_size for f in self.cache_dir.glob('*.json')) / (1024 * 1024)
+        }
+        return stats

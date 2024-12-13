@@ -5,7 +5,7 @@ import numpy as np
 import faiss
 import torch
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from experiment_logger import ExperimentLogger
 from utils import *
 import gc
@@ -76,7 +76,7 @@ class IndexManager:
         try:
             total_batches = (self.args.corpus_size + self.args.batch_size - 1) // self.args.batch_size
 
-            for batch_idx in tqdm(range(total_batches), desc="Indexing embeddings"):
+            for batch_idx in tqdm(range(total_batches), desc="Indexing embeddings", unit="batch"):
                 self.args.batch_size = self.adjust_batch_size()
                 start_idx = batch_idx * self.args.batch_size
 
@@ -135,7 +135,41 @@ class IndexManager:
     def enable_hybrid_retrieval(self) -> None:
         if self.args.hybrid_retrieval and self.args.bm25_index_path:
             self.logger.experiment_logger.info("Enabling hybrid retrieval (dense + sparse).")
-            # Integration logic for hybrid retrieval would go here.
+            try:
+                self.logger.log_step_start("Loading BM25 index")
+                # Load prebuilt BM25 index
+                bm25_index = read_pickle(self.args.bm25_index_path)
+                
+                # Combine dense and sparse indices
+                self.combined_index = CombinedIndex(self.index, bm25_index)
+                
+                self.logger.log_step_end("BM25 index loaded and combined with dense index")
+            except Exception as e:
+                self.logger.log_error(e, "Error enabling hybrid retrieval")
+                raise
+
+class CombinedIndex:
+    def __init__(self, dense_index: faiss.Index, sparse_index: Any):
+        self.dense_index = dense_index
+        self.sparse_index = sparse_index
+    
+    def search(self, query_vectors: np.ndarray, top_k: int) -> Tuple[np.ndarray, np.ndarray]:
+        # Perform dense search
+        dense_scores, dense_indices = self.dense_index.search(query_vectors, top_k)
+        
+        # Perform sparse search
+        sparse_scores, sparse_indices = self.sparse_index.search(query_vectors, top_k)
+        
+        # Combine scores and indices
+        combined_scores = dense_scores + sparse_scores
+        combined_indices = np.concatenate((dense_indices, sparse_indices), axis=1)
+        
+        # Sort and select top-k
+        top_indices = np.argsort(-combined_scores, axis=1)[:, :top_k]
+        top_scores = np.take_along_axis(combined_scores, top_indices, axis=1)
+        top_doc_indices = np.take_along_axis(combined_indices, top_indices, axis=1)
+        
+        return top_scores, top_doc_indices
 
 def main():
     args = parse_arguments()

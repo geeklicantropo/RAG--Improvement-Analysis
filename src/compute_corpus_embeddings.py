@@ -4,7 +4,7 @@ import warnings
 import torch
 from transformers import AutoTokenizer, AutoConfig
 from retriever import Retriever
-from utils import read_json, str2bool
+from utils import read_corpus_json, str2bool, read_json
 from experiment_logger import ExperimentLogger
 import time
 import gc
@@ -134,9 +134,9 @@ def main():
             logger.log_experiment_params(vars(args))
             logger.log_system_info()
 
-            # Load corpus
+            # Load corpus in batches
             logger.log_step_start("Loading corpus")
-            corpus = read_json(args.corpus_path)
+            corpus = read_corpus_json(args.corpus_path)
             logger.log_step_end("Corpus loading")
 
             # Load subset indices if provided
