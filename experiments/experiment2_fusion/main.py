@@ -4,25 +4,20 @@ from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional
 from datetime import datetime
 import torch
-from src.utils import read_corpus_json
-from src.experiment_logger import ExperimentLogger
-from src.utils import seed_everything
-from src.llm import LLM
-from src.prompt_dataset import PromptDataset
-from src.rag_fusion_utils import RAGFusionRanker
-from .config import FusionConfig, FusionConfigFactory
-from .utils import FusionExperimentUtils  
-
-import argparse
-import json
-import gc
-import tqdm
-import warnings
+from tqdm import tqdm
 import logging
+import gc
+import numpy as np
+import json
 
-# Define project_root
-project_root = str(Path(__file__).parent.parent.parent)
-
+from src.utils import seed_everything, clear_memory
+from src.experiment_logger import ExperimentLogger
+from src.llm import LLM
+from src.document_classifier import DocumentClassifier
+from src.llm_evaluator import LLMEvaluator
+from src.rag_fusion_utils import RAGFusionRanker
+from .config import FusionConfig
+from experiments.evaluation.noise_impact import NoiseImpactAnalyzer
 
 class FusionExperiment:
     def __init__(
@@ -35,259 +30,274 @@ class FusionExperiment:
         self.experiment_name = experiment_name
         self.logger = logger or ExperimentLogger(
             experiment_name=experiment_name,
-            base_log_dir=str(Path(project_root) / "logs")
+            base_log_dir=str(Path(__file__).parent.parent.parent / "logs")
         )
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.utils = FusionExperimentUtils()
+        self.llm = LLM(api_key=os.getenv("GEMINI_TOKEN"))
+        self.evaluator = LLMEvaluator(self.llm)
+        self.doc_classifier = DocumentClassifier(self.llm)
+        self.noise_evaluator = NoiseImpactAnalyzer(self.evaluator)
+        self.fusion_ranker = RAGFusionRanker(
+            strategy=config.fusion_strategy,
+            normalize_scores=config.normalize_scores,
+            score_weights=config.fusion_weights
+        )
 
-    def setup(self):
+    def run_fusion_phase(self):
+        """Run fusion with systematic testing of configurations."""
+        self.logger.log_step_start("Fusion Phase")
         try:
-            self.logger.log_step_start("Setup")
-
-            self.llm = LLM(
-                self.config.llm_id,
-                self.device,
-                quantization_bits=4,
-                model_max_length=self.config.model_max_length
-            )
-
-            self.retriever_results = self.utils.load_retrieval_results(
-                str(self.config.contriever_results_path),
-                str(self.config.bm25_results_path) if self.config.use_bm25 else None,
-                self.config.use_fusion,
-                self.logger
-            )
-
-            if self.config.use_fusion:
-                self.fusion_ranker = RAGFusionRanker(
-                    strategy=self.config.fusion_strategy,
-                    k=self.config.fusion_k,
-                    normalize_scores=self.config.normalize_scores,
-                    score_weights=self.config.fusion_weights
+            test_configs = self._generate_test_configs()
+            results = []
+            
+            for config in tqdm(test_configs, desc="Testing configurations"):
+                fusion_results = self._run_fusion_test(config)
+                position_results = self._test_positions(fusion_results)
+                noise_results = self._test_noise_injection(fusion_results)
+                combination_results = self._test_document_combinations(fusion_results)
+                
+                # Evaluate using LLM
+                evaluation = self.evaluator.evaluate_answer(
+                    fusion_results, 
+                    position_results,
+                    noise_results,
+                    combination_results
                 )
-
-            self.dataset = self._load_dataset()
-            self.logger.log_step_end("Setup")
-
+                
+                results.append({
+                    "config": config,
+                    "fusion": fusion_results,
+                    "positions": position_results,
+                    "noise": noise_results,
+                    "combinations": combination_results,
+                    "evaluation": evaluation
+                })
+                
+                clear_memory()
+                
+            self._save_results(results)
+            self.logger.log_step_end("Fusion Phase")
+            return results
+            
         except Exception as e:
-            self.logger.log_error(e, "Error in experiment setup")
+            self.logger.log_error(e, "Error in fusion phase")
             raise
 
-    def _load_dataset(self) -> PromptDataset:
-        try:
-            corpus = read_corpus_json(str(self.config.corpus_path))
+    def _generate_test_configs(self) -> List[Dict]:
+        """Generate systematic test configurations."""
+        configs = []
+        
+        # Test different fusion strategies
+        for strategy in ['rrf', 'linear']:
+            # Test different document positions
+            for doc_positions in ['near', 'mid', 'far']:
+                # Test different noise ratios
+                for noise_ratio in [0.0, 0.1, 0.2]:
+                    configs.append({
+                        "fusion_strategy": strategy,
+                        "doc_positions": doc_positions,
+                        "noise_ratio": noise_ratio,
+                        "weights": self.config.fusion_weights
+                    })
+                    
+        return configs
 
-            if self.config.use_fusion:
-                search_results = self.fusion_ranker.fuse_search_results(self.retriever_results)
-            else:
-                search_results = self.retriever_results['contriever']
+    def _run_fusion_test(self, config: Dict) -> Dict:
+        """Run fusion test with given configuration."""
+        self.logger.log_step_start(f"Testing fusion strategy={config['fusion_strategy']}")
+        
+        # Update fusion ranker with config
+        self.fusion_ranker.strategy = config['fusion_strategy']
+        
+        # Get retrieval results
+        contriever_results = self._get_contriever_results()
+        bm25_results = self._get_bm25_results()
+        
+        # Perform fusion
+        fused_results = self.fusion_ranker.fuse_search_results({
+            'contriever': contriever_results,
+            'bm25': bm25_results
+        })
+        
+        # Categorize documents
+        categorized = self.doc_classifier.classify_documents(
+            fused_results,
+            self.config.score_thresholds
+        )
+        
+        self.logger.log_step_end(f"Fusion={config['fusion_strategy']}")
+        return {
+            "fusion_results": fused_results,
+            "categories": categorized
+        }
 
-            return PromptDataset(
-                corpus=corpus,
-                data_path=str(self.config.train_dataset_path),
-                tokenizer=self.llm.tokenizer,
-                max_tokenized_length=self.config.model_max_length - 2,
-                search_results=search_results,
-                num_documents_in_context=self.config.num_documents_in_context
+    def _test_positions(self, fusion_results: Dict) -> Dict:
+        """Test impact of document positions."""
+        self.logger.log_step_start("Testing positions")
+        
+        positions = ['near', 'mid', 'far']
+        position_results = {}
+        
+        for pos in positions:
+            # Rearrange documents based on position
+            docs = self._position_documents(
+                fusion_results['fusion_results'],
+                position=pos
             )
+            
+            # Evaluate with LLM
+            eval_results = self.evaluator.evaluate_answer(docs)
+            position_results[pos] = eval_results
+            
+        self.logger.log_step_end("Position testing")
+        return position_results
 
-        except Exception as e:
-            self.logger.log_error(e, "Error loading dataset")
-            raise
+    def _test_noise_injection(self, fusion_results: Dict) -> Dict:
+        """Test impact of noise injection."""
+        self.logger.log_step_start("Testing noise")
+        
+        noise_ratios = [0.1, 0.2, 0.3]
+        noise_results = {}
+        
+        for ratio in noise_ratios:
+            # Inject noise
+            noisy_results = self._inject_noise(
+                fusion_results['fusion_results'],
+                ratio=ratio
+            )
+            
+            # Evaluate with LLM
+            eval_results = self.evaluator.evaluate_answer(noisy_results)
+            noise_results[ratio] = eval_results
+            
+        self.logger.log_step_end("Noise testing")
+        return noise_results
+
+    def _test_document_combinations(self, fusion_results: Dict) -> Dict:
+        """Test different document combinations."""
+        self.logger.log_step_start("Testing document combinations")
+        
+        # Gold + BM25
+        gold_bm25 = self._combine_results(
+            fusion_results['fusion_results'], 
+            'gold_bm25'
+        )
+        gold_bm25_eval = self.evaluator.evaluate_answer(gold_bm25)
+        
+        # Gold + Contriever
+        gold_contriever = self._combine_results(
+            fusion_results['fusion_results'],
+            'gold_contriever'
+        )
+        gold_contriever_eval = self.evaluator.evaluate_answer(gold_contriever)
+        
+        # BM25 + Contriever
+        bm25_contriever = self._combine_results(
+            fusion_results['fusion_results'],
+            'bm25_contriever'
+        )
+        bm25_contriever_eval = self.evaluator.evaluate_answer(bm25_contriever)
+        
+        combination_results = {
+            'gold_bm25': gold_bm25_eval,
+            'gold_contriever': gold_contriever_eval,
+            'bm25_contriever': bm25_contriever_eval
+        }
+        
+        self.logger.log_step_end("Document combination testing")
+        return combination_results
+
+    def _position_documents(self, results: List[Dict], position: str) -> List[Dict]:
+        """Position documents according to strategy."""
+        positioned_results = []
+        for result in results:
+            doc_scores = list(zip(result['documents'], result['scores']))
+            
+            if position == 'near':
+                doc_scores.sort(key=lambda x: x[1], reverse=True)
+            elif position == 'mid':
+                mid = len(doc_scores) // 2
+                doc_scores = (
+                    doc_scores[mid:] + 
+                    doc_scores[:mid]
+                )
+            else:  # 'far'
+                doc_scores.sort(key=lambda x: x[1])
+                
+            docs, scores = zip(*doc_scores)
+            positioned_results.append({
+                'documents': list(docs),
+                'scores': list(scores)
+            })
+            
+        return positioned_results
+
+    def _inject_noise(self, results: List[Dict], ratio: float) -> List[Dict]:
+        """Inject noise into fusion results."""
+        noisy_results = []
+        for result in results:
+            num_noise = max(1, int(len(result['documents']) * ratio))
+            noise_docs = self._generate_noise_docs(num_noise)
+            
+            noisy_docs = (
+                result['documents'][:-num_noise] + 
+                noise_docs
+            )
+            noisy_scores = (
+                result['scores'][:-num_noise] + 
+                [0.0] * num_noise
+            )
+            
+            noisy_results.append({
+                'documents': noisy_docs,
+                'scores': noisy_scores
+            })
+            
+        return noisy_results
+
+    def _save_results(self, results: List[Dict]):
+        """Save experiment results."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path(self.config.output_dir) / timestamp
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        for phase in ['fusion', 'positions', 'noise', 'combinations']:
+            phase_results = {
+                config['fusion_strategy']: result[phase]
+                for result in results
+                for config in [result['config']]
+            }
+            
+            output_path = output_dir / f"{phase}_results.json"
+            with open(output_path, 'w') as f:
+                json.dump(phase_results, f, indent=2)
 
     def run(self):
+        """Run complete fusion experiment."""
         try:
-            self.logger.log_step_start("Experiment execution")
-
-            if torch.cuda.is_available():
-                gpu = torch.cuda.current_device()
-                initial_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
-                self.config.adjust_batch_sizes(initial_memory)
-
-            self.logger.log_experiment_params(self.config.to_dict())
-
-            dataloader = torch.utils.data.DataLoader(
-                self.dataset,
-                batch_size=self.config.batch_size,
-                shuffle=False,
-                num_workers=8,
-                pin_memory=True
-            )
-
-            results = []
-            for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
-                if torch.cuda.is_available():
-                    current_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
-                    self.config.adjust_batch_sizes(current_memory)
-
-                if self.config.use_fusion:
-                    fused_results = self.fusion_ranker.fuse_batch(
-                        batch['documents'],
-                        batch['scores'], 
-                        batch_size=self.config.fusion_batch_size
-                    )
-                else:
-                    fused_results = batch['documents']
-
-                prompts = [
-                    self.utils.format_fusion_prompt(q, docs)
-                    for q, docs in zip(batch['query'], fused_results)  
-                ]
-
-                generated_outputs = self.llm.generate(
-                    prompts,
-                    max_new_tokens=self.config.max_new_tokens
-                )
-
-                batch_results = self._process_batch_outputs(
-                    batch, generated_outputs, fused_results
-                )
-                results.extend(batch_results)
-
-                if self.config.save_intermediates and (batch_idx + 1) % self.config.save_every == 0:
-                    self._save_checkpoint(results, batch_idx + 1)
-
-                if torch.cuda.is_available():  
-                    torch.cuda.empty_cache()
-                gc.collect()
-
-                if self.logger.check_memory_threshold():
-                    self.config.batch_size = max(1, self.config.batch_size // 2)
-                    self.config.fusion_batch_size = max(10, self.config.fusion_batch_size // 2)
-
-            metrics = self.utils.analyze_fusion_results(results, self.logger)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_dir = Path(self.config.output_dir) / f"run_{timestamp}"
-            self.utils.save_fusion_artifacts(
-                results,
-                metrics, 
-                self.fusion_ranker.get_fusion_info(),
-                str(output_dir),
-                self.logger
-            )
-
-            self.logger.log_step_end("Experiment execution")
-            return results, metrics
-
+            self.logger.log_step_start("Running fusion experiment")
+            
+            # Run fusion phase
+            fusion_results = self.run_fusion_phase()
+            
+            # Save and return results
+            self._save_results(fusion_results)
+            
+            self.logger.log_step_end("Fusion experiment completed")
+            return fusion_results
+            
         except Exception as e:
-            self.logger.log_error(e, "Error during experiment execution")
+            self.logger.log_error(e, "Error in fusion experiment")
             raise
         finally:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
+            clear_memory()
 
-    def _process_batch_outputs(
-        self,
-        batch: Dict[str, Any],
-        outputs: List[str],
-        fused_results: Dict[str, List[Dict]]
-    ) -> List[Dict[str, Any]]:
-        processed_results = []
-        answer_string = "### Response:" if 'mpt' in self.config.llm_id else "Answer:"
-        
-        for idx, output in enumerate(outputs):
-            try:
-                start_idx = output.find(answer_string) + len(answer_string)
-                answer = output[start_idx:].strip()
-                
-                result = {
-                    'query': batch['query'][idx],
-                    'generated_answer': answer,
-                    'retriever_scores': {
-                        'contriever': batch.get('contriever_scores', [None])[idx],
-                        'bm25': batch.get('bm25_scores', [None])[idx]
-                    },
-                    'fused_score': fused_results[idx].get('score'),
-                    'document_indices': batch['document_indices'][idx],
-                    'prompt_tokens_len': batch['prompt_tokens_len'][idx]
-                }
-                processed_results.append(result)
-                
-            except Exception as e:
-                self.logger.log_error(e, f"Error processing batch item {idx}")
-                continue
-                
-            if torch.cuda.is_available():
-                for k, v in batch.items():
-                    if isinstance(v, torch.Tensor):
-                        del v
-        
-        return processed_results
-
-    def _save_checkpoint(self, results: List[Dict], batch_idx: int):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        checkpoint_dir = Path(self.config.output_dir) / "checkpoints"
-        checkpoint_dir.mkdir(exist_ok=True)
-        
-        checkpoint_path = checkpoint_dir / f"checkpoint_{batch_idx}_{timestamp}.json"
-        with open(checkpoint_path, 'w') as f:
-            json.dump(results, f, indent=2)
-        
-        self.logger.experiment_logger.info(f"Saved checkpoint at batch {batch_idx}")
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Run fusion experiment")
-    
-    parser.add_argument(
-        '--strategy',
-        type=str,
-        choices=['rrf', 'linear'],
-        default='rrf',
-        help='Fusion strategy to use'
-    )
-    parser.add_argument(
-        '--use_random',
-        action='store_true',
-        help='Whether to use random documents'
-    )
-    parser.add_argument(
-        '--output_dir',
-        type=str,
-        default='experiments/experiment2_fusion/results',
-        help='Output directory for results'
-    )
-    
-    return parser.parse_args()
-
-def main(args=None):
-    try:
-        # Set up args
-        if isinstance(args, dict):
-            parser = argparse.ArgumentParser() 
-            parser.add_argument('--strategy', type=str)
-            parser.add_argument('--use_random', type=bool, default=False)
-            namespace = parser.parse_args([])
-            for k, v in args.items():
-                setattr(namespace, k, v)
-            args = namespace
-        else:
-            args = parse_arguments()
-
-        # Run experiment
-        try:
-            args = parse_arguments() if args is None else argparse.Namespace(**args)
-            config = FusionConfigFactory.get_config_for_strategy(args.strategy, args.use_random)
-            experiment = FusionExperiment(config, "fusion_experiment", FusionExperimentLogger())
-            experiment.setup()
-            results, metrics = experiment.run()
-            return results, metrics
-        except Exception as e:
-            logging.error(f"Error in fusion experiment: {str(e)}", exc_info=True)
-            raise
-        finally:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-                        
-    except Exception as e:
-        logging.error(f"Error in fusion experiment: {str(e)}", exc_info=True) 
-        raise
-    finally:
-        # Final cleanup
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+def main():
+    config = FusionConfig()
+    experiment = FusionExperiment(config, "fusion_experiment")
+    results = experiment.run()
+    return results
 
 if __name__ == "__main__":
+    seed_everything(10)
     main()

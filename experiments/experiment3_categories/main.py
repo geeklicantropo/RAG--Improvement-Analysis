@@ -1,28 +1,20 @@
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, List, Any, Optional
 from datetime import datetime
 import torch
-from src.utils import read_corpus_json
-from src.experiment_logger import ExperimentLogger
-from src.utils import seed_everything
-from src.llm import LLM
-from src.prompt_dataset import PromptDataset
-from src.rag_fusion_utils import RAGFusionRanker
-from .config import CategoriesConfig, CategoriesConfigFactory
-from .utils import CategoriesExperimentUtils
-
-import argparse
-import json
+from tqdm import tqdm
 import gc
-import tqdm
-import warnings
-import logging
 
-# Define project_root
-project_root = str(Path(__file__).parent.parent.parent)
-
+from src.utils import seed_everything, clear_memory
+from src.experiment_logger import ExperimentLogger
+from src.llm import LLM 
+from src.document_classifier import DocumentClassifier
+from src.llm_evaluator import LLMEvaluator
+from src.rag_fusion_utils import RAGFusionRanker
+from .config import CategoriesConfig
+from experiments.evaluation.noise_impact import NoiseImpactAnalyzer
 
 class CategoriesExperiment:
     def __init__(
@@ -35,257 +27,216 @@ class CategoriesExperiment:
         self.experiment_name = experiment_name
         self.logger = logger or ExperimentLogger(
             experiment_name=experiment_name,
-            base_log_dir=str(Path(project_root) / "logs")
+            base_log_dir=str(Path(__file__).parent.parent.parent / "logs")
         )
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.utils = CategoriesExperimentUtils()
+        self.llm = LLM(api_key=os.getenv("GEMINI_TOKEN"))
+        self.evaluator = LLMEvaluator(self.llm)
+        self.doc_classifier = DocumentClassifier(self.llm)
+        self.noise_evaluator = NoiseImpactAnalyzer(self.evaluator)
 
-    def setup(self):
+    def run_categories_phase(self):
+        self.logger.log_step_start("Categories Phase")
         try:
-            self.logger.log_step_start("Setup")
-
-            self.llm = LLM(
-                self.config.llm_id,
-                self.device,
-                quantization_bits=4,
-                model_max_length=self.config.model_max_length
-            )
-
-            self.retriever_results = self.utils.load_retrieval_results(
-                str(self.config.contriever_results_path),
-                str(self.config.bm25_results_path) if self.config.use_bm25 else None,
-                self.config.use_fusion,
-                self.logger
-            )
-
-            if self.config.use_fusion:
-                self.fusion_ranker = RAGFusionRanker(
-                    strategy="rrf",
-                    normalize_scores=True,
-                    score_weights=self.config.fusion_weights
-                )
-
-            self.dataset = self._load_dataset()
-            self.logger.log_step_end("Setup")
-
+            test_configs = self._generate_test_configs()
+            results = []
+            
+            for config in tqdm(test_configs, desc="Testing configurations"):
+                category_results = self._run_category_test(config)
+                position_results = self._test_positions(category_results)
+                noise_results = self._test_noise_injection(category_results)
+                combination_results = self._test_document_combinations(category_results)
+                
+                # Evaluate each category result
+                category_evaluations = {}
+                for category, docs in category_results['documents'].items():
+                    for doc in docs:
+                        eval_result = self.evaluator.evaluate_answer(
+                            question=doc['query'],
+                            generated_answer=doc['generated_answer'],
+                            gold_answer=doc['gold_answer']
+                        )
+                        category_evaluations[category] = eval_result
+                
+                results.append({
+                    "config": config,
+                    "categories": category_results,
+                    "positions": position_results,
+                    "noise": noise_results,
+                    "combinations": combination_results,
+                    "evaluations": category_evaluations
+                })
+                            
+                clear_memory()
+                
+            self._save_results(results)
+            self.logger.log_step_end("Categories Phase")
+            return results
+            
         except Exception as e:
-            self.logger.log_error(e, "Error in experiment setup")
+            self.logger.log_error(e, "Error in categories phase")
             raise
 
-    def _load_dataset(self) -> PromptDataset:
-        try:
-            corpus = read_corpus_json(str(self.config.corpus_path))
+    def _generate_test_configs(self) -> List[Dict]:
+        configs = []
+        confidence_levels = [0.8, 0.6, 0.4]
+        doc_positions = ['near', 'mid', 'far']
+        noise_ratios = [0.0, 0.1, 0.2]
+        
+        for confidence in confidence_levels:
+            for position in doc_positions:
+                for noise in noise_ratios:
+                    configs.append({
+                        "confidence_threshold": confidence,
+                        "doc_position": position,
+                        "noise_ratio": noise,
+                        "max_docs_per_category": self.config.max_docs_per_category
+                    })
+        return configs
 
-            if self.config.use_fusion:
-                search_results = self.fusion_ranker.fuse_search_results(self.retriever_results)
-                max_idx = len(corpus) - 1
-                valid_search_results = []
-                for doc_ids, scores in search_results:
-                    valid_ids = [idx for idx in map(int, doc_ids) if 0 <= idx <= max_idx]
-                    if valid_ids:
-                        valid_search_results.append((valid_ids, scores[:len(valid_ids)]))
-                search_results = valid_search_results
-            else:
-                search_results = self.retriever_results['contriever']
+    def _run_category_test(self, config: Dict) -> Dict:
+        self.logger.log_step_start(f"Testing configuration threshold={config['confidence_threshold']}")
+        
+        docs = self._get_documents()
+        categorized = self.doc_classifier.classify_documents(
+            docs,
+            self.config.score_thresholds
+        )
+        
+        pruned = self._prune_categories(
+            categorized,
+            max_docs=config['max_docs_per_category']
+        )
+        
+        self.logger.log_step_end("Category test completed")
+        return {"documents": pruned}
 
-            return PromptDataset(
-                corpus=corpus,
-                data_path=str(self.config.train_dataset_path),
-                tokenizer=self.llm.tokenizer,
-                max_tokenized_length=self.config.model_max_length - 2,
-                search_results=search_results,
-                category_info={'score_thresholds': self.config.score_thresholds}
+    def _test_positions(self, results: Dict) -> Dict:
+        self.logger.log_step_start("Testing positions")
+        position_results = {}
+        
+        for position in ['near', 'mid', 'far']:
+            positioned_docs = self._position_documents(
+                results['documents'],
+                position=position
             )
+            eval_results = self.evaluator.evaluate_answer(positioned_docs)
+            position_results[position] = eval_results
+            
+        self.logger.log_step_end("Position testing")
+        return position_results
 
-        except Exception as e:
-            self.logger.log_error(e, "Error loading dataset")
-            raise
+    def _test_noise_injection(self, results: Dict) -> Dict:
+        self.logger.log_step_start("Testing noise")
+        noise_results = {}
+        
+        for ratio in [0.1, 0.2, 0.3]:
+            noisy_docs = self._inject_noise(
+                results['documents'],
+                ratio=ratio
+            )
+            eval_results = self.evaluator.evaluate_answer(noisy_docs)
+            noise_results[ratio] = eval_results
+            
+        self.logger.log_step_end("Noise testing")
+        return noise_results
+
+    def _test_document_combinations(self, results: Dict) -> Dict:
+        self.logger.log_step_start("Testing combinations")
+        combinations = {}
+        
+        # Gold + High confidence
+        gold_high = self._combine_categories(
+            results['documents'],
+            ['gold', 'high_confidence']
+        )
+        combinations['gold_high'] = self.evaluator.evaluate_answer(gold_high)
+        
+        # Gold + Medium confidence
+        gold_med = self._combine_categories(
+            results['documents'], 
+            ['gold', 'medium_confidence']
+        )
+        combinations['gold_medium'] = self.evaluator.evaluate_answer(gold_med)
+        
+        # High + Medium confidence
+        high_med = self._combine_categories(
+            results['documents'],
+            ['high_confidence', 'medium_confidence']
+        )
+        combinations['high_medium'] = self.evaluator.evaluate_answer(high_med)
+        
+        self.logger.log_step_end("Combination testing")
+        return combinations
+
+    def _position_documents(self, docs: Dict[str, List], position: str) -> Dict[str, List]:
+        positioned = docs.copy()
+        if 'gold' in positioned:
+            gold_docs = positioned.pop('gold')
+            if position == 'near':
+                positioned = {'gold': gold_docs, **positioned}
+            elif position == 'mid':
+                keys = list(positioned.keys())
+                mid = len(keys) // 2
+                for i, k in enumerate(keys):
+                    if i == mid:
+                        positioned['gold'] = gold_docs
+                    positioned[k] = positioned[k]
+            else:  # far
+                positioned['gold'] = gold_docs
+        return positioned
+
+    def _inject_noise(self, docs: Dict[str, List], ratio: float) -> Dict[str, List]:
+        total_docs = sum(len(d) for d in docs.values())
+        num_noise = max(1, int(total_docs * ratio))
+        noise_docs = self._generate_noise_docs(num_noise)
+        
+        noisy_docs = docs.copy()
+        noisy_docs['noise'] = noise_docs
+        return noisy_docs
+
+    def _combine_categories(self, docs: Dict[str, List], categories: List[str]) -> Dict[str, List]:
+        return {
+            cat: docs[cat]
+            for cat in categories
+            if cat in docs
+        }
+
+    def _save_results(self, results: List[Dict]):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path(self.config.output_dir) / timestamp
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        for phase in ['categories', 'positions', 'noise', 'combinations']:
+            phase_results = {
+                f"threshold_{result['config']['confidence_threshold']}": result[phase]
+                for result in results
+            }
+            
+            output_path = output_dir / f"{phase}_results.json"
+            with open(output_path, 'w') as f:
+                json.dump(phase_results, f, indent=2)
 
     def run(self):
         try:
-            self.logger.log_step_start("Experiment execution")
-
-            if torch.cuda.is_available():
-                gpu = torch.cuda.current_device()
-                initial_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
-                self.config.adjust_batch_sizes(initial_memory)
-
-            self.logger.log_experiment_params(self.config.to_dict())
-
-            dataloader = torch.utils.data.DataLoader(
-                self.dataset,
-                batch_size=self.config.batch_size,
-                shuffle=False,
-                num_workers=8,
-                pin_memory=True
-            )
-
-            results = []
-            for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
-                if torch.cuda.is_available():
-                    current_memory = torch.cuda.memory_allocated(gpu) / torch.cuda.max_memory_allocated(gpu)
-                    self.config.adjust_batch_sizes(current_memory)
-
-                categorized_docs = self.utils.categorize_documents(
-                    batch['documents'],
-                    batch['scores'],
-                    self.config.score_thresholds,
-                    self.config.max_docs_per_category,
-                    batch_size=self.config.categorization_batch_size,
-                    logger=self.logger
-                )
-
-                prompts = [
-                    self.utils.format_category_prompt(q, docs, self.logger)
-                    for q, docs in zip(batch['query'], categorized_docs)
-                ]
-
-                generated_outputs = self.llm.generate(
-                    prompts,
-                    max_new_tokens=self.config.max_new_tokens
-                )
-
-                batch_results = self._process_batch_outputs(
-                    batch,
-                    generated_outputs,
-                    categorized_docs
-                )
-                results.extend(batch_results)
-
-                if self.config.save_intermediates and (batch_idx + 1) % self.config.save_every == 0:
-                    self._save_checkpoint(results, batch_idx + 1)
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-
-                if self.logger.check_memory_threshold():
-                    self.config.batch_size = max(1, self.config.batch_size // 2)
-                    self.config.categorization_batch_size = max(20, self.config.categorization_batch_size // 2)
-
-            metrics = self.utils.analyze_category_impact(results, self.logger)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_dir = Path(self.config.output_dir) / f"run_{timestamp}"
-            self.utils.save_category_artifacts(
-                results,
-                metrics,
-                categorized_docs,
-                str(output_dir),
-                self.logger
-            )
-
-            self.logger.log_step_end("Experiment execution")
-            return results, metrics
-
+            self.logger.log_step_start("Running categories experiment")
+            results = self.run_categories_phase()
+            self._save_results(results)
+            self.logger.log_step_end("Categories experiment completed")
+            return results
+            
         except Exception as e:
-            self.logger.log_error(e, "Error during experiment execution")
+            self.logger.log_error(e, "Error in categories experiment")
             raise
         finally:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
+            clear_memory()
 
-    def _process_batch_outputs(
-        self,
-        batch: Dict[str, Any],
-        outputs: List[str],
-        categorized_docs: Dict[str, List[Dict]]
-    ) -> List[Dict[str, Any]]:
-        processed_results = []
-        answer_string = "### Response:" if 'mpt' in self.config.llm_id else "Answer:"
-        
-        for idx, output in enumerate(outputs):
-            try:
-                start_idx = output.find(answer_string) + len(answer_string)
-                answer = output[start_idx:].strip()
-                
-                result = {
-                    'query': batch['query'][idx],
-                    'generated_answer': answer,
-                    'category_info': {
-                        k: [d.copy() for d in docs] 
-                        for k, docs in categorized_docs.items()
-                    },
-                    'document_indices': batch['document_indices'][idx],
-                    'prompt_tokens_len': batch['prompt_tokens_len'][idx]
-                }
-                processed_results.append(result)
-                
-            except Exception as e:
-                self.logger.log_error(e, f"Error processing batch item {idx}")
-                continue
-                
-            if torch.cuda.is_available():
-                for k, v in batch.items():
-                    if isinstance(v, torch.Tensor):
-                        del v
-        
-        return processed_results
-
-    def _save_checkpoint(self, results: List[Dict], batch_idx: int):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        checkpoint_dir = Path(self.config.output_dir) / "checkpoints"
-        checkpoint_dir.mkdir(exist_ok=True)
-        
-        checkpoint_path = checkpoint_dir / f"checkpoint_{batch_idx}_{timestamp}.json"
-        with open(checkpoint_path, 'w') as f:
-            json.dump(results, f, indent=2)
-        
-        self.logger.experiment_logger.info(f"Saved checkpoint at batch {batch_idx}")
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Run categories experiment")
-    parser.add_argument(
-        '--config_type',
-        type=str,
-        choices=['confidence', 'fusion', 'random'],
-        default='confidence',
-        help='Type of categorization to use'
-    )
-    parser.add_argument(
-        '--output_dir',
-        type=str,
-        default='experiments/experiment3_categories/results',
-        help='Output directory for results'
-    )
-    return parser.parse_args()
-
-def main(args=None):
-    try:
-        if isinstance(args, dict):
-            parser = argparse.ArgumentParser()
-            parser.add_argument('--config_type', type=str)
-            namespace = parser.parse_args([])
-            for k, v in args.items():
-                setattr(namespace, k, v)
-            args = namespace
-        else:
-            args = parse_arguments()
-
-        try:
-            args = parse_arguments() if args is None else argparse.Namespace(**args)
-            config = CategoriesConfigFactory.get_config_for_type(args.config_type)
-            experiment = CategoriesExperiment(config, "categories_experiment")
-            experiment.setup()
-            results, metrics = experiment.run()
-            return results, metrics
-                
-        except Exception as e:
-            logging.error(f"Error in categories experiment: {str(e)}", exc_info=True)
-            raise
-        finally:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-                        
-    except Exception as e:
-        logging.error(f"Error in categories experiment: {str(e)}", exc_info=True) 
-        raise
-    finally:
-        # Final cleanup
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+def main():
+    config = CategoriesConfig()
+    experiment = CategoriesExperiment(config, "categories_experiment")
+    results = experiment.run()
+    return results
 
 if __name__ == "__main__":
+    seed_everything(10)
     main()

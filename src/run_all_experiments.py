@@ -243,16 +243,26 @@ class ExperimentPipeline:
     def _evaluate_results_with_llm(self, results: List[Dict]) -> List[Dict]:
         evaluated_results = []
         for result in tqdm(results, desc="Evaluating with LLM"):
+            eval_prompt = f"""
+            Question: {result['query']}
+            Generated Answer: {result['generated_answer']}
+            Gold Answer: {result['gold_answer']}
+            Context: {result.get('context', '')}
+
+            Evaluate the answer's correctness considering:
+            1. Factual accuracy compared to gold answer
+            2. Completeness of information
+            3. Context utilization
+            4. Semantic equivalence
+
+            Rate each aspect 0-100 and explain why.
+            """
             eval_result = self.llm.evaluate_answer(
-                question=result['query'],
-                generated_answer=result['generated_answer'],
+                prompt=eval_prompt,
+                context=result.get('context'),
                 gold_answer=result['gold_answer']
             )
-            result['evaluation'] = {
-                'score': eval_result['score'],
-                'reasoning': eval_result['reasoning'],
-                'correct': eval_result['correct']
-            }
+            result['evaluation'] = eval_result
             evaluated_results.append(result)
         return evaluated_results
 
@@ -412,6 +422,7 @@ class ExperimentPipeline:
         return self.run_experiment_batch(configs, 'categories')
 
     def run_experiment_batch(self, configs: List[Dict], experiment_type: str) -> List[Dict]:
+        time.sleep(1)
         """Run a batch of experiments of the same type."""
         results = []
         

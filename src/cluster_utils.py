@@ -16,17 +16,18 @@ from sklearn.metrics import (
 import torch
 from experiment_logger import ExperimentLogger
 from utils import seed_everything
-
+import google.generativeai as genai
+import time
 
 class ClusteringMethod:
     KMEANS = "kmeans"
     HIERARCHICAL = "hierarchical"
     DBSCAN = "dbscan"
 
-
 class DocumentClusterer:
     def __init__(
         self,
+        api_key: str,
         num_clusters: int,
         random_seed: int = 42,
         use_scaler: bool = True,
@@ -43,18 +44,16 @@ class DocumentClusterer:
         self.method = method
         self.batch_size = batch_size
         self.device = device
-        self.logger = logger
+        self.logger = logger or self._setup_logger()
+
+        # Initialize Gemini
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel('gemini-pro')
 
         self.clusterer = None
         self.scaler = StandardScaler() if use_scaler else None
         self.cluster_metrics = {}
-
         seed_everything(random_seed)
-
-        if logger:
-            logger.experiment_logger.info(
-                f"Initialized DocumentClusterer with {num_clusters} clusters using {method}"
-            )
 
     def _initialize_clusterer(self):
         if self.method == ClusteringMethod.KMEANS:
@@ -66,7 +65,7 @@ class DocumentClusterer:
         elif self.method == ClusteringMethod.HIERARCHICAL:
             self.clusterer = AgglomerativeClustering(
                 n_clusters=self.num_clusters,
-                linkage='ward'
+                linkage="ward"
             )
         elif self.method == ClusteringMethod.DBSCAN:
             self.clusterer = DBSCAN(
@@ -75,6 +74,45 @@ class DocumentClusterer:
             )
         else:
             raise ValueError(f"Unsupported clustering method: {self.method}")
+
+    def evaluate_cluster_quality(self, cluster_docs: List[Dict], query: str = None) -> Dict[str, float]:
+        """Evaluate cluster coherence using LLM"""
+        try:
+            eval_docs = cluster_docs[:5] if len(cluster_docs) > 5 else cluster_docs
+            doc_texts = "\n".join(d.get('text', '')[:200] for d in eval_docs)
+            
+            prompt = f"""
+            {"Query: " + query if query else ""}
+            Documents:
+            {doc_texts}
+            
+            Rate document cluster coherence (0-100):
+            Consider:
+            1. Topic similarity
+            2. Content relevance
+            3. Information complementarity
+            {"4. Query relevance" if query else ""}
+            
+            Provide only the numerical score (0-100):
+            """
+            
+            response = self.model.generate_content(prompt)
+            coherence_score = float(response.text.strip())
+            
+            # Calculate additional metrics
+            avg_length = np.mean([len(d.get('text', '')) for d in cluster_docs])
+            unique_terms = len(set(' '.join([d.get('text', '') for d in cluster_docs]).split()))
+            
+            return {
+                "coherence_score": coherence_score / 100,
+                "avg_doc_length": avg_length,
+                "unique_terms": unique_terms,
+                "docs_evaluated": len(eval_docs)
+            }
+            
+        except Exception as e:
+            self.logger.log_error(e, "Cluster evaluation failed")
+            return {"coherence_score": 0.0, "error": str(e)}
 
     def fit_clusters(
         self,
@@ -108,16 +146,10 @@ class DocumentClusterer:
 
         except Exception as e:
             if self.logger:
-                self.logger.log_error(e, "Error during cluster fitting")
+                self.logger.log_error(e, "Error during clustering")
             raise
-        finally:
-            self._cleanup_memory()
 
-    def evaluate_clusters(
-        self,
-        embeddings: np.ndarray,
-        noise_ratio: float = 0.0
-    ) -> Dict[str, float]:
+    def evaluate_clusters(self, embeddings: np.ndarray, noise_ratio: float = 0.0) -> Dict[str, float]:
         try:
             if self.clusterer is None:
                 raise ValueError("Must fit clusters before evaluation")
@@ -127,18 +159,32 @@ class DocumentClusterer:
                 embeddings = self._inject_noise(embeddings, noise_ratio)
 
             labels = self.clusterer.labels_
-            metrics = {
-                "silhouette_score": silhouette_score(embeddings, labels),
-                "calinski_harabasz_score": calinski_harabasz_score(embeddings, labels),
-                "davies_bouldin_score": davies_bouldin_score(embeddings, labels)
-            }
+            
+            with tqdm(total=3, desc="Computing metrics") as pbar:
+                metrics = {
+                    "silhouette_score": silhouette_score(embeddings, labels),
+                    "calinski_harabasz_score": calinski_harabasz_score(embeddings, labels),
+                    "davies_bouldin_score": davies_bouldin_score(embeddings, labels)
+                }
+                pbar.update(1)
 
-            if hasattr(self.clusterer, "inertia_"):
-                metrics["inertia"] = self.clusterer.inertia_
+                if hasattr(self.clusterer, "inertia_"):
+                    metrics["inertia"] = self.clusterer.inertia_
+                pbar.update(1)
 
-            self.cluster_metrics = metrics
-            if self.logger:
-                self.logger.log_metrics(metrics)
+                # Additional cluster statistics
+                unique_labels = np.unique(labels)
+                metrics.update({
+                    "num_clusters": len(unique_labels),
+                    "avg_cluster_size": np.mean([np.sum(labels == l) for l in unique_labels]),
+                    "std_cluster_size": np.std([np.sum(labels == l) for l in unique_labels])
+                })
+                pbar.update(1)
+
+                self.cluster_metrics = metrics
+                if self.logger:
+                    self.logger.log_metrics(metrics)
+                
             return metrics
 
         except Exception as e:
@@ -180,9 +226,6 @@ class DocumentClusterer:
                 document_ids if document_ids else range(len(embeddings))
             )
 
-            if self.logger:
-                self.logger.log_step_end("Batch processing")
-
             return clusters
 
         except Exception as e:
@@ -199,10 +242,9 @@ class DocumentClusterer:
         for idx, label in enumerate(labels):
             if label != -1:  # Exclude noise points from DBSCAN
                 clusters[label].append(document_ids[idx])
-        return clusters
+        return dict(clusters)
 
     def save_clusters(self, output_path: str, include_metrics: bool = True):
-        """Save clustering results and metrics to JSON."""
         output_data = {
             "clusters": self.clusterer.labels_.tolist() if self.clusterer else [],
             "config": {
@@ -220,20 +262,17 @@ class DocumentClusterer:
             json.dump(output_data, f, indent=2)
 
     def _cleanup_memory(self):
-        """Clean up GPU memory and garbage collection."""
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
 
     def _inject_noise(self, embeddings: np.ndarray, noise_ratio: float) -> np.ndarray:
-        """Add Gaussian noise to embeddings for diversity testing."""
         noise = np.random.normal(0, 0.1, embeddings.shape)
         noise_mask = np.random.random(len(embeddings)) < noise_ratio
         embeddings[noise_mask] += noise[noise_mask]
         return embeddings
 
     def _log_clustering_stats(self, clusters: Dict[int, List[int]]):
-        """Log detailed clustering statistics."""
         stats = {
             "num_clusters": len(clusters),
             "total_documents": sum(len(docs) for docs in clusters.values()),
@@ -243,56 +282,19 @@ class DocumentClusterer:
 
         if self.logger:
             self.logger.log_metrics({"clustering_stats": stats})
-
-
-def find_optimal_clusters(
-    embeddings: np.ndarray,
-    max_clusters: int,
-    min_clusters: int = 2,
-    method: str = ClusteringMethod.KMEANS,
-    batch_size: int = 1000,
-    logger: Optional[ExperimentLogger] = None
-) -> Tuple[int, Dict[str, List[float]]]:
-    if logger:
-        logger.log_step_start("Finding optimal clusters")
-
-    metrics = {
-        "silhouette_scores": [],
-        "calinski_scores": [],
-        "davies_scores": []
-    }
-
-    try:
-        for k in tqdm(range(min_clusters, max_clusters + 1), desc="Evaluating cluster sizes"):
-            clusterer = DocumentClusterer(
-                num_clusters=k,
-                method=method,
-                batch_size=batch_size,
-                logger=logger
-            )
-
-            clusterer.fit_clusters(embeddings)
-            evaluation = clusterer.evaluate_clusters(embeddings)
-
-            metrics["silhouette_scores"].append(evaluation.get("silhouette_score", 0))
-            metrics["calinski_scores"].append(evaluation.get("calinski_harabasz_score", 0))
-            metrics["davies_scores"].append(evaluation.get("davies_bouldin_score", float('inf')))
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-
-        combined_scores = np.array(metrics["silhouette_scores"])
-        optimal_k = min_clusters + np.argmax(combined_scores)
-
-        if logger:
-            logger.log_step_end("Finding optimal clusters")
-            logger.log_metric("optimal_clusters", optimal_k)
-            logger.log_metric("clustering_metrics", metrics)
-
-        return optimal_k, metrics
-
-    except Exception as e:
-        if logger:
-            logger.log_error(e, "Error finding optimal clusters")
-        raise
+            
+    def get_evaluation_summary(self) -> Dict[str, Any]:
+        """Get comprehensive evaluation summary"""
+        if not self.cluster_metrics:
+            return {"error": "No evaluation metrics available"}
+            
+        summary = {
+            "quality_metrics": self.cluster_metrics,
+            "cluster_stats": {
+                "num_clusters": len(set(self.clusterer.labels_)),
+                "noise_points": np.sum(self.clusterer.labels_ == -1) if hasattr(self.clusterer.labels_, "__len__") else 0,
+            },
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        return summary

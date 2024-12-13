@@ -1,249 +1,278 @@
 import numpy as np
-from typing import List, Tuple, Dict, Union, Optional, Any
+from typing import List, Tuple, Dict, Any, Optional
 from tqdm import tqdm
 import logging
+from datetime import datetime
+import torch
+import google.generativeai as genai
+import time
 
 class RAGFusionRanker:
-    """
-    A class for performing RAG-Fusion ranking by combining results from multiple retrievers.
-    Implements Reciprocal Rank Fusion and score normalization techniques.
-    """
-    
     def __init__(
         self,
+        api_key: str,
         k: float = 60.0,
         strategy: str = "rrf",
         normalize_scores: bool = True,
-        score_weights: Optional[Dict[str, float]] = None
+        score_weights: Optional[Dict[str, float]] = None,
+        batch_size: int = 32,
+        memory_threshold: float = 0.9
     ):
-        """
-        Initialize the RAG-Fusion ranker.
-        
-        Args:
-            k: Constant for RRF calculation. Higher values diminish the impact of rank differences.
-            strategy: Fusion strategy ('rrf' for Reciprocal Rank Fusion or 'linear' for linear combination)
-            normalize_scores: Whether to normalize scores before fusion
-            score_weights: Optional weights for different retrievers (e.g., {'contriever': 0.7, 'bm25': 0.3})
-        """
         self.k = k
         self.strategy = strategy
         self.normalize_scores = normalize_scores
         self.score_weights = score_weights or {}
-        
-        if strategy not in ["rrf", "linear"]:
-            raise ValueError("Invalid fusion strategy. Must be 'rrf' or 'linear'.")
+        self.batch_size = batch_size
+        self.memory_threshold = memory_threshold
+        self.logger = self._setup_logger()
+        self.stats = {"fusions": 0, "evaluations": 0}
 
-    def normalize_score_list(
-        self, 
-        scores: List[float], 
-        min_score: Optional[float] = None, 
-        max_score: Optional[float] = None
-    ) -> List[float]:
-        """
-        Normalize scores to [0,1] range using min-max normalization.
-        
-        Args:
-            scores: List of scores to normalize
-            min_score: Optional minimum score for normalization
-            max_score: Optional maximum score for normalization
-            
-        Returns:
-            List of normalized scores
-        """
-        if min_score is None:
-            min_score = min(scores)
-        if max_score is None:
-            max_score = max(scores)
-            
-        if max_score == min_score:
-            return [1.0] * len(scores)
-            
-        return [(score - min_score) / (max_score - min_score) for score in scores]
-    
-    def reciprocal_rank_fusion(
-        self, 
-        results_list: List[Union[Tuple[List[str], List[float]], Dict]]
-    ) -> List[Tuple[List[str], List[float]]]:
-        """Implement reciprocal rank fusion with better error handling."""
-        fused_results = []
-        
-        try:
-            for query_results in zip(*results_list):
-                fused_scores = {}
-                
-                for rank, result in enumerate(query_results):
-                    # Handle different result formats
-                    if isinstance(result, tuple) and len(result) == 2:
-                        doc_ids, scores = result
-                    elif isinstance(result, dict) and 'hits' in result and 'scores' in result:
-                        doc_ids = [str(hit['docid']) for hit in result['hits']]
-                        scores = [float(hit['score']) for hit in result['scores']]
-                    else:
-                        continue
-                        
-                    fused_score = 1 / (rank + self.k)
-                    for doc_id in doc_ids:
-                        if doc_id in fused_scores:
-                            fused_scores[doc_id] += fused_score
-                        else:
-                            fused_scores[doc_id] = fused_score
-                        
-                # Sort by fused scores
-                sorted_results = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
-                doc_ids, scores = zip(*sorted_results) if sorted_results else ([], [])
-                fused_results.append((list(doc_ids), list(scores)))
-            
-            return fused_results
-            
-        except Exception as e:
-            raise ValueError(f"Error during fusion: {str(e)}")
-    
-    def _linear_combination(
-        self, 
-        results_list: List[Tuple[List[str], List[float]]]
-    ) -> Tuple[List[str], List[float]]:
-        """Implement linear score combination."""
-        fused_scores = {}
-        for retriever, (doc_ids, scores) in enumerate(results_list):
-            weight = self.score_weights.get(f"retriever{retriever}", 1.0)
-            for doc_id, score in zip(doc_ids, scores):
-                if doc_id in fused_scores:
-                    fused_scores[doc_id] += score * weight
-                else:
-                    fused_scores[doc_id] = score * weight
-                    
-        # Sort by fused scores
-        sorted_results = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
-        doc_ids, scores = zip(*sorted_results)
-        return list(doc_ids), list(scores)
-    
+        # Initialize Gemini
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel('gemini-pro')
+
+        if strategy not in ["rrf", "linear"]:
+            raise ValueError("Invalid fusion strategy. Must be 'rrf' or 'linear'")
+
+    def _setup_logger(self) -> logging.Logger:
+        logger = logging.getLogger("RAGFusionRanker")
+        logger.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        return logger
+
     def fuse_search_results(
-        self, 
-        retriever_results: Dict[str, List[Union[Dict, Tuple[List[str], List[float]]]]]) -> List[Tuple[List[str], List[float]]]:
-        """
-        Safely fuse search results with validation and BM25 handling.
+        self,
+        retriever_results: Dict[str, List[Tuple[List[str], List[float]]]]
+    ) -> List[Tuple[List[str], List[float]]]:
+        self.logger.info(f"Starting fusion with strategy: {self.strategy}")
         
-        Args:
-            retriever_results: Dictionary mapping retriever names to their search results.
-                              The results can be in the form of a list of (doc_ids, scores) tuples
-                              or a list of dicts with 'hits' and 'scores' keys (for BM25 format).
-        
-        Returns:
-            List of (doc_ids, scores) tuples for the fused results.
-        """
         try:
-            # Validate input format
-            if not isinstance(retriever_results, dict):
-                raise ValueError("Retriever results must be a dictionary")
-                
-            normalized_results = {}
-            for name, results in retriever_results.items():
-                if not isinstance(results, list):
-                    raise ValueError(f"Results for {name} must be a list")
-                if not results:
-                    raise ValueError(f"Empty results for {name}")
-                
-                # Handle BM25 format
-                if name == 'bm25':
-                    processed_results = []
-                    for result in results:
-                        if isinstance(result, dict):
-                            # Convert BM25 dict format to tuple format
-                            doc_ids = [str(hit['docid']) for hit in result.get('hits', [])]
-                            scores = [float(hit['score']) for hit in result.get('scores', [])]
-                            processed_results.append((doc_ids, scores))
-                        else:
-                            processed_results.append(result)
-                    normalized_results[name] = processed_results
-                else:
-                    # Validate format of each non-BM25 result
-                    for result in results:
-                        if not isinstance(result, tuple) or len(result) != 2:
-                            raise ValueError(f"Invalid result format for {name}")
-                        doc_ids, scores = result
-                        if not isinstance(doc_ids, list) or not isinstance(scores, list):
-                            raise ValueError(f"Invalid doc_ids/scores format for {name}")
-                        if len(doc_ids) != len(scores):
-                            raise ValueError(f"Mismatched lengths for doc_ids/scores in {name}")
-                    normalized_results[name] = results
+            all_results = []
+            num_queries = len(next(iter(retriever_results.values())))
             
-            # Process results
-            fused_results = []
-            num_queries = len(next(iter(normalized_results.values())))
-            
-            for query_idx in range(num_queries):
+            for query_idx in tqdm(range(num_queries), desc="Fusing results"):
                 query_results = {
                     name: results[query_idx] 
-                    for name, results in normalized_results.items()
+                    for name, results in retriever_results.items()
                 }
                 
-                # Normalize scores if configured
                 if self.normalize_scores:
-                    for name in query_results:
-                        doc_ids, scores = query_results[name]
-                        min_score = min(scores) if scores else 0
-                        max_score = max(scores) if scores else 1
-                        norm_scores = (
-                            [(s - min_score) / (max_score - min_score) if max_score > min_score else 0.5 
-                            for s in scores]
-                        )
-                        query_results[name] = (doc_ids, norm_scores)
-                
-                # Apply fusion strategy
-                if self.strategy == 'rrf':
-                    fused_result = self.reciprocal_rank_fusion(query_results)
-                else:
-                    fused_result = self._linear_combination(query_results)
+                    query_results = self._normalize_batch(query_results)
                     
-                fused_results.append(fused_result)
+                if self.strategy == "rrf":
+                    fused = self.reciprocal_rank_fusion(query_results)
+                else:
+                    fused = self._linear_combination(query_results)
+                    
+                all_results.append(fused)
+                self.stats["fusions"] += 1
                 
-            return fused_results
+            return all_results
             
         except Exception as e:
-            logging.error(f"Error during fusion: {str(e)}")
+            self.logger.error(f"Fusion error: {str(e)}")
             raise
 
-    def rescore_with_clusters(
+    def _normalize_batch(
+        self,
+        batch_results: Dict[str, Tuple[List[str], List[float]]]
+    ) -> Dict[str, Tuple[List[str], List[float]]]:
+        normalized = {}
+        for retriever, (doc_ids, scores) in batch_results.items():
+            if not scores:
+                continue
+            min_score = min(scores)
+            max_score = max(scores)
+            if max_score > min_score:
+                norm_scores = [(s - min_score) / (max_score - min_score) for s in scores]
+            else:
+                norm_scores = [1.0] * len(scores)
+            normalized[retriever] = (doc_ids, norm_scores)
+        return normalized
+
+    def evaluate_retrieval_diversity(
         self,
         fused_results: List[Tuple[List[str], List[float]]],
-        cluster_info: Dict[str, int],
-        cluster_boost: float = 0.1
-    ) -> List[Tuple[List[str], List[float]]]:
-        """
-        Adjust scores based on cluster information to promote diversity.
-        
-        Args:
-            fused_results: List of (doc_ids, scores) tuples
-            cluster_info: Mapping of document IDs to cluster assignments
-            cluster_boost: Score boost for documents from underrepresented clusters
+        documents: Dict[str, Dict]
+    ) -> Dict[str, float]:
+        """Evaluate diversity of retrieved documents using LLM"""
+        try:
+            self.logger.info("Evaluating retrieval diversity")
+            diversity_scores = []
             
-        Returns:
-            Rescored results considering cluster diversity
-        """
-        rescored_results = []
-        
-        for doc_ids, scores in fused_results:
-            # Track cluster frequencies
-            cluster_counts = {}
-            rescored_doc_scores = []
+            for doc_ids, scores in tqdm(fused_results, desc="Evaluating diversity"):
+                top_docs = [documents[doc_id] for doc_id in doc_ids[:5]]
+                doc_texts = "\n".join(d.get('text', '')[:200] for d in top_docs)
+                
+                prompt = f"""
+                Evaluate the diversity of these documents (0-100):
+                {doc_texts}
+                
+                Consider:
+                1. Topic diversity
+                2. Information complementarity
+                3. Redundancy avoidance
+                
+                Provide only the numerical score (0-100):
+                """
+                
+                response = self.model.generate_content(prompt)
+                diversity_scores.append(float(response.text.strip()) / 100)
+                time.sleep(0.1)  # Rate limiting
+                
+            return {
+                "avg_diversity": np.mean(diversity_scores),
+                "std_diversity": np.std(diversity_scores)
+            }
             
-            # Process documents in order
-            for doc_id, score in zip(doc_ids, scores):
-                if doc_id in cluster_info:
-                    cluster = cluster_info[doc_id]
-                    # Boost score if cluster is underrepresented
-                    boost = cluster_boost / (cluster_counts.get(cluster, 0) + 1)
-                    adjusted_score = score * (1 + boost)
-                    cluster_counts[cluster] = cluster_counts.get(cluster, 0) + 1
-                else:
-                    adjusted_score = score
+        except Exception as e:
+            self.logger.error(f"Diversity evaluation failed: {str(e)}")
+            return {"error": str(e)}
+
+    def reciprocal_rank_fusion(
+        self,
+        results: Dict[str, Tuple[List[str], List[float]]]
+    ) -> Tuple[List[str], List[float]]:
+        try:
+            fused_scores = {}
+            
+            for retriever_name, (doc_ids, scores) in results.items():
+                weight = self.score_weights.get(retriever_name, 1.0)
+                ranked_pairs = sorted(zip(doc_ids, scores), key=lambda x: x[1], reverse=True)
+                
+                for rank, (doc_id, _) in enumerate(ranked_pairs):
+                    if doc_id not in fused_scores:
+                        fused_scores[doc_id] = 0
+                    fused_scores[doc_id] += weight / (rank + self.k)
                     
-                rescored_doc_scores.append((doc_id, adjusted_score))
+            sorted_results = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+            doc_ids, scores = zip(*sorted_results) if sorted_results else ([], [])
             
-            # Sort by adjusted scores
-            rescored_doc_scores.sort(key=lambda x: x[1], reverse=True)
-            new_doc_ids, new_scores = zip(*rescored_doc_scores)
+            return list(doc_ids), list(scores)
             
-            rescored_results.append((list(new_doc_ids), list(new_scores)))
+        except Exception as e:
+            self.logger.error(f"RRF fusion error: {str(e)}")
+            raise
+
+    def _linear_combination(
+        self,
+        results: Dict[str, Tuple[List[str], List[float]]]
+    ) -> Tuple[List[str], List[float]]:
+        try:
+            fused_scores = {}
             
-        return rescored_results
+            for retriever_name, (doc_ids, scores) in results.items():
+                weight = self.score_weights.get(retriever_name, 1.0)
+                for doc_id, score in zip(doc_ids, scores):
+                    if doc_id not in fused_scores:
+                        fused_scores[doc_id] = 0
+                    fused_scores[doc_id] += score * weight
+                    
+            sorted_results = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+            doc_ids, scores = zip(*sorted_results) if sorted_results else ([], [])
+            
+            return list(doc_ids), list(scores)
+            
+        except Exception as e:
+            self.logger.error(f"Linear fusion error: {str(e)}")
+            raise
+
+    def inject_noise_into_contexts(
+        self,
+        fused_results: List[Tuple[List[str], List[float]]],
+        corpus: Dict[str, Dict],
+        noise_ratio: float,
+        random_seed: int = 42
+    ) -> List[Tuple[List[str], List[float]]]:
+        self.logger.info(f"Injecting noise with ratio {noise_ratio}")
+        
+        try:
+            np.random.seed(random_seed)
+            noisy_results = []
+            
+            for doc_ids, scores in tqdm(fused_results, desc="Injecting noise"):
+                num_docs = len(doc_ids)
+                num_noise = max(1, int(num_docs * noise_ratio))
+                
+                # Keep original documents
+                keep_docs = num_docs - num_noise
+                retained_ids = doc_ids[:keep_docs]
+                retained_scores = scores[:keep_docs]
+                
+                # Sample noise documents
+                available_ids = list(set(corpus.keys()) - set(retained_ids))
+                noise_ids = np.random.choice(available_ids, num_noise, replace=False)
+                noise_scores = [0.0] * num_noise
+                
+                noisy_results.append((
+                    retained_ids + list(noise_ids),
+                    retained_scores + noise_scores
+                ))
+                
+            return noisy_results
+            
+        except Exception as e:
+            self.logger.error(f"Noise injection error: {str(e)}")
+            raise
+
+    def evaluate_batch_relevance(
+        self,
+        query: str,
+        documents: List[Dict],
+        batch_size: Optional[int] = None
+    ) -> List[float]:
+        """Evaluate document relevance in batches"""
+        if batch_size is None:
+            batch_size = self.batch_size
+            
+        relevance_scores = []
+        num_batches = (len(documents) + batch_size - 1) // batch_size
+        
+        for i in tqdm(range(num_batches), desc="Evaluating relevance"):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, len(documents))
+            batch_docs = documents[start_idx:end_idx]
+            
+            batch_scores = []
+            for doc in batch_docs:
+                try:
+                    prompt = f"""
+                    Query: {query}
+                    Document: {doc.get('text', '')[:500]}
+                    
+                    Rate document relevance to query (0-100):
+                    Consider:
+                    1. Query relevance
+                    2. Information completeness
+                    3. Answer presence
+                    
+                    Provide only the numerical score (0-100):
+                    """
+                    
+                    response = self.model.generate_content(prompt)
+                    score = float(response.text.strip()) / 100
+                    batch_scores.append(score)
+                    time.sleep(0.1)  # Rate limiting
+                    
+                except Exception as e:
+                    self.logger.error(f"Document evaluation failed: {str(e)}")
+                    batch_scores.append(0.0)
+                    
+            relevance_scores.extend(batch_scores)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        return relevance_scores
+
+    def get_fusion_info(self) -> Dict[str, Any]:
+        return {
+            "strategy": self.strategy,
+            "rrf_k": self.k,
+            "normalize_scores": self.normalize_scores,
+            "weights": self.score_weights,
+            "stats": self.stats,
+            "timestamp": datetime.now().isoformat()
+        }
