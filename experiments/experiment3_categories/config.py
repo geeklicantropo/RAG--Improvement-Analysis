@@ -24,6 +24,10 @@ class CategoriesConfig:
     })
     max_docs_per_category: int = 3
     min_category_score: float = 0.2
+
+    # Memory configuration
+    gpu_memory_threshold: float = 0.9
+    cpu_memory_threshold: float = 0.9
     
     # Document Source Configuration
     use_bm25: bool = False

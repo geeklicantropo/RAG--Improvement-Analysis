@@ -3,7 +3,7 @@ import faiss
 import numpy as np
 from typing import List, Tuple, Optional
 
-from utils import read_pickle, write_pickle
+from src.utils.file_utils import read_pickle, write_pickle
 
 
 # Indexer class adapted from Contriever file https://github.com/facebookresearch/contriever/blob/main/src/index.py

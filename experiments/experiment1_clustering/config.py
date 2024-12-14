@@ -9,31 +9,36 @@ import json
 class ClusteringConfig:
     """Configuration for clustering experiments."""
     
-    # Memory Management:
-    gpu_memory_utilization: float = 0.8
-    memory_warning_threshold: float = 0.7
-    memory_error_threshold: float = 0.9
-    memory_logging_interval: int = 100
-    
-    # Experiment Identification
+    # Experiment identification
     experiment_name: str = "clustering_experiment"
     experiment_id: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d_%H%M%S"))
 
-    # Model Configuration
-    llm_id: str = "meta-llama/Llama-2-7b-chat-hf"
-    embedding_model: str = "meta-llama/Llama-2-7b-chat-hf"  # New field for embedding model
-    model_max_length: int = 4096
-    max_new_tokens: int = 15
-    quantization_bits: Optional[int] = 8
+    # Model Configuration  
+    llm_id: str = "gemini-pro"
+    embedding_model: str = "gemini-pro"
+    model_max_length: int = 30720
+    max_new_tokens: int = 1024
+    
+    # Memory Configuration
+    gpu_memory_utilization: float = 0.8 
+    gpu_memory_threshold: float = 0.9
+    cpu_memory_threshold: float = 0.9
+    memory_warning_threshold: float = 0.7
+    memory_error_threshold: float = 0.9
+    memory_logging_interval: int = 100
 
     # Clustering Configuration
-    num_clusters: int = 5
+    num_clusters: int = 10
     cluster_seed: int = 42
-    method: str = "kmeans"  # Options: kmeans, agglomerative, etc.
+    method: str = "kmeans"
     use_scaler: bool = True
-    min_cluster_size: int = 3
-    min_docs_per_cluster: int = 2
-    max_docs_per_category: int = 3
+    min_cluster_size: int = 5
+    min_docs_per_cluster: int = 5
+    max_docs_per_category: int = 10
+
+    # Document Configuration
+    num_documents_in_context: int = 50
+    max_doc_length: int = 512
 
     # Embeddings Configuration
     compute_new_embeddings: bool = True
@@ -41,7 +46,7 @@ class ClusteringConfig:
     max_length_encoder: int = 512
     embeddings_output_dir: str = "data/embeddings"
 
-    # Noise Injection Configuration
+    # Noise Configuration
     inject_noise: bool = False
     noise_ratio: float = 0.2
     noise_seed: int = 42
@@ -63,9 +68,9 @@ class ClusteringConfig:
     base_data_dir: Path = Path("data")
     processed_dir: Path = base_data_dir / "processed"
 
-    # Output and Batch Processing
+    # Processing Configuration
     output_dir: Path = Path("experiments/experiment1_clustering/results")
-    batch_size: int = 32 
+    batch_size: int = 32
     min_batch_size: int = 1
     max_batch_size: int = 64
     batch_size_reduction_factor: float = 0.5

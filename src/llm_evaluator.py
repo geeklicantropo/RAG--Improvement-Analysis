@@ -1,165 +1,349 @@
 import logging
-from typing import Dict, List, Any, Optional
+import time
+from typing import Dict, List, Any, Optional, Union
+from pathlib import Path
+import json
+import hashlib
+from datetime import datetime
 from tqdm import tqdm
-from collections import defaultdict
-
-from src.llm import LLM
-from src.experiment_logger import ExperimentLogger
+import google.generativeai as genai
 
 class LLMEvaluator:
-    def __init__(self, llm: LLM):
-        self.llm = llm
+    def __init__(self, api_key: str, cache_dir: str = "cache/evaluations"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.logger = self._setup_logger()
         self.eval_cache = {}
+        self.stats = {"hits": 0, "misses": 0}
+        
+        # Initialize Gemini
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel('gemini-pro')
+        
+        self._setup_templates()
 
     def _setup_logger(self) -> logging.Logger:
         logger = logging.getLogger("LLMEvaluator")
         logger.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        
         handler = logging.StreamHandler()
-        handler.setFormatter(formatter)
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logger.addHandler(handler)
-        
         return logger
+
+    def _setup_templates(self):
+        self.templates = {
+            'answer_evaluation': """
+            Question: {question}
+            Generated Answer: {generated_answer}
+            Gold Answer: {gold_answer}
+            Context: {context}
+
+            Evaluate the answer considering:
+            1. Factual accuracy vs gold answer
+            2. Information completeness
+            3. Context utilization
+            4. Semantic equivalence
+
+            Format:
+            Score (0-100):
+            Correct (Yes/No):
+            Reasoning:""",
+
+            'document_relevance': """
+            Question: {question}
+            Document: {document}
+            Gold Answer: {gold_answer}
+
+            Rate document relevance (0-100) considering:
+            1. Answer presence
+            2. Information completeness
+            3. Context relevance
+
+            Provide only the numerical score:""",
+            
+            'semantic_similarity': """
+            Compare these texts and rate their semantic similarity (0-100):
+            Text 1: {text1}
+            Text 2: {text2}
+            Score:""",
+
+            'document_classification': """
+            Question: {question}
+            Gold Answer: {gold_answer}
+            Document: {doc_text}
+
+            Classify this document as either:
+            1. "gold" if it contains the answer
+            2. "distracting" if semantically similar but doesn't contain answer
+            3. "random" if unrelated
+
+            Classification:""",
+
+            'gold_validation': """
+            Question: {question}
+            Expected Answer: {gold_answer}
+            Document: {doc_text}
+
+            Does this document contain enough information to answer the question correctly?
+            Answer 'yes' or 'no' and explain why:
+            """
+        }
 
     def evaluate_answer(
         self,
         question: str,
         generated_answer: str,
         gold_answer: str,
-        context: Optional[str] = None
+        context: Optional[str] = None,
+        retry_count: int = 3
     ) -> Dict[str, Any]:
-        """Evaluate answer correctness using LLM."""
-        cache_key = f"{question}:{generated_answer}:{gold_answer}"
-        if cache_key in self.eval_cache:
-            return self.eval_cache[cache_key]
+        cache_key = hashlib.md5(f"ans_eval:{question}:{generated_answer}:{gold_answer}:{context}".encode()).hexdigest()
+        
+        cached = self._check_cache(cache_key)
+        if cached:
+            return cached
 
-        eval_prompt = f"""
-        Question: {question}
-        Generated Answer: {generated_answer}
-        Gold Answer: {gold_answer}
-        {"Context: " + context if context else ""}
+        prompt = self.templates['answer_evaluation'].format(
+            question=question,
+            generated_answer=generated_answer,
+            gold_answer=gold_answer,
+            context=context or ""
+        )
 
-        Evaluate the generated answer, considering:
-        1. Factual accuracy compared to gold answer
-        2. Completeness of information
-        3. Semantic equivalence
+        for attempt in range(retry_count):
+            try:
+                response = self.model.generate_content(prompt)
+                lines = response.text.strip().split('\n')
+                
+                score_line = lines[0]
+                correct_line = lines[1]
+                reasoning_line = lines[2]
 
-        Provide evaluation as:
-        Score (0-100):
-        Correct (Yes/No):
-        Reasoning:"""
+                score = float(score_line.split(':', 1)[1].strip())
+                correct = 'yes' in correct_line.lower()
+                reasoning = reasoning_line.split(':', 1)[1].strip()
+                
+                result = {
+                    'score': score / 100,
+                    'correct': correct,
+                    'reasoning': reasoning,
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                self._save_to_cache(cache_key, result)
+                return result
 
-        response = self.llm.generate(eval_prompt)
+            except Exception as e:
+                if attempt == retry_count - 1:
+                    self.logger.error(f"Evaluation failed: {str(e)}")
+                    result = {
+                        'score': 0,
+                        'correct': False,
+                        'reasoning': str(e),
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    self._save_to_cache(cache_key, result)
+                    return result
+                time.sleep(1)
+
+    def evaluate_batch(
+        self,
+        items: List[Dict],
+        batch_size: int = 10
+    ) -> List[Dict]:
+        results = []
+        
+        for i in tqdm(range(0, len(items), batch_size), desc="Evaluating"):
+            batch = items[i:i + batch_size]
+            batch_results = []
+            
+            for item in batch:
+                eval_result = self.evaluate_answer(
+                    item['question'],
+                    item['generated_answer'],
+                    item['gold_answer'],
+                    item.get('context')
+                )
+                item['evaluation'] = eval_result
+                batch_results.append(item)
+                time.sleep(0.1)  # Rate limiting
+                
+            results.extend(batch_results)
+            
+        return results
+
+    def compute_semantic_similarity(
+        self,
+        text1: str,
+        text2: str,
+        cache_key: Optional[str] = None
+    ) -> float:
+        if not cache_key:
+            cache_key = hashlib.md5(f"sem_sim:{text1}:{text2}".encode()).hexdigest()
+            
+        cached = self._check_cache(cache_key)
+        if cached and 'similarity' in cached:
+            return cached['similarity']
+            
+        prompt = self.templates['semantic_similarity'].format(
+            text1=text1,
+            text2=text2
+        )
         
         try:
-            lines = response.strip().split('\n')
-            score = float(lines[0].split(':')[1].strip())
-            correct = 'yes' in lines[1].lower()
-            reasoning = lines[2].split(':')[1].strip()
-            
-            result = {
-                'score': score,
-                'correct': correct,
-                'reasoning': reasoning
-            }
-            
-            self.eval_cache[cache_key] = result
-            return result
-            
+            response = self.model.generate_content(prompt)
+            similarity = float(response.text.strip()) / 100
+            self._save_to_cache(cache_key, {'similarity': similarity})
+            return similarity
         except Exception as e:
-            self.logger.error(f"Error parsing evaluation response: {str(e)}")
-            return {'score': 0, 'correct': False, 'reasoning': 'Error in evaluation'}
+            self.logger.error(f"Similarity computation failed: {str(e)}")
+            return 0.0
 
-    def evaluate_clusters(
+    def evaluate_document_relevance(
         self,
-        clusters: Dict[int, List[Dict]],
-        query: str
-    ) -> Dict[str, Any]:
-        """Evaluate clustering quality using LLM."""
-        self.logger.info("Evaluating clusters")
-        metrics = defaultdict(float)
+        document: Dict,
+        question: str,
+        gold_answer: str
+    ) -> float:
+        doc_id = document.get('id', 'no_id')
+        cache_key = hashlib.md5(f"doc_rel:{doc_id}:{question}:{gold_answer}".encode()).hexdigest()
         
-        for cluster_id, docs in tqdm(clusters.items(), desc="Evaluating clusters"):
-            # Evaluate cluster coherence
-            doc_texts = "\n".join(d['text'][:200] for d in docs)  # Truncate for prompt length
-            coherence_prompt = f"""
-            Query: {query}
-            Documents in cluster:
-            {doc_texts}
-
-            Rate the semantic coherence and relevance of this cluster (0-100):"""
+        cached = self._check_cache(cache_key)
+        if cached and 'relevance' in cached:
+            return cached['relevance']
             
+        prompt = self.templates['document_relevance'].format(
+            question=question,
+            document=document['text'],
+            gold_answer=gold_answer
+        )
+        
+        try:
+            response = self.model.generate_content(prompt)
+            relevance = float(response.text.strip()) / 100
+            self._save_to_cache(cache_key, {'relevance': relevance})
+            return relevance
+        except Exception as e:
+            self.logger.error(f"Relevance evaluation failed: {str(e)}")
+            return 0.0
+
+    def classify_document(
+        self,
+        question: str,
+        gold_answer: str,
+        doc_text: str,
+        retry_count: int = 3
+    ) -> str:
+        """
+        Classify a single document as 'gold', 'distracting', or 'random' using LLM.
+
+        Returns: 'gold', 'distracting', or 'random'.
+        """
+        cache_key = hashlib.md5(f"doc_class:{question}:{gold_answer}:{doc_text}".encode()).hexdigest()
+
+        cached = self._check_cache(cache_key)
+        if cached and 'category' in cached:
+            return cached['category']
+
+        prompt = self.templates['document_classification'].format(
+            question=question,
+            gold_answer=gold_answer,
+            doc_text=doc_text
+        )
+
+        for attempt in range(retry_count):
             try:
-                coherence = float(self.llm.generate(coherence_prompt).strip())
-                metrics[f'cluster_{cluster_id}_coherence'] = coherence
-            except ValueError:
-                self.logger.warning(f"Could not parse coherence score for cluster {cluster_id}")
-                metrics[f'cluster_{cluster_id}_coherence'] = 0
+                response = self.model.generate_content(prompt)
+                category = response.text.strip().lower()
+                
+                # Validate category
+                if category not in ['gold', 'distracting', 'random']:
+                    self.logger.warning(f"LLM returned unexpected category '{category}', defaulting to 'random'")
+                    category = 'random'
 
-        metrics['avg_coherence'] = sum(v for k, v in metrics.items() if 'coherence' in k) / len(clusters)
-        return dict(metrics)
+                self._save_to_cache(cache_key, {'category': category})
+                return category
 
-    def evaluate_noise_impact(
+            except Exception as e:
+                if attempt == retry_count - 1:
+                    self.logger.error(f"Document classification failed: {str(e)}")
+                    self._save_to_cache(cache_key, {'category': 'random'})
+                    return 'random'
+                time.sleep(1)
+
+    def validate_gold_document(
         self,
-        clean_results: List[Dict],
-        noisy_results: List[Dict]
-    ) -> Dict[str, Any]:
-        """Compare performance with and without noise."""
-        self.logger.info("Evaluating noise impact")
-        
-        clean_scores = []
-        noisy_scores = []
-        
-        for clean, noisy in tqdm(zip(clean_results, noisy_results), 
-                                desc="Evaluating noise impact",
-                                total=len(clean_results)):
-            clean_eval = self.evaluate_answer(
-                clean['query'],
-                clean['generated_answer'],
-                clean['gold_answer']
-            )
-            noisy_eval = self.evaluate_answer(
-                noisy['query'],
-                noisy['generated_answer'],
-                noisy['gold_answer']
-            )
-            
-            clean_scores.append(clean_eval['score'])
-            noisy_scores.append(noisy_eval['score'])
+        question: str,
+        gold_answer: str,
+        doc_text: str,
+        retry_count: int = 3
+    ) -> bool:
+        """
+        Validate if a supposedly 'gold' document truly supports the gold answer.
+        Returns True if doc is indeed gold, False otherwise.
+        """
+        cache_key = hashlib.md5(f"gold_val:{question}:{gold_answer}:{doc_text}".encode()).hexdigest()
 
+        cached = self._check_cache(cache_key)
+        if cached and 'gold_valid' in cached:
+            return cached['gold_valid']
+
+        prompt = self.templates['gold_validation'].format(
+            question=question,
+            gold_answer=gold_answer,
+            doc_text=doc_text
+        )
+
+        for attempt in range(retry_count):
+            try:
+                response = self.model.generate_content(prompt)
+                answer = response.text.strip().lower()
+                # We expect something like "yes" or "no"
+                is_valid = answer.startswith('yes')
+                self._save_to_cache(cache_key, {'gold_valid': is_valid})
+                return is_valid
+
+            except Exception as e:
+                if attempt == retry_count - 1:
+                    self.logger.error(f"Gold validation failed: {str(e)}")
+                    self._save_to_cache(cache_key, {'gold_valid': False})
+                    return False
+                time.sleep(1)
+
+    def _check_cache(self, cache_key: str) -> Optional[Dict]:
+        if cache_key in self.eval_cache:
+            self.stats["hits"] += 1
+            return self.eval_cache[cache_key]
+
+        cache_file = self.cache_dir / f"{cache_key}.json"
+        if cache_file.exists():
+            try:
+                with open(cache_file) as f:
+                    result = json.load(f)
+                    self.eval_cache[cache_key] = result
+                    self.stats["hits"] += 1
+                    return result
+            except Exception as e:
+                self.logger.warning(f"Cache read failed: {str(e)}")
+
+        self.stats["misses"] += 1
+        return None
+
+    def _save_to_cache(self, cache_key: str, data: Dict):
+        self.eval_cache[cache_key] = data
+        cache_file = self.cache_dir / f"{cache_key}.json"
+        try:
+            with open(cache_file, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            self.logger.error(f"Cache write failed: {str(e)}")
+
+    def get_stats(self) -> Dict[str, Any]:
+        total = self.stats["hits"] + self.stats["misses"]
+        hit_rate = self.stats["hits"] / total if total > 0 else 0
         return {
-            'clean_avg_score': sum(clean_scores) / len(clean_scores),
-            'noisy_avg_score': sum(noisy_scores) / len(noisy_scores),
-            'score_degradation': ((sum(clean_scores) / len(clean_scores)) - 
-                                (sum(noisy_scores) / len(noisy_scores)))
-        }
-
-    def evaluate_position_impact(
-        self,
-        results: List[Dict]
-    ) -> Dict[str, Dict[str, float]]:
-        """Analyze impact of document positions."""
-        self.logger.info("Evaluating position impact")
-        
-        position_metrics = defaultdict(lambda: defaultdict(list))
-        
-        for result in tqdm(results, desc="Evaluating positions"):
-            eval_result = self.evaluate_answer(
-                result['query'],
-                result['generated_answer'],
-                result['gold_answer']
-            )
-            
-            position = result.get('gold_position', 'unknown')
-            position_metrics[position]['scores'].append(eval_result['score'])
-            position_metrics[position]['correct'].append(eval_result['correct'])
-
-        return {
-            pos: {
-                'avg_score': sum(metrics['scores']) / len(metrics['scores']),
-                'accuracy': sum(metrics['correct']) / len(metrics['correct'])
-            }
-            for pos, metrics in position_metrics.items()
+            'total_evaluations': len(self.eval_cache),
+            'cache_hits': self.stats["hits"],
+            'cache_misses': self.stats["misses"],
+            'cache_hit_rate': hit_rate
         }

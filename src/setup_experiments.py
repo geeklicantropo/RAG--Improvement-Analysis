@@ -5,6 +5,8 @@ import logging
 from typing import List, Dict, Optional
 from datetime import datetime
 from tqdm import tqdm
+from dotenv import load_dotenv  
+load_dotenv()
 
 from src.experiment_logger import ExperimentLogger
 from src.utils.file_utils import clear_memory
@@ -16,6 +18,7 @@ from transformers import AutoTokenizer
 
 class ExperimentSetup:
     def __init__(self, base_dir: str = "experiments"):
+        #load_dotenv()  # Load environment variables from .env
         self.base_dir = Path(base_dir)
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.logger = self._setup_logger()
@@ -95,7 +98,6 @@ class ExperimentSetup:
                 return False
                 
             return True
-            
         except ImportError as e:
             self.logger.error(f"Missing required package: {str(e)}")
             return False

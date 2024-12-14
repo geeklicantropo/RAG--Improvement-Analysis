@@ -4,43 +4,42 @@ from pathlib import Path
 from datetime import datetime
 import os
 import json
-from src.utils import read_pickle
+from src.utils.file_utils import read_pickle
 
 @dataclass 
 class BaselineConfig:
     """Configuration for baseline RAG experiment."""
     
     # Model Configuration
-    llm_id: str = "meta-llama/Llama-2-7b-chat-hf"
-    model_max_length: int = 2048
+    llm_id: str = "gemini-pro"
+    model_max_length: int = 30720  
     batch_size: int = 4
-    max_new_tokens: int = 15
+    max_new_tokens: int = 1024
     
     # Memory Management
     gpu_memory_utilization: float = 0.8
     empty_cache_every_n_batches: int = 1
     gradient_checkpointing: bool = True
-    cpu_offload: bool = True 
-    use_8bit_quantization: bool = True
+    cpu_offload: bool = True
     batch_size_reduction_factor: float = 0.5
     
-    # Batch Processing
+    # Batch Processing 
     min_batch_size: int = 1
-    max_batch_size: int = 8 
+    max_batch_size: int = 8
     dynamic_batch_size: bool = True
     
     # Document Configuration
-    num_documents_in_context: int = 5
+    num_documents_in_context: int = 50
     max_doc_length: int = 512
     gold_position: Optional[int] = None
     get_documents_without_answer: bool = True
     use_random: bool = False
-    use_adore: bool = False 
+    use_adore: bool = False
     use_bm25: bool = False
     normalize_embeddings: bool = False
     use_test: bool = False
     random_doc_percentage: Optional[float] = None
-    noise_ratio: float = 0.2  # New parameter for noise injection
+    noise_ratio: float = 0.2
     
     # Data Paths 
     base_data_dir: Path = Path("data")

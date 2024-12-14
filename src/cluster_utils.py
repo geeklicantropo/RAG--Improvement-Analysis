@@ -15,7 +15,7 @@ from sklearn.metrics import (
 )
 import torch
 from experiment_logger import ExperimentLogger
-from utils import seed_everything
+from src.utils.file_utils import seed_everything
 import google.generativeai as genai
 import time
 
@@ -44,9 +44,8 @@ class DocumentClusterer:
         self.method = method
         self.batch_size = batch_size
         self.device = device
-        self.logger = logger or self._setup_logger()
+        self.logger = logger or ExperimentLogger("DocumentClusterer", "logs")
 
-        # Initialize Gemini
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-pro')
 
@@ -99,7 +98,6 @@ class DocumentClusterer:
             response = self.model.generate_content(prompt)
             coherence_score = float(response.text.strip())
             
-            # Calculate additional metrics
             avg_length = np.mean([len(d.get('text', '')) for d in cluster_docs])
             unique_terms = len(set(' '.join([d.get('text', '') for d in cluster_docs]).split()))
             
@@ -111,7 +109,7 @@ class DocumentClusterer:
             }
             
         except Exception as e:
-            self.logger.log_error(e, "Cluster evaluation failed")
+            self.logger.experiment_logger.error(f"Cluster evaluation failed: {str(e)}")
             return {"coherence_score": 0.0, "error": str(e)}
 
     def fit_clusters(
@@ -121,9 +119,7 @@ class DocumentClusterer:
         use_batches: bool = True
     ) -> Dict[int, List[int]]:
         try:
-            if self.logger:
-                self.logger.log_step_start("Fitting clusters")
-
+            self.logger.experiment_logger.info("Starting cluster fitting")
             self._initialize_clusterer()
 
             if use_batches and len(embeddings) > self.batch_size:
@@ -138,15 +134,13 @@ class DocumentClusterer:
                     document_ids if document_ids else range(len(embeddings))
                 )
 
-            if self.logger:
-                self.logger.log_step_end("Fitting clusters")
-                self._log_clustering_stats(clusters)
+            self.logger.experiment_logger.info("Cluster fitting completed")
+            self._log_clustering_stats(clusters)
 
             return clusters
 
         except Exception as e:
-            if self.logger:
-                self.logger.log_error(e, "Error during clustering")
+            self.logger.experiment_logger.error(f"Error during clustering: {str(e)}")
             raise
 
     def evaluate_clusters(self, embeddings: np.ndarray, noise_ratio: float = 0.0) -> Dict[str, float]:
@@ -154,7 +148,6 @@ class DocumentClusterer:
             if self.clusterer is None:
                 raise ValueError("Must fit clusters before evaluation")
 
-            # Add noise if specified
             if noise_ratio > 0:
                 embeddings = self._inject_noise(embeddings, noise_ratio)
 
@@ -172,7 +165,6 @@ class DocumentClusterer:
                     metrics["inertia"] = self.clusterer.inertia_
                 pbar.update(1)
 
-                # Additional cluster statistics
                 unique_labels = np.unique(labels)
                 metrics.update({
                     "num_clusters": len(unique_labels),
@@ -182,14 +174,12 @@ class DocumentClusterer:
                 pbar.update(1)
 
                 self.cluster_metrics = metrics
-                if self.logger:
-                    self.logger.log_metrics(metrics)
+                self.logger.log_metrics(metrics)
                 
             return metrics
 
         except Exception as e:
-            if self.logger:
-                self.logger.log_error(e, "Error evaluating clusters")
+            self.logger.experiment_logger.error(f"Error evaluating clusters: {str(e)}")
             raise
 
     def process_in_batches(
@@ -202,8 +192,7 @@ class DocumentClusterer:
             batch_size = self.batch_size
 
         try:
-            if self.logger:
-                self.logger.log_step_start("Processing in batches")
+            self.logger.experiment_logger.info("Starting batch processing")
 
             total_batches = (len(embeddings) + batch_size - 1) // batch_size
             all_labels = []
@@ -229,8 +218,7 @@ class DocumentClusterer:
             return clusters
 
         except Exception as e:
-            if self.logger:
-                self.logger.log_error(e, "Error in batch processing")
+            self.logger.experiment_logger.error(f"Error in batch processing: {str(e)}")
             raise
 
     def _labels_to_clusters(
@@ -279,12 +267,9 @@ class DocumentClusterer:
             "avg_cluster_size": np.mean([len(docs) for docs in clusters.values()]),
             "empty_clusters": self.num_clusters - len(clusters)
         }
-
-        if self.logger:
-            self.logger.log_metrics({"clustering_stats": stats})
+        self.logger.log_metrics({"clustering_stats": stats})
             
     def get_evaluation_summary(self) -> Dict[str, Any]:
-        """Get comprehensive evaluation summary"""
         if not self.cluster_metrics:
             return {"error": "No evaluation metrics available"}
             
@@ -298,3 +283,43 @@ class DocumentClusterer:
         }
         
         return summary
+
+def fit_clusters(
+    embeddings: np.ndarray, 
+    num_clusters: int, 
+    method: str = ClusteringMethod.KMEANS, 
+    random_seed: int = 42, 
+    use_scaler: bool = True,
+    min_cluster_size: int = 2,
+    batch_size: int = 1000,
+    api_key: Optional[str] = None
+) -> Dict[int, List[int]]:
+    if api_key is None:
+        api_key = os.getenv("GEMINI_TOKEN")
+        if not api_key:
+            raise ValueError("No API key provided for DocumentClusterer and GEMINI_TOKEN not set.")
+    
+    clusterer = DocumentClusterer(
+        api_key=api_key,
+        num_clusters=num_clusters,
+        random_seed=random_seed,
+        use_scaler=use_scaler,
+        min_cluster_size=min_cluster_size,
+        method=method,
+        batch_size=batch_size
+    )
+    
+    clusters = clusterer.fit_clusters(embeddings, use_batches=False)
+    return clusters
+
+def get_top_k_docs_from_cluster(
+    clusters: Dict[int, List[int]], 
+    doc_scores: Optional[Dict[int,float]] = None, 
+    k: int = 5
+) -> Dict[int, List[int]]:
+    top_docs = {}
+    for cid, docs in clusters.items():
+        if doc_scores:
+            docs = sorted(docs, key=lambda d: doc_scores.get(d, 0), reverse=True)
+        top_docs[cid] = docs[:k]
+    return top_docs

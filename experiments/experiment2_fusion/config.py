@@ -30,7 +30,13 @@ class FusionConfig:
     # Data paths
     base_data_dir: Path = Path("data")
     processed_dir: Path = base_data_dir / "processed"
+
+    # Memory thresholds
+    gpu_memory_threshold: float = 0.9
+    cpu_memory_threshold: float = 0.9
     
+    fusion_results_files: List[str] = field(default_factory=list)
+
     @property
     def contriever_results_path(self) -> Path:
         return self.base_data_dir / "contriever_search_results_at150.pkl"

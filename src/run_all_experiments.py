@@ -8,44 +8,35 @@ import warnings
 import logging
 from tqdm import tqdm
 import json
-import pandas as pd
+import numpy as np
 import torch
 import gc
 import argparse
 from collections import defaultdict
-import numpy as np
 
 # Ensure project root is in path
 project_root = Path(__file__).parent.parent
 sys.path.extend([str(project_root)])
 
-from experiments.experiment0_baseline.main import BaselineExperiment
-from experiments.experiment0_baseline.config import BaselineConfigFactory
-from experiments.plotting.plot_baseline import BaselinePlotter
+from src.utils.file_utils import clear_memory
+from experiments.experiment0_baseline.main import main as baseline_main
+from experiments.experiment1_clustering.main import main as clustering_main
+from experiments.experiment2_fusion.main import main as fusion_main
+from experiments.experiment3_categories.main import main as categories_main
 
-from experiments.experiment1_clustering.main import ClusteringExperiment 
-from experiments.experiment1_clustering.config import ClusteringConfig
-from experiments.plotting.plot_clustering import ClusteringPlotter
-
-from experiments.experiment2_fusion.main import FusionExperiment
-from experiments.experiment2_fusion.config import FusionConfigFactory
-from experiments.plotting.plot_fusion import FusionPlotter
-
-from experiments.experiment3_categories.main import CategoriesExperiment
-from experiments.experiment3_categories.config import CategoriesConfigFactory
-from experiments.plotting.plot_categories import CategoriesPlotter
-
-from src.utils.corpus_manager import CorpusManager  
 from src.setup_experiments import ExperimentSetup
 from src.experiment_logger import ExperimentLogger
 from src.llm import LLM
+from src.utils.corpus_manager import CorpusManager
+from experiments.checkpoint_utils import save_checkpoint, load_checkpoints, merge_checkpoint_results
 
-from experiments.checkpoint_utils import (
-    save_checkpoint,
-    load_checkpoints,
-    get_last_checkpoint_batch,
-    merge_checkpoint_results
-)
+# Plotters if needed
+from experiments.plotting.plot_baseline import BaselinePlotter
+from experiments.plotting.plot_clustering import ClusteringPlotter
+from experiments.plotting.plot_fusion import FusionPlotter
+from experiments.plotting.plot_categories import CategoriesPlotter
+from dotenv import load_dotenv
+load_dotenv() 
 
 class OutputController:
     """Controls and filters experiment output."""
@@ -136,25 +127,23 @@ class OutputController:
 
 class ExperimentPipeline:
     def __init__(self, base_output_dir: str = "experiments"):
+
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.base_output_dir = Path(base_output_dir)
         self.results_dir = self.base_output_dir / "results" / self.timestamp
         self.plots_dir = self.results_dir / "plots"
         self.setup = ExperimentSetup()
-        
-        # Initialize corpus manager
-        self.corpus_manager = CorpusManager(
-            base_corpus_path="data/processed/corpus_with_contriever_at150.json"
-        )
-        
-        # Initialize logger
+        self.corpus_manager = CorpusManager("data/processed/corpus_with_contriever_at150.json")
         self.logger = ExperimentLogger(
             experiment_name=f"experiment_pipeline_{self.timestamp}",
             base_log_dir="logs"
         )
         
-        # Initialize LLM evaluator
-        self.llm = LLM(api_key=os.getenv("GEMINI_TOKEN"))
+        # Initialize LLM with proper error handling
+        api_key = os.getenv("GEMINI_TOKEN")
+        if not api_key:
+            raise ValueError("GEMINI_TOKEN environment variable not found")
+        self.llm = LLM(api_key=api_key)
         
         self.output_controller = OutputController(self.logger)
         
@@ -166,398 +155,155 @@ class ExperimentPipeline:
         }
         
         self.plotting_enabled = True
+        self.plotter_mapping = {
+            'baseline': BaselinePlotter,
+            'clustering': ClusteringPlotter,
+            'fusion': FusionPlotter,
+            'categories': CategoriesPlotter
+        }
+
+    def _save_results(self, results: Dict[str, Any], output_dir: Path):
+        """
+        Save final experiment results to final_results.json.
+        Results should be a dictionary possibly with multiple scenarios.
+        """
+        final_path = output_dir / "final_results.json"
+        with open(final_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        self.logger.experiment_logger.info(f"Saved final results to {final_path}")
+
+    def _generate_plots(self, exp_type: str, results: Dict[str, Any]):
+        """Generate plots for the given experiment results if plotting is enabled."""
+        if self.plotting_enabled and exp_type in self.plotter_mapping:
+            exp_plot_dir = self.plots_dir / exp_type
+            exp_plot_dir.mkdir(parents=True, exist_ok=True)
+            plotter = self.plotter_mapping[exp_type](exp_plot_dir)
+            # The plot_results method expects a list of Dict. If results differ, adapt accordingly.
+            # If final_results are a dict with multiple scenarios, flatten if needed.
+            # Here we assume results is a dict of scenario -> list of records. Flatten all:
+            all_records = self._flatten_results(results)
+            plotter.plot_results(all_records)
+
+    def _flatten_results(self, results: Any) -> List[Dict]:
+        """
+        Flatten nested dictionaries of scenarios into a single list of result dictionaries.
+        """
+        if isinstance(results, list):
+            # If already a list of records
+            return results
+        if isinstance(results, dict):
+            # If a dict, recursively gather lists
+            combined = []
+            for v in results.values():
+                combined.extend(self._flatten_results(v))
+            return combined
+        return []
+
+    def _compute_metrics(self, results: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Compute basic metrics from final results if needed.
+        This is a simplified version: flatten and compute accuracy.
+        """
+        all_records = self._flatten_results(results)
+        correct = [r.get('llm_evaluation', {}).get('correct', False) for r in all_records]
+        scores = [r.get('llm_evaluation', {}).get('score', 0) for r in all_records]
+        total = len(all_records)
+        if total == 0:
+            return {'accuracy':0.0,'avg_score':0.0,'total_examples':0}
+        acc = sum(correct)/total
+        avg_score = float(np.mean(scores)) if scores else 0.0
+        return {
+            'accuracy': acc,
+            'avg_score': avg_score,
+            'total_examples': total
+        }
 
     def run_pipeline(self):
         with self.output_controller:
-            start_time = time.time()
             self.logger.log_step_start("Initializing experiment pipeline")
             
-            # Initialize corpus manager 
-            corpus_manager = CorpusManager(
-                base_corpus_path="data/processed/corpus_with_contriever_at150.json"
-            )
-            
-            # Perform setup
             if not self.setup.setup():
                 self.logger.log_error(None, "Setup failed")
                 return
 
-            # Create output directories
             self.results_dir.mkdir(parents=True, exist_ok=True)
             if self.plotting_enabled:
                 self.plots_dir.mkdir(parents=True, exist_ok=True)
 
-            results = {}
+            final_results = {}
             
-            # Run enabled experiments with corpus manager and LLM evaluator
-            for exp_type, enabled in self.enabled_experiments.items():
-                if enabled:
-                    exp_start = time.time()
-                    self.logger.log_step_start(f"Running {exp_type} experiments")
+            # Run experiments sequentially
+            experiment_order = ['baseline', 'clustering', 'fusion', 'categories']
+            
+            for exp_type in experiment_order:
+                if not self.enabled_experiments[exp_type]:
+                    continue
                     
-                    # Run experiment with LLM evaluator
-                    if exp_type == 'baseline':
-                        results[exp_type] = self.run_baseline_experiments(corpus_manager)
-                    elif exp_type == 'clustering':
-                        results[exp_type] = self.run_clustering_experiments(corpus_manager)
-                    elif exp_type == 'fusion':
-                        results[exp_type] = self.run_fusion_experiments()
-                    elif exp_type == 'categories':
-                        results[exp_type] = self.run_categories_experiments()
-                    
-                    # Load and merge checkpoints
-                    checkpoint_dir = self.results_dir / exp_type / "checkpoints"
-                    if checkpoint_dir.exists():
-                        checkpoint_results = load_checkpoints(checkpoint_dir)
-                        results[exp_type] = merge_checkpoint_results(checkpoint_results)
-                    
-                    # Evaluate results using LLM
-                    results[exp_type] = self._evaluate_results_with_llm(results[exp_type])
-                    
-                    # Save checkpoints
-                    save_checkpoint(
-                        results[exp_type],
-                        len(results[exp_type]),
-                        self.results_dir / exp_type
-                    )
-                    
+                self.logger.log_step_start(f"Running {exp_type} experiments")
+                
+                try:
+                    exp_results = self._run_experiment(exp_type)
+                    exp_dir = self.results_dir / exp_type
+                    exp_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Save final results
+                    self._save_results(exp_results, exp_dir)
+
                     # Generate plots if enabled
-                    if self.plotting_enabled:
-                        plotter_mapping = {
-                            'baseline': BaselinePlotter,
-                            'clustering': ClusteringPlotter,
-                            'fusion': FusionPlotter,
-                            'categories': CategoriesPlotter
-                        }
-                        plotter_class = plotter_mapping.get(exp_type)
-                        if plotter_class:
-                            plotter = plotter_class(self.results_dir)
-                            plotter.plot_results(results[exp_type])
-                    
-                    self.logger.log_step_end(f"Running {exp_type} experiments", exp_start)
-            
-            # Generate and save final report
-            self._generate_evaluation_report(results)
-            self.logger.log_step_end("Pipeline execution", start_time)
+                    self._generate_plots(exp_type, exp_results)
 
-    def _evaluate_results_with_llm(self, results: List[Dict]) -> List[Dict]:
-        evaluated_results = []
-        for result in tqdm(results, desc="Evaluating with LLM"):
-            eval_prompt = f"""
-            Question: {result['query']}
-            Generated Answer: {result['generated_answer']}
-            Gold Answer: {result['gold_answer']}
-            Context: {result.get('context', '')}
-
-            Evaluate the answer's correctness considering:
-            1. Factual accuracy compared to gold answer
-            2. Completeness of information
-            3. Context utilization
-            4. Semantic equivalence
-
-            Rate each aspect 0-100 and explain why.
-            """
-            eval_result = self.llm.evaluate_answer(
-                prompt=eval_prompt,
-                context=result.get('context'),
-                gold_answer=result['gold_answer']
-            )
-            result['evaluation'] = eval_result
-            evaluated_results.append(result)
-        return evaluated_results
-
-    def _generate_evaluation_report(self, all_results: Dict[str, List[Dict]]) -> None:
-        """Generate comprehensive evaluation report."""
-        report = {
-            'timestamp': self.timestamp,
-            'experiments': {}
-        }
-        
-        for exp_type, results in all_results.items():
-            exp_metrics = {
-                'accuracy': np.mean([r['llm_evaluation']['correct'] for r in results]),
-                'avg_score': np.mean([r['llm_evaluation']['score'] for r in results]),
-                'position_impact': self._analyze_position_impact(results),
-                'noise_impact': self._analyze_noise_impact(results)
-            }
-            report['experiments'][exp_type] = exp_metrics
-            
-        report_path = self.results_dir / f"evaluation_report_{self.timestamp}.json"
-        with open(report_path, 'w') as f:
-            json.dump(report, f, indent=2)
-
-    def _analyze_position_impact(self, results: List[Dict]) -> Dict:
-        position_metrics = defaultdict(list)
-        for result in results:
-            if 'gold_position' in result:
-                position_metrics[result['gold_position']].append(
-                    result['llm_evaluation']['score']
-                )
-        return {
-            pos: np.mean(scores) 
-            for pos, scores in position_metrics.items()
-        }
-        
-    def _analyze_noise_impact(self, results: List[Dict]) -> Dict:
-        noise_metrics = defaultdict(list)
-        for result in results:
-            if 'noise_ratio' in result:
-                noise_metrics[result['noise_ratio']].append(
-                    result['llm_evaluation']['score']
-                )
-        return {
-            ratio: np.mean(scores)
-            for ratio, scores in noise_metrics.items()
-        }
-
-    def run_baseline_experiments(self, corpus_manager: CorpusManager) -> List[Dict]:
-        """Run baseline experiments."""
-        configs = [
-            {
-                'command': f'{sys.executable} {project_root}/experiments/experiment0_baseline/main.py',
-                'args': {
-                    'retriever': 'contriever',
-                    'corpus_manager': corpus_manager,
-                    'llm_evaluator': self.llm,
-                    'gold_position': None,
-                    'num_documents': 7,
-                    'use_test': False
-                },
-                'description': 'Baseline-Contriever'
-            },
-            {
-                'command': f'{sys.executable} {project_root}/experiments/experiment0_baseline/main.py',
-                'args': {
-                    'retriever': 'bm25',
-                    'corpus_manager': corpus_manager,
-                    'llm_evaluator': self.llm,
-                    'gold_position': None,
-                    'num_documents': 7,
-                    'use_test': True
-                },
-                'description': 'Baseline-BM25'
-            },
-            {
-                'command': f'{sys.executable} {project_root}/experiments/experiment0_baseline/main.py',
-                'args': {
-                    'retriever': 'contriever',
-                    'corpus_manager': corpus_manager,
-                    'llm_evaluator': self.llm,
-                    'use_random': True,
-                    'num_documents': 7,
-                    'use_test': False
-                },
-                'description': 'Baseline-Random'
-            }
-        ]
-        return self.run_experiment_batch(configs, 'baseline')
-
-    def run_clustering_experiments(self, corpus_manager: CorpusManager) -> List[Dict]:
-        """Run clustering experiments."""
-        configs = [
-            {
-                'command': f'{sys.executable} {project_root}/experiments/experiment1_clustering/main.py',
-                'args': {
-                    'num_clusters': k,
-                    'corpus_manager': corpus_manager,
-                    'llm_evaluator': self.llm,
-                    'use_random': False,
-                    'compute_new_embeddings': True
-                },
-                'description': f'Clustering-{k}Clusters'
-            }
-            for k in [3, 5, 7]
-        ]
-        configs.append({
-            'command': f'{sys.executable} {project_root}/experiments/experiment1_clustering/main.py',
-            'args': {
-                'num_clusters': 5,
-                'corpus_manager': corpus_manager,
-                'llm_evaluator': self.llm,
-                'use_random': True,
-                'compute_new_embeddings': True
-            },
-            'description': 'Clustering-Random'
-        })
-        return self.run_experiment_batch(configs, 'clustering')
-
-    def run_fusion_experiments(self) -> List[Dict]:
-        """Run fusion experiments."""
-        configs = [
-            {
-                'command': f'{sys.executable} {project_root}/experiments/experiment2_fusion/main.py',
-                'args': {
-                    'strategy': strategy,
-                    'llm_evaluator': self.llm,
-                    'use_random': False
-                },
-                'description': f'Fusion-{strategy}'
-            }
-            for strategy in ['rrf', 'linear']
-        ]
-        configs.append({
-            'command': f'{sys.executable} {project_root}/experiments/experiment2_fusion/main.py',
-            'args': {
-                'strategy': 'rrf',
-                'llm_evaluator': self.llm,
-                'use_random': True
-            },
-            'description': 'Fusion-Random'
-        })
-        return self.run_experiment_batch(configs, 'fusion')
-
-    def run_categories_experiments(self) -> List[Dict]:
-        """Run categorization experiments."""
-        configs = [
-            {
-                'command': f'{sys.executable} {project_root}/experiments/experiment3_categories/main.py',
-                'args': {
-                    'config_type': config_type,
-                    'llm_evaluator': self.llm
-                },
-                'description': f'Categories-{config_type.capitalize()}'
-            }
-            for config_type in ['confidence', 'fusion', 'random']
-        ]
-        return self.run_experiment_batch(configs, 'categories')
-
-    def run_experiment_batch(self, configs: List[Dict], experiment_type: str) -> List[Dict]:
-        time.sleep(1)
-        """Run a batch of experiments of the same type."""
-        results = []
-        
-        for config in tqdm(configs, desc=f"Running {experiment_type} experiments"):
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    
-                # Reduce batch size if previous experiment failed
-                if results and not results[-1].get('success', False):
-                    config['args']['batch_size'] = max(1, config['args'].get('batch_size', 8) // 2)
-                    
-                output_dir = self.results_dir / experiment_type / config['description']
-                output_dir.mkdir(parents=True, exist_ok=True)
-                
-                experiment_args = config['args'].copy()
-                experiment_args['output_dir'] = str(output_dir)
-                
-                experiment_module = __import__(
-                    f"experiments.{self.experiment_dir_mapping[experiment_type]}.main",
-                    fromlist=['main']
-                )
-                experiment_results = experiment_module.main(experiment_args)
-                
-                if experiment_results:
-                    results_dict, metrics_dict = experiment_results
-                    result = self._process_experiment_results(
-                        config, metrics_dict, output_dir
-                    )
-                    results.append(result)
-                    
+                    # Compute basic metrics and log them
+                    metrics = self._compute_metrics(exp_results)
                     self.logger.experiment_logger.info(
-                        f"Completed {config['description']} with "
-                        f"accuracy: {metrics_dict.get('accuracy', 0):.4f}"
+                        f"Completed {exp_type} with accuracy: {metrics['accuracy']:.4f}, "
+                        f"avg_score: {metrics['avg_score']:.4f} over {metrics['total_examples']} examples"
                     )
-                    
-            except Exception as e:
-                self.logger.log_error(e, f"Error in {config['description']}")
-                results.append({
-                    'config': config,
-                    'error': str(e),
-                    'success': False
-                })
-                
-            # Save checkpoint after each experiment
-            checkpoint_path = output_dir / "checkpoints" / f"checkpoint_{len(results)}.json"
-            save_checkpoint(results, len(results), output_dir)
-                
-        return results
 
-    def _process_experiment_results(
-        self, 
-        config: Dict, 
-        metrics_dict: Dict, 
-        output_dir: Path
-    ) -> Dict:
-        """Process and save individual experiment results."""
-        result = {
-            'config': config,
-            'metrics': {
-                'accuracy': metrics_dict.get('accuracy', 0),
-                'total_examples': metrics_dict.get('total_examples', 0),
-                'avg_response_time': metrics_dict.get('avg_response_time', 0),
-                'avg_context_length': metrics_dict.get('avg_context_length', 0),
-                'description': config['description']
-            },
-            'output_dir': str(output_dir),
-            'success': True
-        }
-        
-        results_file = output_dir / 'experiment_results.json'
-        with open(results_file, 'w') as f:
-            json.dump(result, f, indent=2)
-            
-        self.logger.log_metric(
-            f"{config['description']}_accuracy",
-            metrics_dict.get('accuracy', 0)
-        )
-        
-        return result
+                    final_results[exp_type] = exp_results
+                    self.logger.log_step_end(f"{exp_type} experiments completed")
+                    
+                except Exception as e:
+                    self.logger.log_error(e, f"Error in {exp_type} experiment")
+                    continue
+                    
+                # Clear memory between experiments
+                clear_memory()
+
+            return final_results
+
+    def _run_experiment(self, exp_type: str) -> Dict[str, Any]:
+        """
+        Run a single experiment type by calling its main function.
+        Each main function should return a dict of final results.
+        """
+        if exp_type == 'baseline':
+            # Set default args for baseline
+            sys.argv = [sys.argv[0]]  # Reset any existing args
+            return baseline_main()
+        elif exp_type == 'clustering':
+            return clustering_main()
+        elif exp_type == 'fusion':
+            return fusion_main()
+        elif exp_type == 'categories':
+            return categories_main()
 
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run complete experiment pipeline")
    
-    # Directory configurations
-    parser.add_argument(
-        '--output_dir', 
-        type=str, 
-        default='experiments',
-        help='Base output directory'
-    )
-    parser.add_argument(
-        '--log_dir', 
-        type=str, 
-        default='logs',
-        help='Directory for experiment logs'
-    )
+    parser.add_argument('--output_dir', type=str, default='experiments', help='Base output directory')
+    parser.add_argument('--log_dir', type=str, default='logs', help='Directory for experiment logs')
    
-    # Experiment selection
-    parser.add_argument(
-        '--skip_baseline',
-        action='store_true',
-        help='Skip baseline experiments'
-    )
-    parser.add_argument(
-        '--skip_clustering',
-        action='store_true',
-        help='Skip clustering experiments'
-    )
-    parser.add_argument(
-        '--skip_fusion',
-        action='store_true',
-        help='Skip fusion experiments'
-    )
-    parser.add_argument(
-        '--skip_categories',
-        action='store_true',
-        help='Skip categories experiments'
-    )
+    parser.add_argument('--skip_baseline', action='store_true', help='Skip baseline experiments')
+    parser.add_argument('--skip_clustering', action='store_true', help='Skip clustering experiments')
+    parser.add_argument('--skip_fusion', action='store_true', help='Skip fusion experiments')
+    parser.add_argument('--skip_categories', action='store_true', help='Skip categories experiments')
    
-    # Visualization options
-    parser.add_argument(
-        '--save_plots',
-        type=str,
-        default='true',
-        help='Whether to generate plots (true/false)'
-    )
+    parser.add_argument('--save_plots', type=str, default='true', help='Whether to generate plots (true/false)')
    
-    args = parser.parse_args()
-    args.save_plots = args.save_plots.lower() == 'true'
-    return args
+    return parser.parse_args()
 
 def main():
-    """Main entry point for running all experiments."""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -574,12 +320,10 @@ def main():
             logging.error(f"Error loading global config: {str(e)}")
             raise
             
-        # Set GPU memory settings
         if torch.cuda.is_available():
             gpu_memory_threshold = global_config.get('gpu_memory_threshold', 0.9)
             torch.cuda.set_per_process_memory_fraction(gpu_memory_threshold)
             
-        # Create and configure pipeline
         pipeline = ExperimentPipeline(args.output_dir)
         
         experiments_to_run = {
@@ -590,16 +334,14 @@ def main():
         }
         
         pipeline.enabled_experiments = experiments_to_run
-        pipeline.plotting_enabled = args.save_plots
+        pipeline.plotting_enabled = (args.save_plots.lower() == 'true')
         
-        # Run pipeline
         pipeline.run_pipeline()
             
     except Exception as e:
         logging.error(f"Error in experiment pipeline: {str(e)}", exc_info=True)
         raise
     finally:
-        # Final cleanup
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()

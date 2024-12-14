@@ -6,14 +6,21 @@ from datetime import datetime
 import torch
 from tqdm import tqdm
 
-def _make_serializable(obj: Any) -> Any:
+def _make_serializable(obj: Any, depth: int = 0) -> Any:
+    if depth > 10:  # Prevent infinite recursion
+        return str(obj)
+        
     if torch.is_tensor(obj):
         return obj.tolist()
     elif isinstance(obj, dict):
-        return {k: _make_serializable(v) for k, v in obj.items()}
+        return {k: _make_serializable(v, depth + 1) for k, v in obj.items() if not k.startswith('_')}
     elif isinstance(obj, list):
-        return [_make_serializable(item) for item in obj]
-    return obj
+        return [_make_serializable(item, depth + 1) for item in obj]
+    elif hasattr(obj, 'to_dict'):
+        return obj.to_dict()
+    elif hasattr(obj, '__dict__'):
+        return {k: _make_serializable(v, depth + 1) for k, v in obj.__dict__.items() if not k.startswith('_')}
+    return str(obj) if not isinstance(obj, (int, float, str, bool, type(None))) else obj
 
 def save_checkpoint(results: List[Dict], batch_idx: int, output_dir: Path) -> None:
     checkpoint_dir = output_dir / "checkpoints"

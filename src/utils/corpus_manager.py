@@ -16,6 +16,39 @@ class CorpusManager:
         self.corpus_variants = {}
         self.logger = self._setup_logger()
         self.doc_cache = {}
+
+    def to_dict(self) -> Dict:
+        """Make CorpusManager JSON-serializable"""
+        return {
+            'base_corpus_path': str(self.base_corpus_path),
+            'cache_dir': str(self.cache_dir),
+            'corpus_variants': {k: len(v) if isinstance(v, (list, dict)) else str(v) 
+                            for k, v in self.corpus_variants.items()},
+            'doc_cache_size': len(self.doc_cache)
+        }
+
+    def __getstate__(self):
+        """Support for pickle serialization"""
+        state = self.__dict__.copy()
+        # Remove logger as it's not serializable
+        del state['logger']
+        return state
+
+    def __setstate__(self, state):
+        """Support for pickle deserialization"""
+        self.__dict__.update(state)
+        self.logger = self._setup_logger()
+
+    def get_baseline_corpus(self) -> List[Dict]:
+        """Get the base corpus for baseline experiments."""
+        return self._lazy_load_corpus()
+
+    def get_noisy_corpus(self, noise_ratio: float = 0.2, seed: int = 42) -> List[Dict]:
+        """Get corpus with injected noise documents."""
+        key = f'noisy_{noise_ratio}_{seed}'
+        if key not in self.corpus_variants:
+            self.corpus_variants[key] = self.add_noise_documents(noise_ratio, seed)
+        return self.corpus_variants[key]
         
     def _setup_logger(self):
         logger = logging.getLogger("CorpusManager")
@@ -31,29 +64,36 @@ class CorpusManager:
             batch_size = 1000
             self.base_corpus = []
             
-            with open(self.base_corpus_path) as f:
-                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    batch = []
-                    total_docs = mm.count(b'\n')
+            try:
+                with open(self.base_corpus_path) as f:
+                    # Count lines first for progress bar
+                    total_docs = sum(1 for _ in f)
+                    f.seek(0)
                     
-                    for line in tqdm(mm, total=total_docs, desc="Loading corpus"):
-                        try:
-                            if line.strip():
-                                doc = json.loads(line)
-                                batch.append(doc)
-                                
-                                if len(batch) >= batch_size:
-                                    self.base_corpus.extend(batch)
-                                    batch = []
-                                    gc.collect()
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        batch = []
+                        for line in tqdm(iter(mm.readline, b''), total=total_docs, desc="Loading corpus"):
+                            try:
+                                if line.strip():
+                                    doc = json.loads(line.decode())
+                                    batch.append(doc)
                                     
-                        except json.JSONDecodeError:
-                            self.logger.warning("Skipping invalid JSON line")
-                            continue
+                                    if len(batch) >= batch_size:
+                                        self.base_corpus.extend(batch)
+                                        batch = []
+                                        gc.collect()
+                                        
+                            except json.JSONDecodeError:
+                                self.logger.warning("Skipping invalid JSON line")
+                                continue
+                                
+                        if batch:
+                            self.base_corpus.extend(batch)
                             
-                    if batch:
-                        self.base_corpus.extend(batch)
-                        
+            except Exception as e:
+                self.logger.error(f"Error loading corpus: {str(e)}")
+                raise
+                
             self.logger.info(f"Loaded {len(self.base_corpus)} documents")
             
         return self.base_corpus
@@ -98,3 +138,24 @@ class CorpusManager:
     def clear_cache(self):
         self.doc_cache.clear()
         gc.collect()
+
+    def get_corpus(self) -> List[Dict]:
+        try:
+            with open(self.base_corpus_path) as f:
+                corpus = json.load(f)
+            self.logger.info(f"Loaded {len(corpus)} documents from {self.base_corpus_path}")
+            return corpus
+        except Exception as e:
+            self.logger.error(f"Error loading corpus: {str(e)}")
+            raise
+
+    def get_gold_documents(self) -> List[Dict]:
+        try:
+            gold_docs_path = Path(self.base_corpus_path).parent / "gold_documents.json"
+            with open(gold_docs_path) as f:
+                gold_docs = json.load(f)
+            self.logger.info(f"Loaded {len(gold_docs)} gold documents from {gold_docs_path}")
+            return gold_docs
+        except Exception as e:
+            self.logger.error(f"Error loading gold documents: {str(e)}")
+            raise

@@ -15,7 +15,7 @@ import nltk
 nltk.download('punkt', quiet=True)
 
 from retriever import Retriever, Encoder
-from utils import seed_everything, read_pickle, write_pickle
+from src.utils.file_utils import seed_everything, read_pickle, write_pickle
 from experiment_logger import ExperimentLogger
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"

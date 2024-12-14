@@ -102,19 +102,33 @@ def read_corpus_json(data_path: str, batch_size: int = 1000) -> List[Dict]:
     corpus = []
 
     try:
-        with open(data_path, "r") as f:
-            parser = ijson.items(f, "item")
+        with open(data_path, "rb") as f:
+            # Count total lines for progress bar
+            total_lines = sum(1 for _ in f)
+            f.seek(0)
+            
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             batch = []
 
-            for record in tqdm(parser, desc="Loading corpus in batches"):
-                batch.append(record)
-                if len(batch) >= batch_size:
-                    corpus.extend(batch)
-                    batch = []
-                    clear_memory()
+            for line in tqdm(mm, total=total_lines, desc="Loading corpus in batches"):
+                try:
+                    if line.strip():
+                        doc = json.loads(line)
+                        batch.append(doc)
+                        
+                        if len(batch) >= batch_size:
+                            corpus.extend(batch)
+                            batch = []
+                            clear_memory()
+
+                except json.JSONDecodeError:
+                    logger.warning("Skipping invalid JSON line")
+                    continue
 
             if batch:
                 corpus.extend(batch)
+                
+            mm.close()
 
         logger.info(f"Loaded {len(corpus)} documents.")
         return corpus

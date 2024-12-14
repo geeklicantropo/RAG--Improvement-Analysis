@@ -97,7 +97,15 @@ class ResultsTableGenerator:
         return pd.DataFrame(data)
 
     def _compute_metrics(self, results: List[Dict]) -> Dict[str, float]:
-        evals = [r['llm_evaluation'] for r in results]
+        evals = [r['llm_evaluation'] for r in results if 'llm_evaluation' in r]
+        if not evals:
+            return {
+                'accuracy': 0,
+                'accuracy_std': 0,
+                'avg_score': 0,
+                'score_std': 0,
+                'count': 0
+            }
         return {
             'accuracy': np.mean([e['correct'] for e in evals]),
             'accuracy_std': np.std([e['correct'] for e in evals]),

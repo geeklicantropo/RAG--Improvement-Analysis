@@ -1,175 +1,162 @@
 import logging
-import numpy as np
 from typing import Dict, List, Any, Optional
-from tqdm import tqdm
 from pathlib import Path
-
-from src.llm_evaluator import LLMEvaluator
-from src.experiment_logger import ExperimentLogger
+import numpy as np
+from scipy import stats
+from tqdm import tqdm
+import json
+import hashlib
 
 class ExperimentValidator:
-    def __init__(self, llm_evaluator: LLMEvaluator):
-        self.evaluator = llm_evaluator
+    def __init__(self, output_dir: str = "experiments/validation"):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.logger = self._setup_logger()
+        self.validation_cache = {}
 
     def _setup_logger(self) -> logging.Logger:
         logger = logging.getLogger("ExperimentValidator")
         logger.setLevel(logging.INFO)
         handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logger.addHandler(handler)
         return logger
 
-    def validate_results(
+    def validate_experiment(
         self,
         results: List[Dict],
-        experiment_config: Dict,
-        paper_baselines: Optional[Dict] = None
+        config: Dict,
+        experiment_type: str
     ) -> Dict[str, Any]:
-        validation_results = {
-            'statistical_validation': self._validate_statistics(results),
-            'methodology_validation': self._validate_methodology(results, experiment_config),
-            'reproducibility_validation': self._validate_reproducibility(results)
+        validations = {
+            'evaluation_consistency': self._validate_llm_evaluation(results),
+            'document_handling': self._validate_document_handling(results, config),
+            'statistical_validity': self._validate_statistics(results),
+            'methodology': self._validate_methodology(results, config)
         }
         
-        if paper_baselines:
-            validation_results['baseline_comparison'] = self._compare_to_baselines(results, paper_baselines)
-            
-        return validation_results
+        self._save_validation(validations, experiment_type)
+        return validations
 
-    def _validate_statistics(self, results: List[Dict]) -> Dict[str, bool]:
-        self.logger.info("Validating statistical significance")
-        validations = {}
+    def _validate_llm_evaluation(self, results: List[Dict]) -> Dict[str, bool]:
+        llm_validations = {}
         
-        try:
-            scores = [r.get('score', 0) for r in results]
-            sample_size = len(scores)
-            
-            validations.update({
-                'sufficient_sample_size': sample_size >= 100,
-                'normal_distribution': self._check_normality(scores),
-                'no_outliers': self._check_outliers(scores),
-                'significance_achieved': self._check_significance(scores)
-            })
-            
-            return validations
-        except Exception as e:
-            self.logger.error(f"Statistical validation error: {str(e)}")
-            return {'validation_error': str(e)}
-
-    def _validate_methodology(
-        self, 
-        results: List[Dict],
-        config: Dict
-    ) -> Dict[str, bool]:
-        self.logger.info("Validating methodology")
-        methodologies = {}
+        # Check evaluation presence
+        has_evaluations = all('llm_evaluation' in r for r in results)
+        llm_validations['complete_evaluations'] = has_evaluations
         
-        try:
-            methodologies.update({
-                'consistent_evaluation': self._check_evaluation_consistency(results),
-                'proper_noise_injection': self._check_noise_levels(results, config),
-                'position_testing': self._check_position_testing(results),
-                'proper_splits': self._check_data_splits(results)
-            })
+        if not has_evaluations:
+            return llm_validations
             
-            return methodologies
-        except Exception as e:
-            self.logger.error(f"Methodology validation error: {str(e)}")
-            return {'validation_error': str(e)}
-
-    def _validate_reproducibility(self, results: List[Dict]) -> Dict[str, bool]:
-        self.logger.info("Validating reproducibility")
-        checks = {}
+        # Check evaluation consistency
+        evaluations = [r['llm_evaluation'] for r in results]
+        required_fields = {'score', 'correct', 'reasoning'}
+        fields_present = all(
+            all(field in eval_dict for field in required_fields)
+            for eval_dict in evaluations
+        )
+        llm_validations['consistent_format'] = fields_present
         
-        try:
-            checks.update({
-                'seed_consistency': self._check_seed_consistency(results),
-                'deterministic_output': self._check_output_determinism(results),
-                'complete_metadata': self._check_metadata_completeness(results)
-            })
-            
-            return checks
-        except Exception as e:
-            self.logger.error(f"Reproducibility validation error: {str(e)}")
-            return {'validation_error': str(e)}
-
-    def _compare_to_baselines(
-        self,
-        results: List[Dict],
-        baselines: Dict[str, float]
-    ) -> Dict[str, Any]:
-        self.logger.info("Comparing to paper baselines")
-        comparisons = {}
+        # Check score ranges
+        scores = [e['score'] for e in evaluations]
+        llm_validations['valid_scores'] = all(0 <= s <= 1 for s in scores)
         
-        try:
-            current_metrics = self._compute_metrics(results)
-            
-            for metric, baseline in baselines.items():
-                if metric in current_metrics:
-                    diff = current_metrics[metric] - baseline
-                    comparisons[f'{metric}_diff'] = diff
-                    comparisons[f'{metric}_matches_paper'] = abs(diff) < 0.02
-                    
-            return comparisons
-        except Exception as e:
-            self.logger.error(f"Baseline comparison error: {str(e)}")
-            return {'comparison_error': str(e)}
-
-    def _check_normality(self, scores: List[float]) -> bool:
-        return len(scores) >= 30  # Central Limit Theorem approximation
-
-    def _check_outliers(self, scores: List[float], threshold: float = 3.0) -> bool:
-        z_scores = np.abs((scores - np.mean(scores)) / np.std(scores))
-        return np.sum(z_scores > threshold) / len(scores) < 0.01
-
-    def _check_significance(self, scores: List[float], p_threshold: float = 0.01) -> bool:
-        from scipy import stats
-        _, p_value = stats.ttest_1samp(scores, 0)
-        return p_value < p_threshold
-
-    def _check_evaluation_consistency(self, results: List[Dict]) -> bool:
-        return all('evaluation' in r for r in results)
-
-    def _check_noise_levels(self, results: List[Dict], config: Dict) -> bool:
-        expected_levels = config.get('noise_ratios', [])
-        actual_levels = {r.get('noise_ratio') for r in results if 'noise_ratio' in r}
-        return all(level in actual_levels for level in expected_levels)
-
-    def _check_position_testing(self, results: List[Dict]) -> bool:
-        positions_tested = {'near', 'mid', 'far'}
-        actual_positions = {r.get('position') for r in results if 'position' in r}
-        return positions_tested.issubset(actual_positions)
-
-    def _check_data_splits(self, results: List[Dict]) -> bool:
-        splits = {r.get('split') for r in results if 'split' in r}
-        return {'train', 'test'}.issubset(splits)
-
-    def _compute_metrics(self, results: List[Dict]) -> Dict[str, float]:
-        metrics = {}
-        correct = sum(1 for r in results if r.get('correct', False))
-        metrics['accuracy'] = correct / len(results)
+        # Check reasoning presence
+        has_reasoning = all(len(str(e.get('reasoning', ''))) > 0 for e in evaluations)
+        llm_validations['has_reasoning'] = has_reasoning
         
-        if all('score' in r for r in results):
-            metrics['avg_score'] = np.mean([r['score'] for r in results])
+        return llm_validations
+
+    def _validate_document_handling(self, results: List[Dict], config: Dict) -> Dict[str, bool]:
+        doc_validations = {}
+        
+        # Check category distribution
+        if 'category' in results[0]:
+            categories = [r['category'] for r in results]
+            unique_cats = set(categories)
+            expected_cats = {'gold', 'distracting', 'random'}
+            doc_validations['correct_categories'] = expected_cats.issubset(unique_cats)
             
-        return metrics
+            # Check category balance
+            cat_counts = {cat: categories.count(cat) for cat in unique_cats}
+            max_imbalance = config.get('max_category_imbalance', 2.0)
+            doc_validations['balanced_categories'] = (
+                max(cat_counts.values()) / min(cat_counts.values()) <= max_imbalance
+            )
+            
+        # Check position tracking
+        if 'position' in results[0]:
+            positions = [r['position'] for r in results]
+            doc_validations['position_tracked'] = len(set(positions)) > 1
+            
+        # Check noise injection
+        if 'noise_ratio' in results[0]:
+            noise_ratios = [r['noise_ratio'] for r in results]
+            expected_ratios = config.get('noise_ratios', [0.0, 0.1, 0.2])
+            doc_validations['correct_noise_levels'] = all(r in expected_ratios for r in noise_ratios)
+            
+        return doc_validations
 
-    def _check_seed_consistency(self, results: List[Dict]) -> bool:
-        seeds = {r.get('seed') for r in results if 'seed' in r}
-        return len(seeds) == 1 if seeds else False
+    def _validate_statistics(self, results: List[Dict]) -> Dict[str, Any]:
+        scores = [r.get('llm_evaluation', {}).get('score', 0) for r in results]
+        
+        stats_validation = {
+            'sample_size': len(results),
+            'sufficient_samples': len(results) >= 100,
+        }
+        
+        if len(scores) > 1:
+            # Normality test
+            _, p_value = stats.normaltest(scores)
+            stats_validation['normal_distribution'] = p_value > 0.05
+            
+            # Effect size
+            effect_size = np.mean(scores) / np.std(scores) if np.std(scores) > 0 else 0
+            stats_validation['significant_effect'] = abs(effect_size) > 0.3
+            
+            # Score distribution
+            stats_validation['score_distribution'] = {
+                'mean': np.mean(scores),
+                'std': np.std(scores),
+                'min': np.min(scores),
+                'max': np.max(scores)
+            }
+            
+        return stats_validation
 
-    def _check_output_determinism(self, results: List[Dict]) -> bool:
-        # Check if identical inputs produce identical outputs
-        output_map = {}
-        for r in results:
-            input_key = f"{r.get('query')}_{r.get('context')}"
-            output = r.get('generated_answer')
-            if input_key in output_map and output_map[input_key] != output:
+    def _validate_methodology(self, results: List[Dict], config: Dict) -> Dict[str, bool]:
+        methodology_checks = {}
+        
+        # Check experiment conditions
+        methodology_checks['consistent_conditions'] = self._check_experimental_conditions(results, config)
+        
+        # Check data splits
+        if 'split' in results[0]:
+            splits = set(r['split'] for r in results)
+            methodology_checks['proper_splits'] = {'train', 'test'}.issubset(splits)
+            
+        # Check randomization
+        if 'random_seed' in config:
+            methodology_checks['controlled_randomization'] = True
+            
+        # Check evaluation independence
+        evaluation_hashes = [
+            hashlib.md5(str(r.get('llm_evaluation')).encode()).hexdigest()
+            for r in results
+        ]
+        methodology_checks['independent_evaluations'] = len(set(evaluation_hashes)) > len(results) * 0.9
+        
+        return methodology_checks
+
+    def _check_experimental_conditions(self, results: List[Dict], config: Dict) -> bool:
+        required_conditions = config.get('required_conditions', [])
+        for condition in required_conditions:
+            if condition not in results[0]:
                 return False
-            output_map[input_key] = output
         return True
 
-    def _check_metadata_completeness(self, results: List[Dict]) -> bool:
-        required_fields = {'query', 'generated_answer', 'gold_answer', 'timestamp'}
-        return all(all(field in r for field in required_fields) for r in results)
+    def _save_validation(self, validations: Dict[str, Any], experiment_type: str) -> None:
+        output_file = self.output_dir / f"{experiment_type}_validation.json"
+        with open(output_file, 'w') as f:
+            json.dump(validations, f, indent=2)
+        self.logger.info(f"Saved validation results to {output_file}")

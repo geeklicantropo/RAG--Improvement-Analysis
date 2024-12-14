@@ -4,7 +4,9 @@ import warnings
 import torch
 from transformers import AutoTokenizer, AutoConfig
 from retriever import Retriever
-from utils import read_corpus_json, str2bool, read_json
+#from utils import read_corpus_json, str2bool, read_json
+from src.utils.file_utils import read_corpus_json, str2bool, read_json
+
 from experiment_logger import ExperimentLogger
 import time
 import gc

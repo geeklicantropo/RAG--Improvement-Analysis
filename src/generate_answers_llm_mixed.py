@@ -12,7 +12,6 @@ from llm import LLM
 from utils import *
 from prompt_dataset import MixedDocumentsDataset
 
-
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
 warnings.filterwarnings('ignore')

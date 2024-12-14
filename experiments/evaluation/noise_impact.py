@@ -1,139 +1,98 @@
 import logging
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from tqdm import tqdm
-from collections import defaultdict
 import numpy as np
+from collections import defaultdict
+import time
 
 from src.llm_evaluator import LLMEvaluator
-from src.experiment_logger import ExperimentLogger
 
 class NoiseImpactAnalyzer:
     def __init__(self, llm_evaluator: LLMEvaluator):
         self.evaluator = llm_evaluator
-        self.logger = self._setup_logger()
-
-    def _setup_logger(self) -> logging.Logger:
-        logger = logging.getLogger("NoiseImpactAnalyzer")
-        logger.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger("NoiseImpactAnalyzer")
+        self.logger.setLevel(logging.INFO)
+        self.logger.addHandler(logging.StreamHandler())
         
-        handler = logging.StreamHandler()
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        
-        return logger
-
-    def run_noise_analysis(
+    def analyze_noise_impact(
         self,
         results: List[Dict],
-        noise_ratios: List[float]
+        noise_levels: Optional[List[float]] = None
     ) -> Dict[str, Any]:
-        """Run comprehensive noise impact analysis."""
-        self.logger.info("Starting noise impact analysis")
+        if not noise_levels:
+            noise_levels = [0.0, 0.1, 0.2, 0.3]
+            
+        metrics = {}
+        baseline = None
         
-        metrics = defaultdict(lambda: defaultdict(list))
-        
-        for result in tqdm(results, desc="Analyzing noise impact"):
-            noise_ratio = result.get('noise_ratio', 0.0)
-            if noise_ratio not in noise_ratios:
+        for noise in tqdm(noise_levels, desc="Analyzing noise impact"):
+            noise_results = [r for r in results if r.get('noise_ratio', 0.0) == noise]
+            
+            if not noise_results:
                 continue
                 
-            eval_result = self.evaluator.evaluate_answer(
-                result['query'],
-                result['generated_answer'],
-                result['gold_answer']
-            )
+            metrics[f'noise_{noise}'] = self._compute_noise_metrics(noise_results)
             
-            metrics[noise_ratio]['scores'].append(eval_result['score'])
-            metrics[noise_ratio]['correct'].append(eval_result['correct'])
-            
-            if 'response_time' in result:
-                metrics[noise_ratio]['response_times'].append(result['response_time'])
-                
-            if 'context_length' in result:
-                metrics[noise_ratio]['context_lengths'].append(result['context_length'])
-
-        return self._compute_noise_metrics(metrics)
-
-    def _compute_noise_metrics(
-        self,
-        raw_metrics: Dict[float, Dict[str, List[Any]]]
-    ) -> Dict[str, Any]:
-        """Compute statistical metrics for noise analysis."""
-        processed_metrics = {}
-        
-        for noise_ratio, metrics in raw_metrics.items():
-            ratio_metrics = {
-                'accuracy': sum(metrics['correct']) / len(metrics['correct']),
-                'avg_score': sum(metrics['scores']) / len(metrics['scores']),
-                'score_std': np.std(metrics['scores']),
-                'num_samples': len(metrics['correct'])
-            }
-            
-            if 'response_times' in metrics:
-                ratio_metrics.update({
-                    'avg_response_time': sum(metrics['response_times']) / len(metrics['response_times']),
-                    'response_time_std': np.std(metrics['response_times'])
-                })
-                
-            if 'context_lengths' in metrics:
-                ratio_metrics.update({
-                    'avg_context_length': sum(metrics['context_lengths']) / len(metrics['context_lengths']),
-                    'context_length_std': np.std(metrics['context_lengths'])
-                })
-                
-            processed_metrics[f'noise_{noise_ratio}'] = ratio_metrics
-
-        # Compute relative degradation
-        if 0.0 in raw_metrics:
-            base_accuracy = sum(raw_metrics[0.0]['correct']) / len(raw_metrics[0.0]['correct'])
-            base_score = sum(raw_metrics[0.0]['scores']) / len(raw_metrics[0.0]['scores'])
-            
-            for noise_ratio in raw_metrics.keys():
-                if noise_ratio == 0.0:
-                    continue
-                    
-                curr_accuracy = sum(raw_metrics[noise_ratio]['correct']) / len(raw_metrics[noise_ratio]['correct'])
-                curr_score = sum(raw_metrics[noise_ratio]['scores']) / len(raw_metrics[noise_ratio]['scores'])
-                
-                degradation_metrics = {
-                    'accuracy_degradation': base_accuracy - curr_accuracy,
-                    'score_degradation': base_score - curr_score,
-                    'relative_accuracy_change': (base_accuracy - curr_accuracy) / base_accuracy,
-                    'relative_score_change': (base_score - curr_score) / base_score
+            if noise == 0.0:
+                baseline = metrics[f'noise_{noise}']
+            elif baseline:
+                metrics[f'noise_{noise}']['degradation'] = {
+                    'accuracy': baseline['accuracy'] - metrics[f'noise_{noise}']['accuracy'],
+                    'score': baseline['avg_score'] - metrics[f'noise_{noise}']['avg_score']
                 }
                 
-                processed_metrics[f'noise_{noise_ratio}'].update(degradation_metrics)
-
-        return processed_metrics
-
-    def analyze_noise_types(
-        self,
-        results: List[Dict]
-    ) -> Dict[str, Any]:
-        """Analyze impact of different noise types."""
-        self.logger.info("Analyzing noise types")
+        return metrics
         
-        type_metrics = defaultdict(lambda: defaultdict(list))
+    def _compute_noise_metrics(self, results: List[Dict]) -> Dict[str, float]:
+        evals = [r['llm_evaluation'] for r in results if 'llm_evaluation' in r]
         
-        for result in tqdm(results, desc="Analyzing noise types"):
-            noise_type = result.get('noise_type', 'unknown')
-            
-            eval_result = self.evaluator.evaluate_answer(
-                result['query'],
-                result['generated_answer'],
-                result['gold_answer']
-            )
-            
-            type_metrics[noise_type]['scores'].append(eval_result['score'])
-            type_metrics[noise_type]['correct'].append(eval_result['correct'])
-
         return {
-            noise_type: {
-                'accuracy': sum(metrics['correct']) / len(metrics['correct']),
-                'avg_score': sum(metrics['scores']) / len(metrics['scores']),
-                'score_std': np.std(metrics['scores']),
-                'num_samples': len(metrics['correct'])
-            }
-            for noise_type, metrics in type_metrics.items()
+            'accuracy': np.mean([e['correct'] for e in evals]),
+            'avg_score': np.mean([e['score'] for e in evals]),
+            'score_std': np.std([e['score'] for e in evals]),
+            'count': len(results)
         }
+
+    def evaluate_noise_types(self, results: List[Dict]) -> Dict[str, Dict[str, float]]:
+        noise_types = defaultdict(list)
+        
+        for result in results:
+            if 'noise_type' in result:
+                noise_types[result['noise_type']].append(result)
+                
+        evaluations = {}
+        for noise_type, type_results in noise_types.items():
+            metrics = self._compute_noise_metrics(type_results)
+            
+            # Evaluate impact on answer quality
+            scores = []
+            for r in type_results:
+                eval_result = self.evaluator.evaluate_answer(
+                    r['query'],
+                    r['generated_answer'],
+                    r['gold_answer']
+                )
+                scores.append(eval_result['score'])
+                time.sleep(0.1)  # Rate limiting
+                
+            evaluations[noise_type] = {
+                **metrics,
+                'llm_score': np.mean(scores),
+                'llm_score_std': np.std(scores)
+            }
+            
+        return evaluations
+
+    def analyze_position_impact(self, results: List[Dict]) -> Dict[str, Dict[str, float]]:
+        position_metrics = defaultdict(list)
+        
+        for result in results:
+            if 'position' in result and 'noise_ratio' in result:
+                position_metrics[(result['position'], result['noise_ratio'])].append(result)
+                
+        analysis = {}
+        for (pos, noise), pos_results in position_metrics.items():
+            metrics = self._compute_noise_metrics(pos_results)
+            analysis[f'pos_{pos}_noise_{noise}'] = metrics
+            
+        return analysis

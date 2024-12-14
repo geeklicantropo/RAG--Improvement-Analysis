@@ -1,206 +1,272 @@
 import logging
 from typing import Dict, List, Any, Optional
-from tqdm import tqdm
 from collections import defaultdict
 import numpy as np
 from pathlib import Path
-
-from src.llm_evaluator import LLMEvaluator
-from src.experiment_logger import ExperimentLogger
+from scipy import stats
+from tqdm import tqdm
+import json
 
 class MetricsCollector:
-    def __init__(self, llm_evaluator: LLMEvaluator):
-        self.evaluator = llm_evaluator
+    def __init__(self, output_dir: str = "experiments/metrics"):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.logger = self._setup_logger()
         self.metrics = defaultdict(dict)
 
     def _setup_logger(self) -> logging.Logger:
         logger = logging.getLogger("MetricsCollector")
         logger.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        
         handler = logging.StreamHandler()
-        handler.setFormatter(formatter)
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logger.addHandler(handler)
-        
         return logger
 
     def collect_metrics(
         self,
         results: List[Dict],
         experiment_type: str,
-        configurations: Optional[Dict] = None
+        include_confidence: bool = True
     ) -> Dict[str, Any]:
-        """Collect comprehensive metrics for experiment results."""
-        self.logger.info(f"Collecting metrics for {experiment_type}")
+        """
+        Collect and compute all metrics from a list of result dictionaries.
+        
+        Each result is expected to have:
+          {
+            'query': str,
+            'generated_answer': str,
+            'llm_evaluation': {'correct': bool, 'score': float, ...},
+            'document_indices': [...],
+            'document_categories': [...],
+            'document_positions': [...],
+            'example_id': ...,
+            'gold_answer': str,
+            'category': optional per-document category,
+            'position': optional per-document position,
+            'noise_ratio': optional float for noise experiments,
+            'mode': optional scenario mode like 'gold_only','gold_random','gold_distractor',
+            'combination_type': optional scenario combination like 'gold+random+distractor'
+          }
+
+        Args:
+            results (List[Dict]): The experiment results.
+            experiment_type (str): Name of the experiment to name the output metrics file.
+            include_confidence (bool): Whether to compute confidence intervals.
+
+        Returns:
+            Dict[str, Any]: A dictionary of computed metrics.
+        """
+        metrics = {}
         
         # Base metrics
-        metrics = self._compute_base_metrics(results)
+        metrics.update(self._compute_base_metrics(results))
         
-        # Position-specific metrics
-        if self._has_position_data(results):
-            metrics.update(self._compute_position_metrics(results))
+        # Category metrics if category available
+        if any('category' in r for r in results):
+            metrics['category_metrics'] = self._compute_category_metrics(results)
             
-        # Category-specific metrics
-        if self._has_category_data(results):
-            metrics.update(self._compute_category_metrics(results))
+        # Position metrics if position available
+        if any('position' in r for r in results):
+            metrics['position_metrics'] = self._compute_position_metrics(results)
             
-        # Noise impact metrics
-        if self._has_noise_data(results):
-            metrics.update(self._compute_noise_metrics(results))
-            
-        # Configuration-specific metrics
-        if configurations:
-            metrics.update(self._compute_config_metrics(results, configurations))
-            
+        # Noise metrics if noise_ratio available
+        if any('noise_ratio' in r for r in results):
+            metrics['noise_metrics'] = self._compute_noise_metrics(results)
+
+        # Mode metrics if mode available
+        if any('mode' in r for r in results):
+            metrics['mode_metrics'] = self._compute_mode_metrics(results)
+
+        # Combination metrics if combination_type available
+        if any('combination_type' in r for r in results):
+            metrics['combination_metrics'] = self._compute_combination_metrics(results)
+
+        # Statistical metrics
+        metrics['statistical_metrics'] = self._compute_statistical_metrics(results)
+
+        # Confidence intervals
+        if include_confidence:
+            metrics['confidence_intervals'] = self._compute_confidence_intervals(results)
+
+        self._save_metrics(metrics, experiment_type)
         return metrics
 
     def _compute_base_metrics(self, results: List[Dict]) -> Dict[str, float]:
-        """Compute basic performance metrics."""
-        base_metrics = defaultdict(list)
+        if not results:
+            return {'accuracy': 0.0, 'avg_score': 0.0, 'score_std': 0.0, 'sample_size': 0}
         
-        for result in tqdm(results, desc="Computing base metrics"):
-            eval_result = self.evaluator.evaluate_answer(
-                result['query'],
-                result['generated_answer'],
-                result['gold_answer']
-            )
-            
-            base_metrics['scores'].append(eval_result['score'])
-            base_metrics['correct'].append(eval_result['correct'])
-            
-            if 'response_time' in result:
-                base_metrics['response_times'].append(result['response_time'])
-                
-            if 'context_length' in result:
-                base_metrics['context_lengths'].append(result['context_length'])
-
-        return {
-            'accuracy': sum(base_metrics['correct']) / len(base_metrics['correct']),
-            'avg_score': np.mean(base_metrics['scores']),
-            'score_std': np.std(base_metrics['scores']),
-            'avg_response_time': np.mean(base_metrics['response_times']) if 'response_times' in base_metrics else None,
-            'avg_context_length': np.mean(base_metrics['context_lengths']) if 'context_lengths' in base_metrics else None
-        }
-
-    def _compute_position_metrics(self, results: List[Dict]) -> Dict[str, Dict[str, float]]:
-        """Compute position-specific metrics."""
-        position_metrics = defaultdict(lambda: defaultdict(list))
+        llm_evals = [r.get('llm_evaluation', {}) for r in results]
+        scores = [e.get('score', 0) for e in llm_evals]
+        correct = [e.get('correct', False) for e in llm_evals]
         
-        for result in tqdm(results, desc="Computing position metrics"):
-            position = result.get('gold_position', 'unknown')
-            eval_result = self.evaluator.evaluate_answer(
-                result['query'],
-                result['generated_answer'],
-                result['gold_answer']
-            )
-            
-            position_metrics[position]['scores'].append(eval_result['score'])
-            position_metrics[position]['correct'].append(eval_result['correct'])
-
         return {
-            f'position_{pos}': {
-                'accuracy': sum(metrics['correct']) / len(metrics['correct']),
-                'avg_score': np.mean(metrics['scores']),
-                'score_std': np.std(metrics['scores'])
-            }
-            for pos, metrics in position_metrics.items()
+            'accuracy': float(np.mean(correct)) if correct else 0.0,
+            'avg_score': float(np.mean(scores)) if scores else 0.0,
+            'score_std': float(np.std(scores)) if scores else 0.0,
+            'sample_size': len(results)
         }
 
     def _compute_category_metrics(self, results: List[Dict]) -> Dict[str, Dict[str, float]]:
-        """Compute category-specific metrics."""
-        category_metrics = defaultdict(lambda: defaultdict(list))
+        categories = defaultdict(list)
         
-        for result in tqdm(results, desc="Computing category metrics"):
-            category = result.get('category', 'unknown')
-            eval_result = self.evaluator.evaluate_answer(
-                result['query'],
-                result['generated_answer'],
-                result['gold_answer']
-            )
-            
-            category_metrics[category]['scores'].append(eval_result['score'])
-            category_metrics[category]['correct'].append(eval_result['correct'])
-
-        return {
-            f'category_{cat}': {
-                'accuracy': sum(metrics['correct']) / len(metrics['correct']),
-                'avg_score': np.mean(metrics['scores']),
-                'score_std': np.std(metrics['scores'])
+        for result in results:
+            cat_list = result.get('document_categories')
+            llm_eval = result.get('llm_evaluation', {})
+            # If multiple docs per result have categories, we aggregate them.
+            # If 'category' is not per-result but per-doc, we can handle it differently.
+            # We assume per result we already have doc categories as a list.
+            if cat_list:
+                # Average correctness for this result
+                c = llm_eval.get('correct', False)
+                s = llm_eval.get('score', 0)
+                for cat in cat_list:
+                    categories[cat].append({'score': s, 'correct': c})
+        
+        cat_metrics = {}
+        for cat, cat_results in categories.items():
+            correct_vals = [r['correct'] for r in cat_results]
+            scores = [r['score'] for r in cat_results]
+            cat_metrics[cat] = {
+                'accuracy': float(np.mean(correct_vals)) if correct_vals else 0.0,
+                'avg_score': float(np.mean(scores)) if scores else 0.0,
+                'sample_size': len(cat_results)
             }
-            for cat, metrics in category_metrics.items()
-        }
+
+        return cat_metrics
+
+    def _compute_position_metrics(self, results: List[Dict]) -> Dict[str, Dict[str, float]]:
+        positions = defaultdict(list)
+        
+        for result in results:
+            pos_list = result.get('document_positions')
+            llm_eval = result.get('llm_evaluation', {})
+            c = llm_eval.get('correct', False)
+            s = llm_eval.get('score', 0)
+            if pos_list:
+                # Each doc has a position (near, mid, far).
+                # We'll aggregate by all positions present in this result.
+                for p in pos_list:
+                    positions[p].append({'score': s, 'correct': c})
+                
+        pos_metrics = {}
+        for p, pos_results in positions.items():
+            correct_vals = [r['correct'] for r in pos_results]
+            scores = [r['score'] for r in pos_results]
+            pos_metrics[p] = {
+                'accuracy': float(np.mean(correct_vals)) if correct_vals else 0.0,
+                'avg_score': float(np.mean(scores)) if scores else 0.0,
+                'sample_size': len(pos_results)
+            }
+
+        return pos_metrics
 
     def _compute_noise_metrics(self, results: List[Dict]) -> Dict[str, Dict[str, float]]:
-        """Compute noise-related metrics."""
-        noise_metrics = defaultdict(lambda: defaultdict(list))
+        noise_levels = defaultdict(list)
         
-        for result in tqdm(results, desc="Computing noise metrics"):
-            noise_ratio = result.get('noise_ratio', 0.0)
-            eval_result = self.evaluator.evaluate_answer(
-                result['query'],
-                result['generated_answer'],
-                result['gold_answer']
-            )
-            
-            noise_metrics[noise_ratio]['scores'].append(eval_result['score'])
-            noise_metrics[noise_ratio]['correct'].append(eval_result['correct'])
+        for result in results:
+            llm_eval = result.get('llm_evaluation', {})
+            c = llm_eval.get('correct', False)
+            s = llm_eval.get('score', 0)
+            nl = result.get('noise_ratio', None)
+            if nl is not None:
+                noise_levels[nl].append({'score': s, 'correct': c})
 
         metrics = {}
-        baseline_accuracy = None
+        baseline = noise_levels.get(0.0, [])
+        baseline_acc = float(np.mean([r['correct'] for r in baseline])) if baseline else 0
         
-        for ratio, data in noise_metrics.items():
-            accuracy = sum(data['correct']) / len(data['correct'])
-            if ratio == 0.0:
-                baseline_accuracy = accuracy
-                
-            metrics[f'noise_{ratio}'] = {
+        for noise_ratio, noise_results in noise_levels.items():
+            correct_vals = [r['correct'] for r in noise_results]
+            scores = [r['score'] for r in noise_results]
+            accuracy = float(np.mean(correct_vals)) if correct_vals else 0.0
+            metrics[f'noise_{noise_ratio}'] = {
                 'accuracy': accuracy,
-                'avg_score': np.mean(data['scores']),
-                'score_std': np.std(data['scores'])
+                'avg_score': float(np.mean(scores)) if scores else 0.0,
+                'degradation': baseline_acc - accuracy if noise_ratio > 0 else 0.0,
+                'sample_size': len(noise_results)
             }
             
-            if baseline_accuracy and ratio > 0:
-                metrics[f'noise_{ratio}']['degradation'] = baseline_accuracy - accuracy
-                
         return metrics
 
-    def _compute_config_metrics(
-        self,
-        results: List[Dict],
-        configurations: Dict[str, Any]
-    ) -> Dict[str, Dict[str, float]]:
-        """Compute configuration-specific metrics."""
-        config_metrics = defaultdict(lambda: defaultdict(list))
-        
-        for result in tqdm(results, desc="Computing configuration metrics"):
-            config_id = result.get('config_id')
-            if not config_id or config_id not in configurations:
-                continue
-                
-            eval_result = self.evaluator.evaluate_answer(
-                result['query'],
-                result['generated_answer'],
-                result['gold_answer']
-            )
-            
-            config_metrics[config_id]['scores'].append(eval_result['score'])
-            config_metrics[config_id]['correct'].append(eval_result['correct'])
+    def _compute_mode_metrics(self, results: List[Dict]) -> Dict[str, Dict[str, float]]:
+        mode_map = defaultdict(lambda: {'correct': 0, 'total': 0, 'scores': []})
+        for r in results:
+            llm_eval = r.get('llm_evaluation', {})
+            c = llm_eval.get('correct', False)
+            s = llm_eval.get('score', 0)
+            m = r.get('mode')
+            if m is not None:
+                mode_map[m]['total'] += 1
+                if c:
+                    mode_map[m]['correct'] += 1
+                mode_map[m]['scores'].append(s)
 
-        return {
-            f'config_{cfg_id}': {
-                'accuracy': sum(metrics['correct']) / len(metrics['correct']),
-                'avg_score': np.mean(metrics['scores']),
-                'score_std': np.std(metrics['scores'])
+        mode_metrics = {}
+        for m, stats in mode_map.items():
+            acc = stats['correct'] / stats['total'] if stats['total'] > 0 else 0.0
+            avg_s = float(np.mean(stats['scores'])) if stats['scores'] else 0.0
+            mode_metrics[m] = {
+                'accuracy': acc,
+                'avg_score': avg_s,
+                'sample_size': stats['total']
             }
-            for cfg_id, metrics in config_metrics.items()
+        return mode_metrics
+
+    def _compute_combination_metrics(self, results: List[Dict]) -> Dict[str, Dict[str, float]]:
+        combo_map = defaultdict(lambda: {'correct': 0, 'total': 0, 'scores': []})
+        for r in results:
+            llm_eval = r.get('llm_evaluation', {})
+            c = llm_eval.get('correct', False)
+            s = llm_eval.get('score', 0)
+            ct = r.get('combination_type')
+            if ct is not None:
+                combo_map[ct]['total'] += 1
+                if c:
+                    combo_map[ct]['correct'] += 1
+                combo_map[ct]['scores'].append(s)
+
+        combo_metrics = {}
+        for ct, stats in combo_map.items():
+            acc = stats['correct'] / stats['total'] if stats['total'] > 0 else 0.0
+            avg_s = float(np.mean(stats['scores'])) if stats['scores'] else 0.0
+            combo_metrics[ct] = {
+                'accuracy': acc,
+                'avg_score': avg_s,
+                'sample_size': stats['total']
+            }
+        return combo_metrics
+
+    def _compute_statistical_metrics(self, results: List[Dict]) -> Dict[str, Any]:
+        scores = [r.get('llm_evaluation', {}).get('score', 0) for r in results]
+        if len(scores) < 2:  # not enough data for normality test
+            return {'normality_test_p': None, 'effect_size': 0.0, 'statistically_significant': False}
+
+        _, normality_p = stats.normaltest(scores)
+        effect_size = (np.mean(scores) / np.std(scores)) if np.std(scores) > 0 else 0.0
+        
+        return {
+            'normality_test_p': float(normality_p),
+            'effect_size': effect_size,
+            'statistically_significant': normality_p < 0.05
         }
 
-    def _has_position_data(self, results: List[Dict]) -> bool:
-        return any('gold_position' in r for r in results)
+    def _compute_confidence_intervals(self, results: List[Dict]) -> Dict[str, List[float]]:
+        scores = [r.get('llm_evaluation', {}).get('score', 0) for r in results]
+        if len(scores) < 2:
+            return {'ci_95': [0, 0], 'ci_99': [0, 0]}
 
-    def _has_category_data(self, results: List[Dict]) -> bool:
-        return any('category' in r for r in results)
+        sem = stats.sem(scores)
+        mean = np.mean(scores)
+        ci_95 = stats.t.interval(0.95, len(scores)-1, loc=mean, scale=sem)
+        ci_99 = stats.t.interval(0.99, len(scores)-1, loc=mean, scale=sem)
 
-    def _has_noise_data(self, results: List[Dict]) -> bool:
-        return any('noise_ratio' in r for r in results)
+        return {
+            'ci_95': [float(ci_95[0]), float(ci_95[1])] if ci_95 else [0,0],
+            'ci_99': [float(ci_99[0]), float(ci_99[1])] if ci_99 else [0,0]
+        }
+
+    def _save_metrics(self, metrics: Dict[str, Any], experiment_type: str) -> None:
+        output_file = self.output_dir / f"{experiment_type}_metrics.json"
+        with open(output_file, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        self.logger.info(f"Saved metrics to {output_file}")

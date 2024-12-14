@@ -3,30 +3,28 @@ import gc
 import hashlib
 import json
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 import logging
 import google.generativeai as genai
 from tqdm import tqdm
 import torch
-import numpy as np
+import time
 
 class LLM:
     def __init__(
         self,
         api_key: str,
         model: str = "gemini-pro",
-        cache_dir: Optional[str] = "cache/llm_responses",
-        memory_threshold: float = 0.9,
-        max_retries: int = 3,
-        evaluation_threshold: float = 0.8
+        cache_dir: Optional[str] = "cache/llm_responses"
     ):
-        self.api_key = api_key
+        if not api_key:
+            raise ValueError("API key cannot be empty")
+            
         genai.configure(api_key=api_key)
         
-        # Configure Gemini model settings
-        generation_config = {
-            "temperature": 0.3,
+        self.generation_config = {
+            "temperature": 0.7,
             "top_p": 0.8,
             "top_k": 40,
             "max_output_tokens": 1024,
@@ -38,60 +36,16 @@ class LLM:
             {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
         ]
-        
+
         self.model = genai.GenerativeModel(
             model_name=model,
-            generation_config=generation_config,
+            generation_config=self.generation_config,
             safety_settings=safety_settings
         )
-        self.eval_model = genai.GenerativeModel(
-            model_name=model,
-            generation_config=generation_config,
-            safety_settings=safety_settings
-        )
-        
+
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.memory_threshold = memory_threshold
-        self.max_retries = max_retries
-        self.evaluation_threshold = evaluation_threshold
         self.logger = self._setup_logger()
-
-        # Templates
-        self.generation_template = """
-        Question: {question}
-        Context: {context}
-        Task: Extract the precise answer from the context.
-        Answer:"""
-        
-        self.evaluation_template = """
-        You are an expert evaluator judging answer correctness.
-        
-        Question: {question}
-        Gold Answer: {gold_answer}
-        Generated Answer: {generated_answer}
-        
-        Task: Evaluate if the generated answer is correct. Consider:
-        1. Factual accuracy
-        2. Semantic equivalence
-        3. Completeness
-        
-        Provide your evaluation in the following format:
-        Score (0-100): <numerical score>
-        Correct (Yes/No): <yes/no>
-        Reasoning: <detailed explanation>
-        """
-        
-        self.similarity_template = """
-        Task: Evaluate the semantic similarity between these two answers on a scale of 0-100.
-        
-        Answer 1: {answer1}
-        Answer 2: {answer2}
-        
-        Provide:
-        Similarity Score (0-100): 
-        Explanation:
-        """
 
     def evaluate_answer(
         self,
@@ -99,6 +53,15 @@ class LLM:
         generated_answer: str,
         gold_answer: str
     ) -> Dict[str, Any]:
+        """Evaluate answer using LLM."""
+        if not question or not generated_answer or not gold_answer:
+            return {
+                'score': 0,
+                'correct': False,
+                'reasoning': "Missing required input",
+                'semantic_similarity': 0
+            }
+            
         prompt = self.evaluation_template.format(
             question=question,
             gold_answer=gold_answer,
@@ -111,36 +74,42 @@ class LLM:
             return cached
             
         try:
+            # Use LLM for evaluation
             response = self.eval_model.generate_content(prompt)
             if not response.parts:
                 raise ValueError("Empty response from model")
             response_text = response.parts[0].text
             
-            # Parse evaluation response
+            # Parse LLM evaluation response
             lines = response_text.strip().split('\n')
             score = float([l for l in lines if 'Score' in l][0].split(':')[1].strip())
             correct = 'yes' in [l for l in lines if 'Correct' in l][0].lower()
             reasoning = [l for l in lines if 'Reasoning' in l][0].split(':')[1].strip()
             
+            # Use LLM for semantic similarity
             similarity = self.compute_semantic_similarity(generated_answer, gold_answer)
             
             result = {
                 'score': score,
                 'correct': correct,
                 'reasoning': reasoning,
-                'semantic_similarity': similarity
+                'semantic_similarity': similarity,
+                'evaluation_method': 'llm',
+                'timestamp': str(datetime.now())
             }
             
             self._save_to_cache(cache_key, result)
             return result
             
         except Exception as e:
-            self.logger.error(f"Evaluation failed: {str(e)}")
+            self.logger.error(f"LLM evaluation failed: {str(e)}")
             return {
                 'score': 0,
                 'correct': False,
-                'reasoning': f"Evaluation error: {str(e)}",
-                'semantic_similarity': 0
+                'reasoning': f"LLM evaluation error: {str(e)}",
+                'semantic_similarity': 0,
+                'evaluation_method': 'failed',
+                'timestamp': str(datetime.now())
             }
 
     def compute_semantic_similarity(
@@ -173,62 +142,57 @@ class LLM:
             self.logger.error(f"Similarity computation failed: {str(e)}")
             return 0.0
 
-    def generate(
-        self,
-        questions: Union[str, List[str]],
-        contexts: Union[str, List[str]],
-        batch_size: int = 8
-    ) -> List[str]:
-        if isinstance(questions, str):
-            questions = [questions]
-        if isinstance(contexts, str):
-            contexts = [contexts]
+    def generate(self, prompts: Union[str, List[str]], max_new_tokens: int = 15) -> List[str]:
+        if isinstance(prompts, str):
+            prompts = [prompts]
+            
+        results = []
+        for prompt in prompts:
+            cache_key = self._get_cache_key(prompt)
+            cached = self._check_cache(cache_key)
+            
+            if cached:
+                results.append(cached['response'])
+                continue
+                
+            try:
+                response = self.model.generate_content(prompt)
+                response_text = response.text.strip()
+                self._save_to_cache(cache_key, {'response': response_text})
+                results.append(response_text)
+                
+            except Exception as e:
+                self.logger.error(f"Generation failed: {str(e)}")
+                results.append("")
+                
+        return results
 
-        self.logger.info(f"Generating answers for {len(questions)} questions")
+    def generate_batch(
+        self,
+        prompts: List[str],
+        batch_size: int = 10
+    ) -> List[str]:
         results = []
         
-        for i in tqdm(range(0, len(questions), batch_size), desc="Generating"):
-            batch_questions = questions[i:i + batch_size]
-            batch_contexts = contexts[i:i + batch_size]
-            
+        for i in tqdm(range(0, len(prompts), batch_size), desc="Generating"):
+            batch = prompts[i:i + batch_size]
             batch_results = []
-            for q, c in zip(batch_questions, batch_contexts):
-                prompt = self.generation_template.format(question=q, context=c)
-                cache_key = self._get_cache_key(prompt)
-                
-                cached = self._check_cache(cache_key)
-                if cached:
-                    batch_results.append(cached['response'])
-                    continue
-                
-                for attempt in range(self.max_retries):
-                    try:
-                        response = self.model.generate_content(prompt)
-                        if not response.parts:
-                            raise ValueError("Empty response from model")
-                        response_text = response.parts[0].text
-                        self._save_to_cache(cache_key, {'response': response_text})
-                        batch_results.append(response_text)
-                        break
-                    except Exception as e:
-                        if attempt == self.max_retries - 1:
-                            self.logger.error(f"Generation failed: {str(e)}")
-                            batch_results.append("")
-                        else:
-                            self.logger.warning(f"Attempt {attempt+1} failed, retrying...")
             
+            for prompt in batch:
+                result = self.generate(prompt)
+                batch_results.append(result)
+                time.sleep(0.1)  # Rate limiting
+                
             results.extend(batch_results)
-            self._cleanup_memory()
             
         return results
 
     def _setup_logger(self) -> logging.Logger:
         logger = logging.getLogger("LLM")
         logger.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        ch = logging.StreamHandler()
-        ch.setFormatter(formatter)
-        logger.addHandler(ch)
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(handler)
         return logger
 
     def _get_cache_key(self, text: str) -> str:
