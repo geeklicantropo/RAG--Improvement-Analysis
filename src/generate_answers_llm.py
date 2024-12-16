@@ -34,7 +34,7 @@ info = {
 def parse_arguments():
    parser = argparse.ArgumentParser(description="Run LLM Closed-Book Generation.")
    parser.add_argument('--output_dir', type=str, default='data/gen_res')
-   parser.add_argument('--llm_id', type=str, default='meta-llama/Llama-2-7b-chat-hf')
+   parser.add_argument('--llm_id', type=str, default='gemini-pro')
    parser.add_argument('--model_max_length', type=int, default=4096)
    parser.add_argument('--subset_path', type=str, default='data/processed/corpus_with_contriever_at150.json')
    parser.add_argument('--use_random', type=str2bool, default=False)
@@ -206,12 +206,15 @@ def main():
    args = parse_arguments()
 
    print("Loading LLM...")
+   '''
    llm = LLM(
        llm_id=args.llm_id,
        device=device,
        quantization_bits=4, 
        model_max_length=args.model_max_length
    )
+   '''
+   llm = LLM(api_key=os.getenv("GEMINI_TOKEN"))
    print("LLM loaded")
 
    print("Loading corpus...")

@@ -42,19 +42,20 @@ class DocumentClassifier:
         return logger
 
     def classify_documents(
-        self,
-        documents: List[Dict],
-        query: str,
-        gold_answer: str,
-        use_cache: bool = True
+    self,
+    documents: List[Dict],
+    query: str,
+    gold_answer: str,
+    use_cache: bool = True
     ) -> Dict[str, List[Dict]]:
         categories = {"gold": [], "distracting": [], "random": []}
         
+        if not documents:
+            return categories
+            
         try:
             self.logger.info(f"Starting classification of {len(documents)} documents")
-            self.logger.info(f"Query: {query}")
-            self.logger.info(f"Gold answer: {gold_answer}")
-
+            
             for i in range(0, len(documents), self.batch_size):
                 if torch.cuda.is_available():
                     allocated = torch.cuda.memory_allocated()
@@ -76,7 +77,6 @@ class DocumentClassifier:
                 for cat, docs in batch_classifications.items():
                     if cat == 'gold':
                         self.stats["gold_hits"] += len(docs)
-                        self.logger.info(f"Found {len(docs)} gold documents in batch")
                         for doc in docs:
                             self.logger.debug(f"Gold document content: {doc.get('text', '')[:200]}")
                     categories[cat].extend(docs)
@@ -85,7 +85,7 @@ class DocumentClassifier:
 
             self._log_classification_stats(categories)
             return categories
-            
+                
         except Exception as e:
             self.logger.error(f"Error classifying documents: {str(e)}")
             raise

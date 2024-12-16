@@ -1,7 +1,7 @@
 import os
 import sys
 import logging
-import argparse
+import argparse 
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 import pandas as pd
@@ -15,18 +15,6 @@ import gc
 from src.llm import LLM
 from src.llm_evaluator import LLMEvaluator
 from src.experiment_logger import ExperimentLogger
-
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate generation results using LLM")
-    parser.add_argument('--results_dir', type=str, required=True,
-                      help='Directory containing generation results')
-    parser.add_argument('--output_dir', type=str, default='evaluation_results',
-                      help='Directory for saving evaluation results')
-    parser.add_argument('--api_key', type=str, required=True,
-                      help='Gemini API key')
-    parser.add_argument('--batch_size', type=int, default=32,
-                      help='Batch size for LLM evaluation')
-    return parser.parse_args()
 
 class ResultsEvaluator:
     def __init__(self, api_key: str, output_dir: Path, logger: ExperimentLogger):
@@ -43,16 +31,25 @@ class ResultsEvaluator:
             batch = results[batch_start:batch_start + batch_size]
             
             for result in batch:
+                context = self._get_context(result['document_indices'], result.get('corpus', {}))
                 eval_result = self.evaluator.evaluate_answer(
                     question=result['query'],
                     generated_answer=result['generated_answer'],
                     gold_answer=result['gold_answer'],
-                    context=result.get('context')
+                    context=context
                 )
                 result['llm_evaluation'] = eval_result
                 evaluated_results.append(result)
 
         return self._compute_metrics(evaluated_results)
+
+    def _get_context(self, doc_ids: List[int], corpus: Dict[int, Dict]) -> str:
+        context = []
+        for idx, doc_id in enumerate(doc_ids):
+            if doc_id in corpus:
+                doc = corpus[doc_id]
+                context.append(f"Document [{idx+1}]: {doc.get('text', '')}")
+        return "\n\n".join(context)
 
     def _compute_metrics(self, results: List[Dict]) -> Dict[str, Any]:
         metrics = {
@@ -70,6 +67,7 @@ class ResultsEvaluator:
         return {
             'accuracy': np.mean([e['correct'] for e in evals]),
             'avg_score': np.mean([e['score'] for e in evals]),
+            'score_std': np.std([e['score'] for e in evals]),
             'total_examples': len(results)
         }
 
@@ -129,18 +127,36 @@ class ResultsEvaluator:
         with open(output_file, 'w') as f:
             json.dump(metrics, f, indent=2)
 
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate generation results using LLM")
+    parser.add_argument('--results_dir', type=str, default="experiments/results",
+                      help='Directory containing generation results')
+    parser.add_argument('--output_dir', type=str, default="experiments/evaluation_results",
+                      help='Directory for saving evaluation results')
+    parser.add_argument('--batch_size', type=int, default=32,
+                      help='Batch size for LLM evaluation')
+    args = parser.parse_args()
+    return args
+
 def main():
     args = parse_arguments()
     
     logger = ExperimentLogger("results_evaluation", "logs")
+    results_dir = Path(args.results_dir)
     output_dir = Path(args.output_dir)
+    batch_size = args.batch_size
+    
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         with logger:
-            evaluator = ResultsEvaluator(args.api_key, output_dir, logger)
-            
-            results_files = list(Path(args.results_dir).glob("*.json"))
+            api_key = os.getenv("GEMINI_TOKEN")
+            if not api_key:
+                logger.experiment_logger.error("GEMINI_TOKEN environment variable not found")
+                return
+
+            evaluator = ResultsEvaluator(api_key, output_dir, logger)
+            results_files = list(results_dir.glob("*.json"))
             all_results = []
             
             for file in results_files:
@@ -148,11 +164,11 @@ def main():
                     results = json.load(f)
                     all_results.extend(results)
             
-            metrics = evaluator.evaluate_results(all_results, args.batch_size)
-            logger.log_metrics(metrics)
+            metrics = evaluator.evaluate_results(all_results, batch_size)
+            logger.experiment_logger.info(f"Evaluation metrics: {json.dumps(metrics, indent=2)}")
             
     except Exception as e:
-        logger.log_error(e, "Error in main execution")
+        logger.experiment_logger.error(f"Error in main execution: {str(e)}")
         raise
     finally:
         if torch.cuda.is_available():

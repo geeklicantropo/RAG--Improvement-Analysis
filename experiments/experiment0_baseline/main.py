@@ -20,7 +20,7 @@ from src.llm import LLM
 from src.llm_evaluator import LLMEvaluator
 from src.document_classifier import DocumentClassifier
 from src.prompt_dataset import PromptDataset
-from experiments.checkpoint_utils import save_checkpoint
+from experiments.checkpoint_utils import load_checkpoints, get_last_checkpoint_batch, save_checkpoint
 from .config import BaselineConfig, BaselineConfigFactory
 from src.generate_answers_llm import _format_prompt, _contains_answer
 
@@ -209,10 +209,39 @@ class BaselineExperiment:
     def _generate_and_evaluate(self, mode: str) -> List[Dict]:
         mode_dir = self.output_dir / "naive_rag" / mode
         mode_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir = mode_dir / "checkpoints"
 
-        results = []
-        batch_size = self.config.batch_size
-        test_queries = self.test_data
+        # Check for existing checkpoints
+        if checkpoint_dir.exists():
+            self.logger.info(f"Found checkpoint directory for {mode}")
+            existing_results = load_checkpoints(checkpoint_dir)
+            if existing_results:
+                last_batch = get_last_checkpoint_batch(checkpoint_dir)
+                self.logger.info(f"Resuming from checkpoint at batch {last_batch}")
+                
+                # Get the last processed example ID
+                processed_ids = {r['example_id'] for r in existing_results}
+                
+                # Filter test queries to only process remaining examples
+                remaining_queries = [
+                    example for example in self.test_data 
+                    if example['id'] not in processed_ids
+                ]
+                
+                if not remaining_queries:
+                    self.logger.info("All examples already processed, returning existing results")
+                    return existing_results
+                    
+                self.logger.info(f"Processing remaining {len(remaining_queries)} examples")
+                test_queries = remaining_queries
+                results = existing_results
+            else:
+                test_queries = self.test_data
+                results = []
+        else:
+            test_queries = self.test_data
+            results = []
+
         gold_docs = self.corpus_manager.get_gold_documents()
         
         with tqdm(total=len(test_queries), desc=f"Processing {mode}") as pbar:
@@ -221,7 +250,7 @@ class BaselineExperiment:
                     question = example['question']
                     gold_answer = example['answers'][0]
 
-                    # Find gold document for this query
+                    # Find gold document
                     gold_doc = None
                     for doc in gold_docs:
                         if doc.get('id') == example.get('id') or self._contains_answer(doc['text'], gold_answer):
@@ -230,11 +259,10 @@ class BaselineExperiment:
 
                     if not gold_doc:
                         self.logger.experiment_logger.warning(f"No gold document found for question: {question}")
-
                         pbar.update(1)
                         continue
 
-                    # Prepare documents based on mode
+                    # Process documents based on mode
                     if mode == 'gold_only':
                         docs = [gold_doc]
                     elif mode == 'gold_random':
@@ -251,12 +279,10 @@ class BaselineExperiment:
                         ]
                         docs = [gold_doc] + distractor_docs
 
-                    # Generate prompt and get response
                     prompt = _format_prompt(question, docs, gold_answer)
                     if self._validate_prompt(prompt):
                         generated_answer = self.llm.generate(prompt, max_new_tokens=self.config.max_new_tokens)[0]
                         
-                        # Evaluate response
                         eval_result = self.llm_evaluator.evaluate_answer(
                             question=question,
                             generated_answer=generated_answer,
@@ -266,26 +292,26 @@ class BaselineExperiment:
                                 [d.get('category', 'gold' if d == gold_doc else 'other') for d in docs],
                                 list(range(len(docs))),
                                 question,
-                                gold_answer
+                                gold_answer,
+                                docs
                             )
                         )
 
-                        results.append({
+                        result = {
                             'query': question,
                             'generated_answer': generated_answer,
                             'llm_evaluation': eval_result,
                             'document_indices': [d.get('id') for d in docs],
-                            'document_categories': [
-                                'gold' if d == gold_doc else d.get('category', 'other') 
-                                for d in docs
-                            ],
+                            'document_categories': [d.get('category', 'gold' if d == gold_doc else 'other') for d in docs],
                             'example_id': example['id'],
                             'gold_answer': gold_answer,
                             'mode': mode
-                        })
+                        }
+                        results.append(result)
 
                     pbar.update(1)
-                    
+
+                    # Save checkpoint periodically
                     if len(results) % self.config.save_every == 0:
                         save_checkpoint(results, len(results), mode_dir)
 
@@ -318,15 +344,14 @@ class BaselineExperiment:
             return False
 
     def _select_random_docs(self, corpus: List[Dict], count: int) -> List[Dict]:
-        # selects 'count' random docs from given corpus and classifies them
-        # after classification, returns them
-        selected = random.sample(corpus, min(count, len(corpus)))
-        # classify to assign category and position
-        # we can treat them as doc set for classification
-        cat = self.doc_classifier.classify_documents(selected, "dummy?", "dummy?")
-        # flatten categories
-        all_docs = cat['gold'] + cat['distracting'] + cat['random']
-        return all_docs
+        """
+        Selects random documents from corpus and classifies them.
+        """
+        if isinstance(corpus[0], str):  # Handle string documents
+            selected = [{'text': doc, 'id': i} for i, doc in enumerate(random.sample(corpus, min(count, len(corpus))))]
+        else:
+            selected = random.sample(corpus, min(count, len(corpus)))
+        return selected
 
     def _build_context(self, indices, categories, positions, question, gold_answer, doc_set):
         # rebuild doc texts from doc_set by matching ids
@@ -357,47 +382,51 @@ class BaselineExperiment:
             return False
 
     def _run_noise_tests(self, noise_levels: List[float]) -> Dict:
-        # Implement noise tests by injecting random docs from random_corpus and reddit_corpus
         noise_results = {}
         for nl in noise_levels:
-            # For each noise level, we inject 'nl * num_documents_in_context' random docs
-            # and measure performance. We'll do a simple approach: 
-            # take each query from test_data, mix in random nonsense docs.
             nr_dir = self.output_dir / "naive_rag" / f"noise_injection_{int(nl*100)}"
             nr_dir.mkdir(parents=True, exist_ok=True)
             run_results = []
+            
             for example in tqdm(self.test_data, desc=f"Noise Tests {nl}"):
                 question = example['question']
                 gold_answer = example['answers'][0]
 
-                # get some gold docs from base corpus
+                # Get gold docs
                 top_docs = self.base_corpus[:self.config.num_documents_in_context]
                 categories = self.doc_classifier.classify_documents(top_docs, question, gold_answer)
                 gold_docs = categories['gold']
 
-                # inject noise docs
+                # Inject noise docs
                 noise_count = int(nl * self.config.num_documents_in_context)
-                # pick noise_count docs from reddit_corpus or random_corpus:
                 noise_docs = self._select_random_docs(self.reddit_corpus, noise_count)
-                # combine gold and noise
                 final_docs = gold_docs + noise_docs
 
                 prompt = _format_prompt(question, final_docs)
                 if self._validate_prompt(prompt):
                     generated_answer = self.llm.generate(prompt, max_new_tokens=self.config.max_new_tokens)[0]
-                    eval_res = self.llm_evaluator.evaluate_answer(question, generated_answer, gold_answer,
-                        context=self._build_context([d['id'] for d in final_docs],
-                        [d['category'] for d in final_docs],
-                        [d['position'] for d in final_docs], question, gold_answer, final_docs)
+                    eval_res = self.llm_evaluator.evaluate_answer(
+                        question=question,
+                        generated_answer=generated_answer,
+                        gold_answer=gold_answer,
+                        context=self._build_context(
+                            [d.get('id') for d in final_docs],
+                            [d.get('category', 'gold' if d in gold_docs else 'other') for d in final_docs],
+                            list(range(len(final_docs))),
+                            question,
+                            gold_answer,
+                            final_docs
+                        )
                     )
+                    
                     run_results.append({
                         'query': question,
                         'generated_answer': generated_answer,
                         'llm_evaluation': eval_res,
-                        'noise_level': nl,
-                        'docs_used': [d['id'] for d in final_docs]
+                        'noise_ratio': nl,
+                        'docs_used': [d.get('id') for d in final_docs]
                     })
-            
+
             save_checkpoint(run_results, 'final', nr_dir)
             noise_results[nl] = run_results
 

@@ -13,7 +13,7 @@ import random
 import argparse
 
 
-from experiments.checkpoint_utils import save_checkpoint
+from experiments.checkpoint_utils import load_checkpoints, get_last_checkpoint_batch, save_checkpoint
 from src.utils.file_utils import seed_everything, clear_memory
 from src.experiment_logger import ExperimentLogger
 from src.llm import LLM
@@ -99,19 +99,53 @@ class ClusteringExperiment:
         return final_results
 
     def _select_random_docs(self, corpus: List[Dict], count: int) -> List[Dict]:
-        selected = random.sample(corpus, min(count, len(corpus)))
-        cat = self.doc_classifier.classify_documents(selected, "dummy_q?", "dummy_a?")
-        return cat['gold'] + cat['distracting'] + cat['random']
+        """
+        Selects random documents from corpus and classifies them.
+        """
+        if isinstance(corpus[0], str):
+            selected = [{'text': doc, 'id': i} for i, doc in enumerate(random.sample(corpus, min(count, len(corpus))))]
+        else:
+            selected = random.sample(corpus, min(count, len(corpus)))
+        return selected
 
     def _generate_and_evaluate(self, mode: str) -> List[Dict]:
         mode_dir = self.output_dir / "clustered" / mode
         mode_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir = mode_dir / "checkpoints"
 
-        results = []
-        batch_size = self.config.batch_size
-        test_queries = self.test_data
+        # Check for existing checkpoints
+        if checkpoint_dir.exists():
+            self.logger.info(f"Found checkpoint directory for {mode}")
+            existing_results = load_checkpoints(checkpoint_dir)
+            if existing_results:
+                last_batch = get_last_checkpoint_batch(checkpoint_dir)
+                self.logger.info(f"Resuming from checkpoint at batch {last_batch}")
+                
+                # Get the last processed example ID
+                processed_ids = {r['example_id'] for r in existing_results}
+                
+                # Filter test queries to only process remaining examples
+                remaining_queries = [
+                    example for example in self.test_data 
+                    if example['id'] not in processed_ids
+                ]
+                
+                if not remaining_queries:
+                    self.logger.info("All examples already processed, returning existing results")
+                    return existing_results
+                    
+                self.logger.info(f"Processing remaining {len(remaining_queries)} examples")
+                test_queries = remaining_queries
+                results = existing_results
+            else:
+                test_queries = self.test_data
+                results = []
+        else:
+            test_queries = self.test_data
+            results = []
+
         gold_docs = self.corpus_manager.get_gold_documents()
-
+        
         with tqdm(total=len(test_queries), desc=f"Processing {mode}") as pbar:
             for example in test_queries:
                 try:
@@ -127,7 +161,6 @@ class ClusteringExperiment:
 
                     if not gold_doc:
                         self.logger.experiment_logger.warning(f"No gold document found for question: {question}")
-
                         pbar.update(1)
                         continue
 
@@ -165,7 +198,7 @@ class ClusteringExperiment:
                             )
                         )
 
-                        results.append({
+                        result = {
                             'query': question,
                             'generated_answer': generated_answer,
                             'llm_evaluation': eval_result,
@@ -174,7 +207,8 @@ class ClusteringExperiment:
                             'example_id': example['id'],
                             'gold_answer': gold_answer,
                             'mode': mode
-                        })
+                        }
+                        results.append(result)
 
                     pbar.update(1)
 
@@ -206,7 +240,7 @@ class ClusteringExperiment:
                 doc_text = f"[GOLD] {doc_text}"
             docs.append(doc_text)
         return "\n\n".join(docs)
-    
+        
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run clustering-based retrieval experiments")
     parser.add_argument('--output_dir', type=str, default="experiments/experiment1_clustering/results", help="Output directory")

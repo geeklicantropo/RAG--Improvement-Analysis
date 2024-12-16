@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from llm import LLM
-from utils import *
+from src.utils.file_utils import str2bool, read_pickle, read_json, write_pickle, read_corpus_json, seed_everything
 from prompt_dataset import QueryDataset
 
 
@@ -29,7 +29,7 @@ info = {
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run LLM Closed-Book Generation (only query).")
     parser.add_argument('--output_dir', type=str, default='data/gen_res', help='Output directory')
-    parser.add_argument('--llm_id', type=str, default='meta-llama/Llama-2-7b-chat-hf', help='LLM model identifier')
+    parser.add_argument('--llm_id', type=str, default='gemini-pro', help='LLM model identifier')
     parser.add_argument('--model_max_length', type=int, help='Maximum input length for the LLM model', default=4096)
     parser.add_argument('--use_test', type=str2bool, help='Use the test set', default=False)
     parser.add_argument('--max_new_tokens', type=int, help='Maximum number of tokens to generate', default=15)
@@ -113,11 +113,14 @@ def main():
     args = parse_arguments()
 
     print("Loading LLM...")
-    llm_id = args.llm_id
+    #llm_id = args.llm_id
+    '''
     llm = LLM(
         llm_id, device, quantization_bits=4, 
         model_max_length=args.model_max_length
     )
+    '''
+    llm = LLM(api_key=os.getenv("GEMINI_TOKEN"))
     print("LLM loaded")
 
     print("Loading prompt dataset...")
