@@ -26,13 +26,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--prefix_name', type=str, default='contriever')
     parser.add_argument('--batch_size', type=int, default=10000)
     parser.add_argument('--max_memory_usage', type=float, default=0.8)
-    parser.add_argument('--subset_type', type=str, choices=['cluster', 'noise', 'full'], default='full')
-    parser.add_argument('--subset_id', type=str, help='Identifier for the subset index')
-    parser.add_argument('--hybrid_retrieval', type=str2bool, default=False, help='Enable hybrid retrieval (dense + sparse)')
-    parser.add_argument('--bm25_index_path', type=str, help='Path to prebuilt BM25 index for hybrid retrieval')
+    parser.add_argument('--checkpoint_every', type=int, default=100000)
+    parser.add_argument('--use_gpu', action='store_true')
     return parser.parse_args()
 
-
+'''
 class IndexManager:
     def __init__(self, args: argparse.Namespace, logger: ExperimentLogger):
         self.args = args
@@ -170,39 +168,87 @@ class CombinedIndex:
         top_doc_indices = np.take_along_axis(combined_indices, top_indices, axis=1)
         
         return top_scores, top_doc_indices
+'''  
+class IndexBuilder:
+    def __init__(self, args: argparse.Namespace, logger: ExperimentLogger):
+        self.args = args
+        self.logger = logger
+        self.embeddings_cache = {}
+        self.current_memory_usage = 0.0
+
+    def build_index(self) -> faiss.Index:
+        try:
+            # Create base index
+            if self.args.idx_type == 'IP':
+                index = faiss.IndexFlatIP(self.args.vector_sz)
+            else:
+                index = faiss.IndexFlatL2(self.args.vector_sz)
+
+            # Add GPU support if requested
+            if self.args.use_gpu and torch.cuda.is_available():
+                res = faiss.StandardGpuResources()
+                index = faiss.index_cpu_to_gpu(res, 0, index)
+
+            # Process in batches with checkpoints
+            for start_idx in tqdm(range(0, self.args.corpus_size, self.args.batch_size)):
+                batch_end = min(start_idx + self.args.batch_size, self.args.corpus_size)
+                
+                # Load batch embeddings
+                batch_embeddings = self._load_embeddings_batch(start_idx, batch_end)
+                
+                # Add to index
+                index.add(batch_embeddings.astype('float32'))
+                
+                # Save checkpoint if needed
+                if start_idx % self.args.checkpoint_every == 0:
+                    self._save_checkpoint(index, start_idx)
+                
+                # Memory management
+                self._cleanup_memory()
+                
+            return index
+
+        except Exception as e:
+            self.logger.log_error(e, "Error building index")
+            raise
+
+    def _load_embeddings_batch(self, start_idx: int, end_idx: int) -> np.ndarray:
+        file_path = os.path.join(
+            self.args.embeddings_dir,
+            f'{self.args.prefix_name}_{end_idx}_embeddings.npy'
+        )
+        return np.load(file_path, mmap_mode='r')
+
+    def _save_checkpoint(self, index: faiss.Index, batch_idx: int):
+        checkpoint_path = os.path.join(
+            self.args.faiss_dir,
+            f'index_checkpoint_{batch_idx}.faiss'
+        )
+        faiss.write_index(index, checkpoint_path)
+
+    def _cleanup_memory(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
 def main():
     args = parse_arguments()
-    logger = ExperimentLogger("indexing_embeddings", "logs")
+    logger = ExperimentLogger("index_embeddings", "logs")
 
     try:
         with logger:
-            logger.log_experiment_params(vars(args))
-            logger.log_system_info()
-
-            index_manager = IndexManager(args, logger)
-
-            # Create index
-            index = index_manager.create_index()
-
-            # Index embeddings
-            index_manager.index_embeddings(index)
-
-            # Save index and metadata
-            index_manager.save_index(index)
-
-            # Enable hybrid retrieval if specified
-            if args.hybrid_retrieval:
-                index_manager.enable_hybrid_retrieval()
+            index_builder = IndexBuilder(args, logger)
+            index = index_builder.build_index()
+            
+            # Save final index
+            output_path = os.path.join(args.faiss_dir, f'{args.idx_type}_index.faiss')
+            faiss.write_index(index, output_path)
+            logger.log_metric("index_saved", output_path)
 
     except Exception as e:
         logger.log_error(e, "Main execution failed")
         raise
-    finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-
 
 if __name__ == '__main__':
     main()

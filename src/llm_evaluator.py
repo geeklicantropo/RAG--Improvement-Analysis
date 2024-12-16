@@ -228,87 +228,85 @@ class LLMEvaluator:
             return 0.0
 
     def classify_document(
-        self,
-        question: str,
-        gold_answer: str,
-        doc_text: str,
-        retry_count: int = 3
+    self,
+    question: str,
+    gold_answer: str,
+    doc_text: str,
+    retry_count: int = 3
     ) -> str:
-        """
-        Classify a single document as 'gold', 'distracting', or 'random' using LLM.
-
-        Returns: 'gold', 'distracting', or 'random'.
-        """
+        """Classify document as gold/distracting/random"""
         cache_key = hashlib.md5(f"doc_class:{question}:{gold_answer}:{doc_text}".encode()).hexdigest()
-
+        
         cached = self._check_cache(cache_key)
         if cached and 'category' in cached:
             return cached['category']
 
-        prompt = self.templates['document_classification'].format(
-            question=question,
-            gold_answer=gold_answer,
-            doc_text=doc_text
-        )
+        # Added to existing LLMEvaluator class
+        prompt = f"""Evaluate if this document contains the answer to the question:
+
+    Question: {question}
+    Correct Answer: {gold_answer}
+    Document: {doc_text}
+
+    Choose ONE category:
+    GOLD - Document contains the correct answer
+    DISTRACTING - Document is related but doesn't contain the answer
+    RANDOM - Document is unrelated
+
+    Output only one word (GOLD/DISTRACTING/RANDOM):"""
 
         for attempt in range(retry_count):
             try:
                 response = self.model.generate_content(prompt)
-                category = response.text.strip().lower()
+                if not response.text:
+                    raise ValueError("Empty response")
+                    
+                category = response.text.strip().upper()
+                if category in ['GOLD', 'DISTRACTING', 'RANDOM']:
+                    self._save_to_cache(cache_key, {'category': category.lower()})
+                    return category.lower()
                 
-                # Validate category
-                if category not in ['gold', 'distracting', 'random']:
-                    self.logger.warning(f"LLM returned unexpected category '{category}', defaulting to 'random'")
-                    category = 'random'
-
-                self._save_to_cache(cache_key, {'category': category})
-                return category
+                raise ValueError(f"Invalid category: {category}")
 
             except Exception as e:
+                self.logger.error(f"Attempt {attempt+1} failed: {str(e)}")
                 if attempt == retry_count - 1:
-                    self.logger.error(f"Document classification failed: {str(e)}")
-                    self._save_to_cache(cache_key, {'category': 'random'})
                     return 'random'
                 time.sleep(1)
 
     def validate_gold_document(
-        self,
-        question: str,
-        gold_answer: str,
-        doc_text: str,
-        retry_count: int = 3
+    self,
+    question: str,
+    gold_answer: str,
+    doc_text: str
     ) -> bool:
-        """
-        Validate if a supposedly 'gold' document truly supports the gold answer.
-        Returns True if doc is indeed gold, False otherwise.
-        """
+        """Validate if document contains the gold answer"""
         cache_key = hashlib.md5(f"gold_val:{question}:{gold_answer}:{doc_text}".encode()).hexdigest()
-
+        
         cached = self._check_cache(cache_key)
-        if cached and 'gold_valid' in cached:
-            return cached['gold_valid']
+        if cached and 'is_valid' in cached:
+            return cached['is_valid']
 
-        prompt = self.templates['gold_validation'].format(
-            question=question,
-            gold_answer=gold_answer,
-            doc_text=doc_text
-        )
+        prompt = f"""
+        Question: {question}
+        Expected Answer: {gold_answer}
+        Document: {doc_text}
 
-        for attempt in range(retry_count):
-            try:
-                response = self.model.generate_content(prompt)
-                answer = response.text.strip().lower()
-                # We expect something like "yes" or "no"
-                is_valid = answer.startswith('yes')
-                self._save_to_cache(cache_key, {'gold_valid': is_valid})
-                return is_valid
+        Does this document contain enough information to answer the question correctly?
+        Answer 'yes' or 'no' and explain why:
+        """
 
-            except Exception as e:
-                if attempt == retry_count - 1:
-                    self.logger.error(f"Gold validation failed: {str(e)}")
-                    self._save_to_cache(cache_key, {'gold_valid': False})
-                    return False
-                time.sleep(1)
+        try:
+            response = self.model.generate_content(prompt)
+            answer = response.text.strip().lower()
+            is_valid = answer.startswith('yes')
+            
+            self._save_to_cache(cache_key, {'is_valid': is_valid})
+            return is_valid
+
+        except Exception as e:
+            self.logger.error(f"Gold validation failed: {str(e)}")
+            return False
 
     def _check_cache(self, cache_key: str) -> Optional[Dict]:
         if cache_key in self.eval_cache:

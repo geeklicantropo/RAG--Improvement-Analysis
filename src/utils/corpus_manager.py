@@ -8,14 +8,15 @@ from tqdm import tqdm
 import gc
 import mmap
 
+
 class CorpusManager:
     def __init__(self, base_corpus_path: str, cache_dir: str = "cache/corpus"):
         self.base_corpus_path = Path(base_corpus_path)
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.corpus_variants = {}
         self.logger = self._setup_logger()
         self.doc_cache = {}
+        self.base_corpus = self.get_corpus()  
 
     def to_dict(self) -> Dict:
         """Make CorpusManager JSON-serializable"""
@@ -150,12 +151,24 @@ class CorpusManager:
             raise
 
     def get_gold_documents(self) -> List[Dict]:
+        """Load gold documents from base corpus"""
+        gold_docs = []
         try:
-            gold_docs_path = Path(self.base_corpus_path).parent / "gold_documents.json"
-            with open(gold_docs_path) as f:
-                gold_docs = json.load(f)
-            self.logger.info(f"Loaded {len(gold_docs)} gold documents from {gold_docs_path}")
+            from datasets import load_dataset
+            dataset = load_dataset("florin-hf/nq_open_gold", split="train")
+            for item in dataset:
+                doc = {
+                    'text': item['text'],
+                    'id': item['id'], 
+                    'idx_gold_in_corpus': item.get('idx_gold_in_corpus'),
+                    'is_gold': True
+                }
+                gold_docs.append(doc)
             return gold_docs
-        except Exception as e:
-            self.logger.error(f"Error loading gold documents: {str(e)}")
-            raise
+        except:
+            self.logger.warning("Failed to load HuggingFace dataset, scanning base corpus")
+            for doc in self.get_corpus():
+                if any(ans in doc.get('text', '') for ans in ['answers', 'answer', 'correct']):
+                    doc['is_gold'] = True
+                    gold_docs.append(doc)
+            return gold_docs

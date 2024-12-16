@@ -18,6 +18,11 @@ class ClusteringConfig:
     embedding_model: str = "gemini-pro"
     model_max_length: int = 30720
     max_new_tokens: int = 1024
+
+    # Encoder configuration 
+    encoder_id: str = 'facebook/contriever'
+    max_length_encoder: int = 512
+    normalize_embeddings: bool = True
     
     # Memory Configuration
     gpu_memory_utilization: float = 0.8 

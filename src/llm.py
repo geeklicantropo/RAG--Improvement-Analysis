@@ -12,35 +12,29 @@ import torch
 import time
 
 class LLM:
-    def __init__(
-        self,
-        api_key: str,
-        model: str = "gemini-pro",
-        cache_dir: Optional[str] = "cache/llm_responses"
-    ):
-        if not api_key:
-            raise ValueError("API key cannot be empty")
-            
+    def __init__(self, api_key: str, cache_dir: str = "cache/llm_responses"):
         genai.configure(api_key=api_key)
-        
         self.generation_config = {
-            "temperature": 0.7,
-            "top_p": 0.8,
-            "top_k": 40,
+            "temperature": 0.1,  
+            "top_p": 0.95,      
+            "top_k": 3,         
             "max_output_tokens": 1024,
         }
-        
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+
+        self.safety_settings = [
+            {"category": cat, "threshold": "BLOCK_NONE"}
+            for cat in [
+                "HARM_CATEGORY_HARASSMENT",
+                "HARM_CATEGORY_HATE_SPEECH", 
+                "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "HARM_CATEGORY_DANGEROUS_CONTENT"
+            ]
         ]
 
         self.model = genai.GenerativeModel(
-            model_name=model,
+            model_name='gemini-pro',
             generation_config=self.generation_config,
-            safety_settings=safety_settings
+            safety_settings=self.safety_settings
         )
 
         self.cache_dir = Path(cache_dir)

@@ -6,7 +6,9 @@ import torch
 import torch.nn.functional as F
 import normalize_text
 import tqdm
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
+from src.utils.file_utils import clear_memory
+from src.llm import LLM
 
 
 
@@ -71,8 +73,8 @@ class Retriever:
         self,
         device: torch.device,
         tokenizer: AutoTokenizer,
-        query_encoder: Encoder,
-        doc_encoder: Optional[Encoder] = None,
+        query_encoder: Union[Encoder, LLM],
+        doc_encoder: Optional[Union[Encoder, LLM]] = None,
         max_length: int = 512,
         add_special_tokens: bool = True,
         norm_query_emb: bool = False,
@@ -82,8 +84,6 @@ class Retriever:
     ):
         
         self.device = device
-        self.query_encoder = query_encoder.to(device)
-        self.doc_encoder = self.query_encoder if doc_encoder is None else doc_encoder.to(device)
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.add_special_tokens = add_special_tokens
@@ -92,6 +92,18 @@ class Retriever:
         self.lower_case = lower_case
         self.do_normalize_text = do_normalize_text
 
+        if isinstance(query_encoder, LLM):
+            self.query_encoder = query_encoder
+        else:
+            self.query_encoder = query_encoder.to(device)
+
+        if doc_encoder is None:
+            self.doc_encoder = self.query_encoder
+        else:
+            if isinstance(doc_encoder, LLM):
+                self.doc_encoder = doc_encoder
+            else:
+                self.doc_encoder = doc_encoder.to(device)
 
     def encode_queries(self, queries: List[str], batch_size: int) -> np.ndarray:
         if self.do_normalize_text:
@@ -115,21 +127,24 @@ class Retriever:
                     return_tensors="pt",
                 ).to(self.device)
 
-                emb = self.query_encoder.encode(**q_inputs, normalize=self.norm_query_emb)
+                if isinstance(self.query_encoder, LLM):
+                    emb = self.query_encoder.generate(queries[start_idx:end_idx], max_new_tokens=1, return_tensors=True)
+                    emb = emb[:, -1, :]  # Use the last token embedding as the query embedding
+                else:
+                    emb = self.query_encoder.encode(**q_inputs, normalize=self.norm_query_emb)
                 all_embeddings.append(emb.cpu())
 
         all_embeddings = torch.cat(all_embeddings, dim=0)
         return all_embeddings
-    
 
     def encode_corpus(
-    self, 
-    corpus_info: List[Dict[str, str]], 
-    batch_size: int, 
-    output_dir: str, 
-    prefix_name: str,
-    save_every: int = 500,
-    logger: Optional[Any] = None  # Add logger parameter
+        self, 
+        corpus_info: List[Dict[str, str]], 
+        batch_size: int, 
+        output_dir: str, 
+        prefix_name: str,
+        save_every: int = 500,
+        logger: Optional[Any] = None  # Add logger parameter
     ) -> None:
         """Encode corpus documents with progress tracking and logging."""
         os.makedirs(output_dir, exist_ok=True)
@@ -158,16 +173,20 @@ class Retriever:
                         corpus = [c.lower() for c in corpus]
 
                     # Encode batch
-                    doc_inputs = self.tokenizer(
-                        corpus,
-                        max_length=self.max_length,
-                        padding=True,
-                        truncation=True,
-                        add_special_tokens=self.add_special_tokens,
-                        return_tensors="pt",
-                    ).to(self.device)
+                    if isinstance(self.doc_encoder, LLM):
+                        emb = self.doc_encoder.generate(corpus, max_new_tokens=1, return_tensors=True)
+                        emb = emb[:, -1, :]  # Use the last token embedding as the document embedding
+                    else:
+                        doc_inputs = self.tokenizer(
+                            corpus,
+                            max_length=self.max_length,
+                            padding=True,
+                            truncation=True,
+                            add_special_tokens=self.add_special_tokens,
+                            return_tensors="pt",
+                        ).to(self.device)
 
-                    emb = self.doc_encoder.encode(**doc_inputs, normalize=self.norm_doc_emb)
+                        emb = self.doc_encoder.encode(**doc_inputs, normalize=self.norm_doc_emb)
                     all_embeddings.append(emb)
 
                     num_steps += 1
@@ -189,3 +208,44 @@ class Retriever:
                     if logger:
                         logger.log_error(e, f"Error processing batch {k}")
                     raise
+
+    def load_embeddings_batch(self, start_idx: int, end_idx: int) -> np.ndarray:
+        """Load batch of embeddings from disk."""
+        file_path = os.path.join(
+            self.embeddings_dir,
+            f'{self.prefix_name}_{end_idx}_embeddings.npy'
+        )
+        return np.load(file_path, mmap_mode='r')
+
+    def retrieve_documents(
+        self,
+        query: str, 
+        corpus_size: int,
+        batch_size: int = 1000,
+        top_k: int = 100
+    ) -> List[int]:
+        """Retrieve relevant documents for a query."""
+        # Encode query
+        query_inputs = self.tokenizer(
+            query,
+            max_length=self.max_length,
+            padding=True,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt"
+        ).to(self.device)
+        
+        query_embeddings = self.query_encoder.encode(**query_inputs, normalize=True)
+        doc_scores = []
+        
+        for start_idx in range(0, corpus_size, batch_size):
+            batch_embeddings = self.load_embeddings_batch(start_idx, start_idx + batch_size)
+            batch_scores = np.matmul(query_embeddings.cpu().numpy(), batch_embeddings.T)
+            doc_scores.extend(batch_scores[0].tolist())
+            
+            clear_memory()
+            
+        top_indices = np.argsort(doc_scores)[-top_k:][::-1].tolist()
+        top_scores = [doc_scores[i] for i in top_indices]
+            
+        return [top_indices, top_scores]
