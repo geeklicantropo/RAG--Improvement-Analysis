@@ -30,7 +30,7 @@ info = {
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run LLM Closed-Book Generation (only query).")
     parser.add_argument('--output_dir', type=str, default='data/gen_res', help='Output directory')
-    parser.add_argument('--llm_id', type=str, default='gemini-pro', help='LLM model identifier')
+    parser.add_argument('--llm_id', type=str, default='gemini-1.5-flash', help='LLM model identifier')
     parser.add_argument('--model_max_length', type=int, help='Maximum input length for the LLM model', default=4096)
     parser.add_argument('--use_test', type=str2bool, help='Use the test set', default=False)
     parser.add_argument('--max_new_tokens', type=int, help='Maximum number of tokens to generate', default=15)

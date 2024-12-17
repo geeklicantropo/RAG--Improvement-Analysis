@@ -48,7 +48,7 @@ class DocumentClusterer:
         self.logger = logger or ExperimentLogger("DocumentClusterer", "logs")
 
         #genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-pro')
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
 
         self.clusterer = None
         self.scaler = StandardScaler() if use_scaler else None

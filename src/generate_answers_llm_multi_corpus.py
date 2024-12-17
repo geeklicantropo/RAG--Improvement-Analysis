@@ -100,7 +100,7 @@ class MultiCorpusDataset(Dataset):
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run LLM Generation with multi corpus documents.")
     parser.add_argument('--output_dir', type=str, default='data/gen_res')
-    parser.add_argument('--llm_id', type=str, default='gemini-pro')
+    parser.add_argument('--llm_id', type=str, default='gemini-1.5-flash')
     parser.add_argument('--model_max_length', type=int, default=4096)
     parser.add_argument('--subset_path', type=str, 
                        default='data/processed/corpus_with_contriever_at150.json')

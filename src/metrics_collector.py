@@ -6,6 +6,7 @@ from pathlib import Path
 from scipy import stats
 from tqdm import tqdm
 import json
+from datetime import datetime
 
 class MetricsCollector:
     def __init__(self, output_dir: str = "experiments/metrics"):
@@ -23,70 +24,44 @@ class MetricsCollector:
         return logger
 
     def collect_metrics(
-        self,
-        results: List[Dict],
-        experiment_type: str,
-        include_confidence: bool = True
+    self,
+    results: List[Dict],
+    experiment_type: str,
+    include_confidence: bool = True
     ) -> Dict[str, Any]:
-        """
-        Collect and compute all metrics from a list of result dictionaries.
-        
-        Each result is expected to have:
-          {
-            'query': str,
-            'generated_answer': str,
-            'llm_evaluation': {'correct': bool, 'score': float, ...},
-            'document_indices': [...],
-            'document_categories': [...],
-            'document_positions': [...],
-            'example_id': ...,
-            'gold_answer': str,
-            'category': optional per-document category,
-            'position': optional per-document position,
-            'noise_ratio': optional float for noise experiments,
-            'mode': optional scenario mode like 'gold_only','gold_random','gold_distractor',
-            'combination_type': optional scenario combination like 'gold+random+distractor'
-          }
+        metrics = {
+            'experiment_type': experiment_type,
+            'total_examples': len(results),
+            'timestamp': datetime.now().isoformat()
+        }
 
-        Args:
-            results (List[Dict]): The experiment results.
-            experiment_type (str): Name of the experiment to name the output metrics file.
-            include_confidence (bool): Whether to compute confidence intervals.
+        # Basic metrics
+        eval_results = [r['llm_evaluation'] for r in results if 'llm_evaluation' in r]
+        if eval_results:
+            metrics.update({
+                'accuracy': np.mean([e.get('correct', False) for e in eval_results]),
+                'avg_score': np.mean([e.get('score', 0) for e in eval_results]),
+                'score_std': np.std([e.get('score', 0) for e in eval_results])
+            })
 
-        Returns:
-            Dict[str, Any]: A dictionary of computed metrics.
-        """
-        metrics = {}
-        
-        # Base metrics
-        metrics.update(self._compute_base_metrics(results))
-        
-        # Category metrics if category available
+        # Category metrics
         if any('category' in r for r in results):
             metrics['category_metrics'] = self._compute_category_metrics(results)
-            
-        # Position metrics if position available
+
+        # Position metrics
         if any('position' in r for r in results):
             metrics['position_metrics'] = self._compute_position_metrics(results)
-            
-        # Noise metrics if noise_ratio available
+
+        # Noise metrics
         if any('noise_ratio' in r for r in results):
             metrics['noise_metrics'] = self._compute_noise_metrics(results)
 
-        # Mode metrics if mode available
-        if any('mode' in r for r in results):
-            metrics['mode_metrics'] = self._compute_mode_metrics(results)
-
-        # Combination metrics if combination_type available
-        if any('combination_type' in r for r in results):
-            metrics['combination_metrics'] = self._compute_combination_metrics(results)
-
         # Statistical metrics
-        metrics['statistical_metrics'] = self._compute_statistical_metrics(results)
+        metrics['statistical_metrics'] = self._compute_statistical_metrics(eval_results)
 
         # Confidence intervals
-        if include_confidence:
-            metrics['confidence_intervals'] = self._compute_confidence_intervals(results)
+        if include_confidence and eval_results:
+            metrics['confidence_intervals'] = self._compute_confidence_intervals(eval_results)
 
         self._save_metrics(metrics, experiment_type)
         return metrics

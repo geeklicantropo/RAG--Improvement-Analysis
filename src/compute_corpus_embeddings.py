@@ -50,7 +50,7 @@ class EmbeddingsComputer:
        self.memory_tracker = MemoryTracker(args.max_memory_usage)
        
        #genai.configure(api_key=os.getenv("GEMINI_TOKEN"))
-       self.model = genai.GenerativeModel('gemini-pro')
+       self.model = genai.GenerativeModel('gemini-1.5-flash')
 
     def compute_embeddings(self, corpus: List[Dict], subset_indices: Optional[List[int]] = None) -> None:
        if subset_indices is None:

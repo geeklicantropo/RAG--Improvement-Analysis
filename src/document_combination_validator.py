@@ -13,7 +13,7 @@ class DocumentCombinationValidator:
         
         # Initialize Gemini
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-pro')
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
         
     def _setup_logger(self) -> logging.Logger:
         logger = logging.getLogger("DocumentCombinationValidator")

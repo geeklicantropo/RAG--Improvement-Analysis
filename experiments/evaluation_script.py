@@ -10,9 +10,13 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
+import time
+
+logger = logging.getLogger(__name__)
+from datetime import datetime
 
 from experiment_logger import ExperimentLogger
-from utils import read_json, str2bool
+from src.utils.file_utils import read_json, str2bool
 from normalize_answers import are_answers_matching
 
 class ExperimentEvaluator:
@@ -46,134 +50,63 @@ class ExperimentEvaluator:
             self.logger.log_error(e, f"Error loading results for {experiment_name}")
             raise
             
-    def compute_metrics(self, experiment_name: str) -> Dict[str, float]:
-        """Compute evaluation metrics for an experiment."""
-        results = self.metrics[experiment_name]["results"]
-        metrics = {}
-        
-        try:
-            # Basic metrics
-            total_examples = len(results)
-            correct_answers = sum(1 for r in results if r['ans_match_after_norm'])
-            accuracy = correct_answers / total_examples
+    def compute_metrics(self, results: List[Dict]) -> Dict[str, float]:
+        """Compute basic metrics from LLM evaluation results."""
+        eval_results = [r['llm_evaluation'] for r in results if 'llm_evaluation' in r]
+        if not eval_results:
+            return {'accuracy': 0.0, 'avg_score': 0.0, 'score_std': 0.0, 'sample_size': 0}
+
+        return {
+            'accuracy': np.mean([e['correct'] for e in eval_results]),
+            'avg_score': np.mean([e['score'] for e in eval_results]),
+            'score_std': np.std([e['score'] for e in eval_results]),
+            'sample_size': len(eval_results)
+        }
             
-            metrics.update({
-                "accuracy": accuracy,
-                "total_examples": total_examples,
-                "correct_answers": correct_answers
-            })
-            
-            # Clustering-specific metrics (if applicable)
-            if "cluster_assignments" in results[0]:
-                cluster_metrics = self._compute_clustering_metrics(results)
-                metrics.update(cluster_metrics)
-            
-            # Fusion-specific metrics (if applicable)
-            if "retriever_scores" in results[0]:
-                fusion_metrics = self._compute_fusion_metrics(results)
-                metrics.update(fusion_metrics)
-            
-            # Category-specific metrics (if applicable)
-            if "category_info" in results[0]:
-                category_metrics = self._compute_category_metrics(results)
-                metrics.update(category_metrics)
-            
-            self.metrics[experiment_name]["computed_metrics"] = metrics
-            return metrics
-            
-        except Exception as e:
-            self.logger.log_error(e, f"Error computing metrics for {experiment_name}")
-            raise
-            
-    def _compute_clustering_metrics(self, results: List[Dict]) -> Dict[str, float]:
-        """Compute metrics specific to clustering experiments."""
-        metrics = {}
-        
-        # Analyze per-cluster performance
-        cluster_performance = defaultdict(lambda: {"correct": 0, "total": 0})
-        
-        for result in results:
-            clusters = result["cluster_assignments"]
-            for doc_id, cluster_id in clusters.items():
-                cluster_performance[cluster_id]["total"] += 1
-                if result["ans_match_after_norm"]:
-                    cluster_performance[cluster_id]["correct"] += 1
-        
-        # Calculate cluster-specific metrics
-        for cluster_id, stats in cluster_performance.items():
-            accuracy = stats["correct"] / stats["total"] if stats["total"] > 0 else 0
-            metrics[f"cluster_{cluster_id}_accuracy"] = accuracy
-            
-        # Calculate cluster diversity metrics
-        unique_clusters = len(cluster_performance)
-        metrics["num_clusters"] = unique_clusters
-        
-        return metrics
-        
-    def _compute_fusion_metrics(self, results: List[Dict]) -> Dict[str, float]:
-        """Compute metrics specific to fusion experiments."""
-        metrics = {}
-        
-        # Analyze retriever contribution
-        retriever_contribution = defaultdict(lambda: {"correct": 0, "total": 0})
-        
-        for result in results:
-            scores = result["retriever_scores"]
-            max_retriever = max(scores.items(), key=lambda x: x[1])[0]
-            retriever_contribution[max_retriever]["total"] += 1
-            if result["ans_match_after_norm"]:
-                retriever_contribution[max_retriever]["correct"] += 1
-        
-        # Calculate retriever-specific metrics
-        for retriever, stats in retriever_contribution.items():
-            accuracy = stats["correct"] / stats["total"] if stats["total"] > 0 else 0
-            metrics[f"{retriever}_accuracy"] = accuracy
-            
-        return metrics
-        
-    def _compute_category_metrics(self, results: List[Dict]) -> Dict[str, float]:
-        """Compute metrics specific to category-based experiments."""
-        metrics = {}
-        
-        # Analyze per-category performance
-        category_performance = defaultdict(lambda: {"correct": 0, "total": 0})
-        
-        for result in results:
-            categories = result["category_info"]
-            for doc_id, category in categories.items():
-                category_performance[category]["total"] += 1
-                if result["ans_match_after_norm"]:
-                    category_performance[category]["correct"] += 1
-        
-        # Calculate category-specific metrics
-        for category, stats in category_performance.items():
-            accuracy = stats["correct"] / stats["total"] if stats["total"] > 0 else 0
-            metrics[f"category_{category}_accuracy"] = accuracy
-            
-        return metrics
-        
     def compare_experiments(
         self,
-        experiment_names: List[str],
-        metrics_to_compare: Optional[List[str]] = None
-    ) -> pd.DataFrame:
-        """Compare metrics across different experiments."""
-        comparison_df = pd.DataFrame()
-        
-        for exp_name in experiment_names:
-            if exp_name not in self.metrics:
-                continue
-                
-            metrics = self.metrics[exp_name].get("computed_metrics", {})
-            if not metrics:
-                metrics = self.compute_metrics(exp_name)
-                
-            if metrics_to_compare:
-                metrics = {k: v for k, v in metrics.items() if k in metrics_to_compare}
-                
-            comparison_df[exp_name] = pd.Series(metrics)
-            
-        return comparison_df
+        baseline_results: List[Dict],
+        clustering_results: List[Dict]
+    ) -> Dict[str, Any]:
+        """Compare baseline and clustering experiments."""
+        try:
+            baseline_metrics = self.compute_metrics(baseline_results)
+            clustering_metrics = self.compute_metrics(clustering_results)
+
+            baseline_scores = [r['llm_evaluation']['score'] for r in baseline_results]
+            clustering_scores = [r['llm_evaluation']['score'] for r in clustering_results]
+
+            t_stat, p_value = stats.ttest_ind(baseline_scores, clustering_scores)
+            effect_size = (np.mean(clustering_scores) - np.mean(baseline_scores)) / np.sqrt(
+                (np.std(clustering_scores)**2 + np.std(baseline_scores)**2) / 2
+            )
+
+            comparison = {
+                'metrics': {
+                    'baseline': baseline_metrics,
+                    'clustering': clustering_metrics,
+                    'difference': {
+                        'accuracy': clustering_metrics['accuracy'] - baseline_metrics['accuracy'],
+                        'avg_score': clustering_metrics['avg_score'] - baseline_metrics['avg_score']
+                    }
+                },
+                'statistical_analysis': {
+                    't_statistic': float(t_stat),
+                    'p_value': float(p_value),
+                    'effect_size': float(effect_size),
+                    'significant': p_value < 0.05
+                },
+                'timestamp': datetime.now().isoformat()
+            }
+
+            return comparison
+
+        except Exception as e:
+            logger.error(f"Error comparing experiments: {str(e)}")
+            return {
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            }
         
     def statistical_analysis(
         self,
@@ -252,6 +185,26 @@ class ExperimentEvaluator:
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, "accuracy_comparison.png"))
         plt.close()
+
+    def _plot_fusion_analysis(
+    self,
+    experiment_name: str,
+    results: List[Dict],
+    save_dir: str
+    ) -> None:
+        """Plot fusion-specific analysis."""
+        # No time. This is not gonna be used, so I will hink about this later
+        pass
+
+    def _plot_category_analysis(
+        self,
+        experiment_name: str,
+        results: List[Dict],
+        save_dir: str
+    ) -> None:
+        """Plot category-specific analysis."""
+        # No time. This is not gonna be used, so I will hink about this later
+        pass
         
     def _plot_cluster_analysis(
         self,
