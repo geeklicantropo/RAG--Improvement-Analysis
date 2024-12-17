@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 from torch.utils.data import Dataset, DataLoader
 import torch
 
+from src.utils.rate_limit import rate_limit
 from src.llm import LLM
 from src.utils.file_utils import seed_everything, read_pickle, read_corpus_json, str2bool
 
@@ -121,6 +122,7 @@ def load_corpus(args):
     other_corpus = read_pickle('data/processed/reddit_corpus.pkl')
     return corpus, mapping, other_corpus
 
+@rate_limit
 def generate_and_save(args: argparse.Namespace, llm: LLM, prompt_dataloader: DataLoader):
     llm_id = args.llm_id
     save_every = args.save_every

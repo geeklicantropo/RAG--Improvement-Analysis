@@ -17,6 +17,7 @@ import torch
 from experiment_logger import ExperimentLogger
 from src.utils.file_utils import seed_everything
 import google.generativeai as genai
+from src.utils.rate_limit import rate_limit
 import time
 
 class ClusteringMethod:
@@ -46,7 +47,7 @@ class DocumentClusterer:
         self.device = device
         self.logger = logger or ExperimentLogger("DocumentClusterer", "logs")
 
-        genai.configure(api_key=api_key)
+        #genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-pro')
 
         self.clusterer = None
@@ -74,6 +75,7 @@ class DocumentClusterer:
         else:
             raise ValueError(f"Unsupported clustering method: {self.method}")
 
+    @rate_limit
     def evaluate_cluster_quality(self, cluster_docs: List[Dict], query: str = None) -> Dict[str, float]:
         """Evaluate cluster coherence using LLM"""
         try:
@@ -113,34 +115,32 @@ class DocumentClusterer:
             return {"coherence_score": 0.0, "error": str(e)}
 
     def fit_clusters(
-        self,
-        embeddings: np.ndarray,
-        document_ids: Optional[List[int]] = None,
-        use_batches: bool = True
+    self,
+    embeddings: np.ndarray,
+    document_ids: Optional[List[int]] = None,
+    use_batches: bool = True
     ) -> Dict[int, List[int]]:
         try:
-            self.logger.experiment_logger.info("Starting cluster fitting")
             self._initialize_clusterer()
 
-            if use_batches and len(embeddings) > self.batch_size:
-                clusters = self.process_in_batches(embeddings, document_ids)
-            else:
-                if self.use_scaler:
-                    embeddings = self.scaler.fit_transform(embeddings)
+            if self.use_scaler:
+                embeddings = self.scaler.fit_transform(embeddings)
 
-                labels = self.clusterer.fit_predict(embeddings)
-                clusters = self._labels_to_clusters(
-                    labels,
-                    document_ids if document_ids else range(len(embeddings))
-                )
+            labels = self.clusterer.fit_predict(embeddings)
+            clusters = self._labels_to_clusters(
+                labels,
+                document_ids if document_ids else range(len(embeddings))
+            )
 
-            self.logger.experiment_logger.info("Cluster fitting completed")
-            self._log_clustering_stats(clusters)
+            # Add rate limiting for Gemini evaluation calls
+            for cluster_id, docs in clusters.items():
+                time.sleep(0.1)  # Rate limit
+                self.evaluate_cluster_quality(docs)
 
             return clusters
 
         except Exception as e:
-            self.logger.experiment_logger.error(f"Error during clustering: {str(e)}")
+            self.logger.log_error(e, "Error during clustering")
             raise
 
     def evaluate_clusters(self, embeddings: np.ndarray, noise_ratio: float = 0.0) -> Dict[str, float]:

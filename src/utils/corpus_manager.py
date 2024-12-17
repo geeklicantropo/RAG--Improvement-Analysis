@@ -8,7 +8,6 @@ from tqdm import tqdm
 import gc
 import mmap
 
-
 class CorpusManager:
     def __init__(self, base_corpus_path: str, cache_dir: str = "cache/corpus"):
         self.base_corpus_path = Path(base_corpus_path)

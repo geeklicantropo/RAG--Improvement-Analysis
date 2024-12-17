@@ -8,8 +8,8 @@ from pathlib import Path
 import torch
 import gc
 from collections import defaultdict
-import google.generativeai as genai
 from .llm_evaluator import LLMEvaluator
+from src.utils.rate_limit import rate_limit
 
 class DocumentClassifier:
     def __init__(
@@ -41,6 +41,7 @@ class DocumentClassifier:
         logger.addHandler(handler)
         return logger
 
+    @rate_limit
     def classify_documents(
     self,
     documents: List[Dict],
@@ -165,6 +166,7 @@ class DocumentClassifier:
             
         return False
 
+    @rate_limit
     def validate_gold_documents(
         self,
         documents: List[Dict],

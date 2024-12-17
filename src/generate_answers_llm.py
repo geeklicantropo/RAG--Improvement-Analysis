@@ -7,6 +7,7 @@ from tqdm import tqdm
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Any, Optional
+from src.utils.rate_limit import rate_limit
 
 import torch
 import json
@@ -157,6 +158,7 @@ def _contains_answer(text: str, answer: str) -> bool:
     overlap = len(answer_words & text_words)
     return overlap >= len(answer_words) * 0.8
 
+@rate_limit
 def generate_and_save(args: argparse.Namespace, llm: LLM, prompt_dataloader: DataLoader, corpus: List[Dict]):
    llm_id = args.llm_id
    save_every = args.save_every
@@ -206,14 +208,6 @@ def main():
    args = parse_arguments()
 
    print("Loading LLM...")
-   '''
-   llm = LLM(
-       llm_id=args.llm_id,
-       device=device,
-       quantization_bits=4, 
-       model_max_length=args.model_max_length
-   )
-   '''
    llm = LLM(api_key=os.getenv("GEMINI_TOKEN"))
    print("LLM loaded")
 

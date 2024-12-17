@@ -9,6 +9,7 @@ import shutil
 from tqdm import tqdm
 import google.generativeai as genai
 import time
+from src.utils.rate_limit import rate_limit
 
 class GenerationCacheManager:
     def __init__(
@@ -27,7 +28,7 @@ class GenerationCacheManager:
         self.cache_stats = {"hits": 0, "misses": 0}
 
         # Initialize Gemini
-        genai.configure(api_key=api_key)
+        #genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-pro')
         
     def _setup_logger(self) -> logging.Logger:
@@ -39,6 +40,7 @@ class GenerationCacheManager:
         logger.addHandler(handler)
         return logger
 
+    @rate_limit
     def evaluate_generation(self, prompt: str, response: str, gold_answer: str) -> Dict[str, Any]:
         """Evaluate generation using Gemini"""
         eval_prompt = f"""

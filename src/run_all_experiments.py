@@ -1,28 +1,40 @@
 import os
+from dotenv import load_dotenv
+load_dotenv() 
+
+import google.generativeai as genai
+import time
+#from src.utils.rate_limit import rate_limit
+
+# Configure GEMINI once at startup
+GEMINI_TOKEN = os.getenv("GEMINI_TOKEN")
+if not GEMINI_TOKEN:
+    raise ValueError("GEMINI_TOKEN environment variable not found")
+genai.configure(api_key=GEMINI_TOKEN)
+
+# Rest of imports
 import sys
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from datetime import datetime
-import time
-import warnings
-import logging
-from tqdm import tqdm
-import json
-import numpy as np
 import torch
+import logging
 import gc
 import argparse
 from collections import defaultdict
+import json
+import numpy as np
+from tqdm import tqdm
 
 # Ensure project root is in path
 project_root = Path(__file__).parent.parent
 sys.path.extend([str(project_root)])
 
 from src.utils.file_utils import clear_memory
-from experiments.experiment0_baseline.main import main as baseline_main
-from experiments.experiment1_clustering.main import main as clustering_main
-from experiments.experiment2_fusion.main import main as fusion_main
-from experiments.experiment3_categories.main import main as categories_main
+#from experiments.experiment0_baseline.main import main as baseline_main
+#from experiments.experiment1_clustering.main import main as clustering_main
+#from experiments.experiment2_fusion.main import main as fusion_main
+#from experiments.experiment3_categories.main import main as categories_main
 
 # Import utils and evaluation
 from src.experiment_logger import ExperimentLogger
@@ -48,8 +60,8 @@ from experiments.experiment1_clustering.main import ClusteringExperiment
 # Import setup config
 from src.setup_experiments import ExperimentLogger, ExperimentSetup
 
-from dotenv import load_dotenv
-load_dotenv() 
+import warnings
+warnings.filterwarnings('ignore')
 
 class OutputController:
     """Controls and filters experiment output."""
@@ -114,7 +126,6 @@ class OutputController:
     
     def __enter__(self):
         """Set up output capturing."""
-        warnings.filterwarnings('ignore')
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         
         for logger_name in ["transformers", "torch", "pytorch_lightning"]:

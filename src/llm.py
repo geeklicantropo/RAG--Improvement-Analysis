@@ -1,3 +1,4 @@
+from src.utils.rate_limit import rate_limit
 import os
 import gc
 import hashlib
@@ -13,7 +14,7 @@ import time
 
 class LLM:
     def __init__(self, api_key: str, cache_dir: str = "cache/llm_responses"):
-        genai.configure(api_key=api_key)
+        #genai.configure(api_key=api_key)
         self.generation_config = {
             "temperature": 0.1,  
             "top_p": 0.95,      
@@ -41,6 +42,7 @@ class LLM:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.logger = self._setup_logger()
 
+    @rate_limit 
     def evaluate_answer(
         self,
         question: str,
@@ -106,6 +108,7 @@ class LLM:
                 'timestamp': str(datetime.now())
             }
 
+    @rate_limit
     def compute_semantic_similarity(
         self,
         answer1: str,
@@ -135,7 +138,8 @@ class LLM:
         except Exception as e:
             self.logger.error(f"Similarity computation failed: {str(e)}")
             return 0.0
-
+        
+    @rate_limit
     def generate(self, prompts: Union[str, List[str]], max_new_tokens: int = 15) -> List[str]:
         if isinstance(prompts, str):
             prompts = [prompts]

@@ -37,31 +37,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--top_k', type=int, default=100)
     return parser.parse_args()
 
-def initialize_retriever(args: argparse.Namespace, logger: ExperimentLogger) -> Retriever:
-    try:
-        logger.log_step_start("Initializing retriever")
-        config = AutoConfig.from_pretrained(args.encoder_id)
-        encoder = Encoder(config).eval()
-        tokenizer = AutoTokenizer.from_pretrained(args.encoder_id)
-        
-        retriever = Retriever(
-            device=device,
-            tokenizer=tokenizer,
-            query_encoder=encoder,
-            max_length=args.max_length_encoder
-        )
-        logger.log_step_end("Retriever initialization")
-        return retriever
-    except Exception as e:
-        logger.log_error(e, "Retriever initialization failed")
-        raise
-
 class BM25Retriever:
     def __init__(self, corpus: List[Dict], logger: ExperimentLogger):
         self.logger = logger
         try:
             self.logger.log_step_start("Initializing BM25")
-            # Tokenize corpus documents
             corpus_texts = [doc.get('text', '') for doc in corpus]
             tokenized_corpus = [word_tokenize(text.lower()) for text in corpus_texts]
             self.bm25 = BM25Okapi(tokenized_corpus)
@@ -186,6 +166,24 @@ def inject_noise(
         
         noisy_results.append((new_doc_ids, new_scores))
     return noisy_results
+
+def initialize_retriever(args: argparse.Namespace, logger: ExperimentLogger) -> Retriever:
+    try:
+        logger.log_step_start("Initializing retriever")
+        
+        retriever = Retriever(
+            device=device,
+            api_key=os.getenv("GEMINI_TOKEN"),
+            batch_size=args.batch_size,
+            max_length=args.max_length_encoder
+        )
+        
+        logger.log_step_end("Retriever initialization")
+        return retriever
+        
+    except Exception as e:
+        logger.log_error(e, "Retriever initialization failed")
+        raise
 
 def main():
     args = parse_arguments()

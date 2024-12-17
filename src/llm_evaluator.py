@@ -7,6 +7,9 @@ import hashlib
 from datetime import datetime
 from tqdm import tqdm
 import google.generativeai as genai
+from src.utils.rate_limit import rate_limit
+
+
 
 class LLMEvaluator:
     def __init__(self, api_key: str, cache_dir: str = "cache/evaluations"):
@@ -17,7 +20,7 @@ class LLMEvaluator:
         self.stats = {"hits": 0, "misses": 0}
         
         # Initialize Gemini
-        genai.configure(api_key=api_key)
+        #genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-pro')
         
         self._setup_templates()
@@ -89,6 +92,7 @@ class LLMEvaluator:
             """
         }
 
+    @rate_limit
     def evaluate_answer(
         self,
         question: str,
@@ -172,6 +176,7 @@ class LLMEvaluator:
             
         return results
 
+    @rate_limit
     def compute_semantic_similarity(
         self,
         text1: str,

@@ -4,6 +4,7 @@ import warnings
 from tqdm import tqdm
 from typing import Tuple, Dict, Optional, List
 import json
+from src.utils.rate_limit import rate_limit
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -20,14 +21,12 @@ warnings.filterwarnings('ignore')
 SEED=10
 
 class MixedDocumentsDataset(Dataset):
-    def __init__(self, corpus, data_path, tokenizer, max_tokenized_length,
-                 retriever_search_results, random_search_results, 
-                 documents_disposition_info, full_to_subset_idx_map=None,
-                 do_normalize_query=True, gold_position=None,
-                 get_documents_without_answer=False):
+    def __init__(self, corpus, data_path, 
+            retriever_search_results, random_search_results, 
+            documents_disposition_info, full_to_subset_idx_map=None,
+            do_normalize_query=True, gold_position=None,
+            get_documents_without_answer=False):
         self.corpus = corpus
-        self.tokenizer = tokenizer
-        self.max_tokenized_length = max_tokenized_length
         self.retriever_search_results = retriever_search_results
         self.random_search_results = random_search_results
         self.documents_disposition_info = documents_disposition_info
@@ -174,8 +173,8 @@ def initialize_dataset_and_loader(
    corpus: List[Dict], 
    mapping: Optional[Dict[int, int]], 
    retriever_search_results: List[Tuple[List[int], List[float]]], 
-   random_search_results: List[Tuple[List[int], List[float]]], 
-   tokenizer: PreTrainedTokenizer
+   random_search_results: List[Tuple[List[int], List[float]]]#, 
+   #tokenizer: PreTrainedTokenizer
 ) -> DataLoader:
    documents_disposition_info = {
        "num_retrieved_documents": args.num_retrieved_documents,
@@ -188,7 +187,7 @@ def initialize_dataset_and_loader(
    prompt_ds = MixedDocumentsDataset(
        corpus=corpus, 
        data_path=data_path,
-       tokenizer=tokenizer,
+       #tokenizer=tokenizer,
        max_tokenized_length=args.model_max_length - 2,
        retriever_search_results=retriever_search_results,
        random_search_results=random_search_results,
@@ -224,6 +223,7 @@ def print_info(args: argparse.Namespace):
    print(f"BATCH SIZE: {args.batch_size}")
    print(f"SAVE EVERY: {args.save_every}")
 
+@rate_limit 
 def generate_and_save(
    args: argparse.Namespace, 
    llm: LLM, 
@@ -274,14 +274,7 @@ def main():
    args = parse_arguments()
 
    print("Loading LLM...")
-   '''
-   llm = LLM(
-       llm_id=args.llm_id,
-       device=device, 
-       quantization_bits=4,
-       model_max_length=args.model_max_length
-   )
-   '''
+  
    #tokenizer = llm.tokenizer
    llm = LLM(api_key=os.getenv("GEMINI_TOKEN"))
    print("LLM loaded")
@@ -294,7 +287,7 @@ def main():
    print("Loading prompt dataset...") 
    prompt_dataloader = initialize_dataset_and_loader(
        args, corpus, mapping, retriever_search_results,
-       random_search_results, tokenizer
+       random_search_results#, tokenizer
    )
    print("Prompt dataset loaded")
 

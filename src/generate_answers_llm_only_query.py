@@ -5,6 +5,7 @@ from tqdm import tqdm
 
 import torch
 from torch.utils.data import DataLoader
+from src.utils.rate_limit import rate_limit
 
 from llm import LLM
 from src.utils.file_utils import str2bool, read_pickle, read_json, write_pickle, read_corpus_json, seed_everything
@@ -68,7 +69,7 @@ def print_info(args: argparse.Namespace):
     print(f"BATCH SIZE: {args.batch_size}")
     print(f"SAVE EVERY: {args.save_every}")
 
-
+@rate_limit
 def generate_and_save(
     args: argparse.Namespace, 
     llm: LLM, 

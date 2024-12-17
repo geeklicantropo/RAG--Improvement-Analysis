@@ -6,6 +6,7 @@ from datetime import datetime
 import torch
 import google.generativeai as genai
 import time
+from src.utils.rate_limit import rate_limit
 
 class RAGFusionRanker:
     def __init__(
@@ -28,7 +29,7 @@ class RAGFusionRanker:
         self.stats = {"fusions": 0, "evaluations": 0}
 
         # Initialize Gemini
-        genai.configure(api_key=api_key)
+        #genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-pro')
 
         if strategy not in ["rrf", "linear"]:
@@ -93,6 +94,7 @@ class RAGFusionRanker:
             normalized[retriever] = (doc_ids, norm_scores)
         return normalized
 
+    @rate_limit
     def evaluate_retrieval_diversity(
         self,
         fused_results: List[Tuple[List[str], List[float]]],
