@@ -9,21 +9,23 @@ from tqdm import tqdm
 import google.generativeai as genai
 from src.utils.rate_limit import rate_limit
 
-
-
 class LLMEvaluator:
     def __init__(self, api_key: str, cache_dir: str = "cache/evaluations"):
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.logger = self._setup_logger()
-        self.eval_cache = {}
-        self.stats = {"hits": 0, "misses": 0}
-        
-        # Initialize Gemini
-        #genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        self._setup_templates()
+        try:
+            self.cache_dir = Path(cache_dir)
+            # Change mode to absolute permissions (0o777) to avoid permission issues
+            self.cache_dir.mkdir(mode=0o777, parents=True, exist_ok=True)
+            self.logger = self._setup_logger()
+            self.eval_cache = {}
+            self.stats = {"hits": 0, "misses": 0}
+            
+            # Initialize Gemini
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-1.5-flash')
+            
+            self._setup_templates()
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize LLMEvaluator: {str(e)}")
 
     def _setup_logger(self) -> logging.Logger:
         logger = logging.getLogger("LLMEvaluator")
@@ -97,7 +99,7 @@ class LLMEvaluator:
         self,
         question: str,
         generated_answer: str,
-        gold_answer: str,
+        gold_answer: str,  
         context: Optional[str] = None,
         retry_count: int = 3
     ) -> Dict[str, Any]:
@@ -106,26 +108,51 @@ class LLMEvaluator:
         cached = self._check_cache(cache_key)
         if cached:
             return cached
-
-        prompt = self.templates['answer_evaluation'].format(
-            question=question,
-            generated_answer=generated_answer,
-            gold_answer=gold_answer,
-            context=context or ""
-        )
+            
+        prompt = f"""Evaluate this answer. Start your response with the score on a new line:
+        Question: {question}
+        Generated Answer: {generated_answer}
+        Gold Answer: {gold_answer}
+        {f'Context: {context}' if context else ''}
+        
+        Provide your response in exactly this format:
+        Score: [number between 0-100]
+        Correct: [Yes/No]
+        Reasoning: [Your explanation]
+        """
 
         for attempt in range(retry_count):
             try:
                 response = self.model.generate_content(prompt)
-                lines = response.text.strip().split('\n')
+                text = response.text.strip()
                 
-                score_line = lines[0]
-                correct_line = lines[1]
-                reasoning_line = lines[2]
-
-                score = float(score_line.split(':', 1)[1].strip())
-                correct = 'yes' in correct_line.lower()
-                reasoning = reasoning_line.split(':', 1)[1].strip()
+                # Handle both newline and space separated formats
+                lines = [l.strip() for l in text.split('\n') if l.strip()]
+                if len(lines) < 3:
+                    lines = text.split('Score:')[-1].split('Correct:')
+                    
+                # Extract score with fallback
+                score = 0
+                try:
+                    score_text = [l for l in lines if 'score:' in l.lower() or l.strip().replace('.','').isdigit()][0]
+                    score = float(''.join(c for c in score_text if c.isdigit() or c == '.'))
+                except (IndexError, ValueError):
+                    score = 0
+                    
+                # Extract correct/incorrect with fallback
+                correct = False
+                try:
+                    correct_text = [l for l in lines if 'correct:' in l.lower()][0].lower()
+                    correct = 'yes' in correct_text or 'true' in correct_text
+                except IndexError:
+                    correct = False
+                    
+                # Extract reasoning with fallback
+                reasoning = "No reasoning provided"
+                try:
+                    reasoning = [l for l in lines if 'reasoning:' in l.lower()][0].split(':', 1)[1].strip()
+                except (IndexError, ValueError):
+                    reasoning = text.split('\n')[-1] if text else "No reasoning provided"
                 
                 result = {
                     'score': score / 100,

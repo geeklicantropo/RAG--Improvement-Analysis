@@ -11,7 +11,7 @@ class BaselineConfig:
     """Configuration for baseline RAG experiment."""
     
     # Model Configuration
-    llm_id: str = "gemini-pro"
+    llm_id: str = "gemini-1.5-flash"
     model_max_length: int = 30720  
     batch_size: int = 4
     max_new_tokens: int = 1024
@@ -50,7 +50,14 @@ class BaselineConfig:
     base_data_dir: Path = Path("data")
     processed_dir: Path = base_data_dir / "processed"
     output_dir: Path = Path("experiments/experiment0_baseline/results")
-    save_every: int = 100
+    save_every: int = 10000
+
+    # Corpus Configuration
+    base_corpus_size: int = 1000 
+    num_random_docs: int = 1000
+    num_adversarial_docs: int = 1000
+    random_seed: int = 42
+    adversarial_seed: int = 42
 
     @property
     def corpus_path(self) -> Path:

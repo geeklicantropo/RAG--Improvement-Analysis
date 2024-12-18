@@ -42,54 +42,66 @@ class DocumentClassifier:
         return logger
 
     @rate_limit
-    def classify_documents(
+    def classify_document(
     self,
-    documents: List[Dict],
-    query: str,
+    question: str,
     gold_answer: str,
-    use_cache: bool = True
-    ) -> Dict[str, List[Dict]]:
-        categories = {"gold": [], "distracting": [], "random": []}
-        
-        if not documents:
-            return categories
-            
-        try:
-            self.logger.info(f"Starting classification of {len(documents)} documents")
-            
-            for i in range(0, len(documents), self.batch_size):
-                if torch.cuda.is_available():
-                    allocated = torch.cuda.memory_allocated()
-                    max_allocated = torch.cuda.max_memory_allocated()
-                    if max_allocated > 0:
-                        current_memory = allocated / max_allocated
-                        if current_memory > self.max_memory_usage:
-                            self.batch_size = max(1, self.batch_size // 2)
-                            self.logger.info(f"Reduced batch size to {self.batch_size}")
+    doc_text: str,
+    retry_count: int = 3
+    ) -> str:
+        cache_key = hashlib.md5(f"doc_class:{question}:{gold_answer}:{doc_text}".encode()).hexdigest()
+    
+        cached = self._check_cache(cache_key)
+        if cached and 'category' in cached:
+            return cached['category']
 
-                batch = documents[i:i + self.batch_size]
-                batch_classifications = self._classify_batch(
-                    batch,
-                    query,
-                    gold_answer,
-                    use_cache
-                )
+        prompt = f"""You are categorizing a document's relevance and correctness with respect to a given question and its gold answer.
 
-                for cat, docs in batch_classifications.items():
-                    if cat == 'gold':
-                        self.stats["gold_hits"] += len(docs)
-                        for doc in docs:
-                            self.logger.debug(f"Gold document content: {doc.get('text', '')[:200]}")
-                    categories[cat].extend(docs)
+        Follow these steps carefully:
+        1. Read the question and the gold answer.
+        2. Examine the document for information that directly or indirectly (through paraphrase or close factual match) matches the gold answer. If the document clearly supports or provides the gold answer, it is "GOLD".
+        3. If the document does not contain the gold answer, check if it is still about the same topic or context as the question. If it is relevant to the question but does NOT provide the correct answer, it is "DISTRACTING".
+        4. If the document is off-topic or unrelated to the question, it is "RANDOM".
 
-                self._cleanup_memory()
+        Definitions:
+        - GOLD: The document provides substantial evidence or content that answers the question correctly (it either explicitly states the gold answer or contains enough information from which the gold answer can be confidently derived).
+        - DISTRACTING: The document stays on-topic (discusses something related to the question) but does not provide the gold answer. It might mention related concepts, hints, or partially correct info, but not the actual needed answer.
+        - RANDOM: The document is unrelated, off-topic, or does not help answer the question at all.
 
-            self._log_classification_stats(categories)
-            return categories
-                
-        except Exception as e:
-            self.logger.error(f"Error classifying documents: {str(e)}")
-            raise
+        Now classify the document strictly as one of [GOLD, DISTRACTING, RANDOM].
+
+        Question: {question}
+        Gold Answer: {gold_answer}
+        Document: {doc_text}
+
+        Your classification (just one word: GOLD, DISTRACTING, or RANDOM):"""
+
+        for attempt in range(retry_count):
+            try:
+                response = self.model.generate_content(prompt)
+                if not response.text:
+                    raise ValueError("Empty response")
+                    
+                category = response.text.strip().upper()
+                if category in ['GOLD', 'DISTRACTING', 'RANDOM']:
+                    self._save_to_cache(cache_key, {'category': category.lower()})
+                    return category.lower()
+                    
+                raise ValueError(f"Invalid category: {category}")
+
+            except Exception as e:
+                self.logger.error(f"Attempt {attempt+1} failed: {str(e)}")
+                if attempt == retry_count - 1:
+                    # Try one final time with simplified prompt
+                    try:
+                        simple_prompt = f"Is this document: {doc_text[:200]} relevant to answering: {question}? Say only DISTRACTING or RANDOM"
+                        response = self.model.generate_content(simple_prompt)
+                        category = 'DISTRACTING' if 'DISTRACTING' in response.text.upper() else 'RANDOM'
+                        return category.lower()
+                    except:
+                        self.logger.error("Final fallback failed")
+                        raise
+                time.sleep(1)
 
     def _classify_batch(self, batch: List[Dict], query: str, gold_answer: str, use_cache: bool) -> Dict[str, List[Dict]]:
         batch_categories = defaultdict(list)

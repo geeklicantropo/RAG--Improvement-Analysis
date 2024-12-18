@@ -7,7 +7,7 @@ import numpy as np
 import logging
 from tqdm import tqdm
 import json
-
+from scipy import stats
 
 class ComparativePlotter:
     """Generates comparative visualizations across different experiment types."""
@@ -41,6 +41,39 @@ class ComparativePlotter:
         logger.addHandler(fh)
 
         return logger
+    
+    def _plot_baseline_comparison(self, baseline_results: pd.DataFrame):
+        plt.figure(figsize=(8, 6))
+        sns.barplot(data=baseline_results, x='experiment_type', y='accuracy')
+        plt.title("Baseline: Gold vs Random vs Adversarial")
+        plt.xlabel("Experiment Type") 
+        plt.ylabel("Accuracy")
+        plt.savefig(self.plots_dir / "baseline_comparison.png")
+        plt.close()
+
+    def _plot_clustering_comparison(self, clustering_results: pd.DataFrame):
+        plt.figure(figsize=(8, 6))  
+        sns.barplot(data=clustering_results, x='experiment_type', y='accuracy')
+        plt.title("Clustering: Gold vs Random vs Adversarial")
+        plt.xlabel("Experiment Type")
+        plt.ylabel("Accuracy") 
+        plt.savefig(self.plots_dir / "clustering_comparison.png")
+        plt.close()
+
+    def _plot_baseline_vs_clustering(self, results_data: Dict[str, pd.DataFrame]):
+        best_baseline = results_data['baseline'].loc[results_data['baseline']['accuracy'].idxmax()]
+        best_clustering = results_data['clustering'].loc[results_data['clustering']['accuracy'].idxmax()]
+        
+        comparison_df = pd.DataFrame([
+            {'Experiment': 'Baseline', 'Accuracy': best_baseline['accuracy'], 'Type': best_baseline['experiment_type']},
+            {'Experiment': 'Clustering', 'Accuracy': best_clustering['accuracy'], 'Type': best_clustering['experiment_type']}
+        ])
+        
+        plt.figure(figsize=(8, 6))
+        sns.barplot(data=comparison_df, x='Experiment', y='Accuracy', hue='Type')  
+        plt.title("Best Baseline vs Best Clustering")
+        plt.savefig(self.plots_dir / "baseline_vs_clustering.png")
+        plt.close()
 
     def plot_experiment_results(
     self, 
@@ -51,12 +84,6 @@ class ComparativePlotter:
     ) -> None:
         """
         Generate and save plots for experiment results.
-
-        Args:
-            baseline_results (List[Dict]): Results from baseline experiments.
-            clustering_results (List[Dict]): Results from clustering experiments.
-            fusion_results (List[Dict], optional): Results from fusion experiments.
-            category_results (List[Dict], optional): Results from category experiments.
         """
         # Prepare results data for plotting
         results_data = self._prepare_results_data(
@@ -65,13 +92,15 @@ class ComparativePlotter:
             fusion_results if fusion_results else [],
             category_results if category_results else []
         )
+        
+        # Compare baseline gold vs random vs adversarial
+        self._plot_baseline_comparison(results_data['baseline'])
+        
+        # Compare clustering gold vs random vs adversarial
+        self._plot_clustering_comparison(results_data['clustering']) 
 
-        # Call plotting methods with prepared data
-        self._plot_accuracy_comparison(results_data)
-        self._plot_noise_impact(results_data) 
-        self._plot_cluster_vs_rag_comparison(results_data)
-        self._plot_retrieval_analysis(results_data)
-        self._plot_performance_metrics(results_data)
+        # Compare best baseline vs best clustering
+        self._plot_baseline_vs_clustering(results_data)
 
     def _prepare_results_data(
     self,
@@ -428,3 +457,91 @@ class ComparativePlotter:
 
         except Exception as e:
             self.logger.error(f"Error in save_summary_report: {str(e)}")
+
+    def plot_experiments_comparison(
+    self,
+    results: Dict[str, List[Dict]], 
+    output_dir: Path,
+    experiment_types: List[str] = ['baseline', 'random', 'adore']
+    ) -> None:
+        """Plot comparisons between baseline gold documents, random noise, and adversarial documents"""
+        plots_dir = output_dir / "plots" / "comparisons"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+        # Add new plots while keeping existing functionality
+        try:
+            baseline_results = [r for r in results.get('baseline', []) if r.get('experiment_type') == 'baseline']
+            random_results = [r for r in results.get('baseline', []) if r.get('experiment_type') == 'random']
+            adv_results = [r for r in results.get('baseline', []) if r.get('experiment_type') == 'adore']
+
+            # New comparison plots
+            fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+
+            # 1. Accuracy comparison
+            accuracies = {
+                'Baseline (Gold)': np.mean([r['llm_evaluation']['correct'] for r in baseline_results]),
+                'Random Noise': np.mean([r['llm_evaluation']['correct'] for r in random_results]),
+                'Adversarial': np.mean([r['llm_evaluation']['correct'] for r in adv_results])
+            }
+            sns.barplot(x=list(accuracies.keys()), y=list(accuracies.values()), ax=axes[0,0])
+            axes[0,0].set_title('Accuracy by Document Type')
+            axes[0,0].set_ylabel('Accuracy')
+            axes[0,0].tick_params(axis='x', rotation=45)
+
+            # 2. Score distributions
+            scores_data = []
+            for exp_type, exp_results in [('Baseline', baseline_results), 
+                                        ('Random', random_results),
+                                        ('Adversarial', adv_results)]:
+                scores = [r['llm_evaluation']['score'] for r in exp_results]
+                scores_data.extend([(score, exp_type) for score in scores])
+            
+            df_scores = pd.DataFrame(scores_data, columns=['Score', 'Type'])
+            sns.violinplot(data=df_scores, x='Type', y='Score', ax=axes[0,1])
+            axes[0,1].set_title('LLM Evaluation Score Distributions')
+
+            # 3. Performance degradation
+            baseline_acc = accuracies['Baseline (Gold)']
+            degradation = {
+                'Random': baseline_acc - accuracies['Random Noise'],
+                'Adversarial': baseline_acc - accuracies['Adversarial']
+            }
+            sns.barplot(x=list(degradation.keys()), y=list(degradation.values()), ax=axes[1,0])
+            axes[1,0].set_title('Performance Degradation')
+            axes[1,0].set_ylabel('Accuracy Drop')
+
+            # 4. Statistical significance
+            stats_results = {}
+            for exp_type in ['Random', 'Adversarial']:
+                exp_scores = ([r['llm_evaluation']['score'] for r in random_results] if exp_type == 'Random' 
+                            else [r['llm_evaluation']['score'] for r in adv_results])
+                baseline_scores = [r['llm_evaluation']['score'] for r in baseline_results]
+                t_stat, p_val = stats.ttest_ind(baseline_scores, exp_scores)
+                stats_results[f'vs_{exp_type}'] = {'t_stat': t_stat, 'p_value': p_val}
+
+            axes[1,1].text(0.1, 0.5, f"Statistical Tests:\n" + \
+                        "\n".join([f"{k}: p={v['p_value']:.3f}" for k,v in stats_results.items()]),
+                        fontsize=10)
+            axes[1,1].axis('off')
+
+            plt.tight_layout()
+            plt.savefig(plots_dir / 'doc_type_comparison.png', dpi=300, bbox_inches='tight')
+            plt.close()
+
+            # Save numerical results
+            results_summary = {
+                'accuracies': accuracies,
+                'degradation': degradation,
+                'statistical_tests': stats_results,
+                'sample_sizes': {
+                    'baseline': len(baseline_results),
+                    'random': len(random_results),
+                    'adversarial': len(adv_results)
+                }
+            }
+            
+            with open(plots_dir / 'comparison_metrics.json', 'w') as f:
+                json.dump(results_summary, f, indent=2)
+
+        except Exception as e:
+            print(f"Error generating comparison plots: {str(e)}")

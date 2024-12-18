@@ -8,20 +8,19 @@ import gc
 from tqdm import tqdm
 from datetime import datetime
 import json
-import numpy as np
 import random
 import argparse
-
+import numpy as np
 
 from experiments.checkpoint_utils import load_checkpoints, get_last_checkpoint_batch, save_checkpoint
 from src.utils.file_utils import seed_everything, clear_memory
 from src.experiment_logger import ExperimentLogger
 from src.llm import LLM
-from src.document_classifier import DocumentClassifier
 from src.llm_evaluator import LLMEvaluator
 from src.utils.corpus_manager import CorpusManager
 from src.generate_answers_llm import _format_prompt, _contains_answer
-from .config import ClusteringConfig, ClusteringConfigFactory
+from .config import ClusteringConfig
+from src.document_classifier import DocumentClassifier
 
 
 class ClusteringExperiment:
@@ -40,224 +39,175 @@ class ClusteringExperiment:
             base_log_dir=str(Path(__file__).parent.parent.parent / "logs")
         )
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.doc_classifier = DocumentClassifier(self.llm_evaluator)
         self.llm = LLM(api_key=os.getenv("GEMINI_TOKEN"))
         self.output_dir = Path(config.output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Load data
-        self.train_data = self._load_json_data("data/10k_train_dataset.json")
-        self.test_data = self._load_json_data("data/test_dataset.json")
-        self.base_corpus = self._load_json_data("data/processed/corpus_with_contriever_at150.json")
-        self.cluster_model = self._initialize_clusters()
+        self.train_data = self._load_json_data(config.train_path)
+        self.test_data = self._load_json_data(config.test_path)
+        self.base_corpus = self.corpus_manager.get_random_subset(num_docs=config.base_corpus_size)
 
-        self.random_corpus = self._load_pickle_data("data/processed/corpus_with_random_50_words.pkl")
-        self.distractor_results = self._load_pickle_data("data/contriever_search_results_at150.pkl")
-        self.reddit_corpus = self._load_pickle_data("data/processed/reddit_corpus.pkl")
+        # Random and adversarial docs
+        self.random_corpus = self.corpus_manager.get_random_subset(num_docs=config.num_random_docs, seed=config.random_seed)
+        self.adversarial_corpus = self.corpus_manager.get_random_subset(num_docs=config.num_adversarial_docs, seed=config.adversarial_seed)
+        self.doc_classifier = DocumentClassifier(self.llm_evaluator)
 
+    def _load_json_data(self, path: str) -> List[Dict]:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.logger.info(f"Loaded {len(data)} examples from {path}.")
+        return data
 
+    def _load_checkpoint(self, checkpoint_dir: Path) -> List[Dict]:
+        if checkpoint_dir.exists():
+            checkpoint_files = sorted(checkpoint_dir.glob("checkpoint_*.json"))
+            if checkpoint_files:
+                latest_checkpoint = checkpoint_files[-1]
+                self.logger.info(f"Resuming from checkpoint: {latest_checkpoint}")
+                with open(latest_checkpoint, "r") as f:
+                    return json.load(f)
+        return []
 
-    def _load_pickle_data(self, path: str) -> Any:
-        import pickle
-        with open(path, 'rb') as f:
-            return pickle.load(f)
+    def _save_checkpoint(self, results: List[Dict], checkpoint_dir: Path, batch_idx: int):
+        checkpoint_file = checkpoint_dir / f"checkpoint_{batch_idx}.json"
+        with open(checkpoint_file, "w") as f:
+            json.dump(results, f, indent=2)
+        self.logger.info(f"Saved checkpoint to {checkpoint_file}")
 
-    def _load_json_data(self, path: str):
-        with open(path) as f:
-            return json.load(f)
-
-    def _initialize_clusters(self):
-        try:
-            embeddings = np.array([doc['embedding'] for doc in self.base_corpus])
-        except KeyError:
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            vectorizer = TfidfVectorizer(max_features=768)
-            texts = [doc['text'] for doc in self.base_corpus]
-            embeddings = vectorizer.fit_transform(texts).toarray()
-
-        from src.cluster_utils import fit_clusters
-        return fit_clusters(embeddings, self.config.num_clusters)
-
-    def run(self):
-        self.logger.log_step_start("Clustering Experiment")
-        final_results = {
-            'clustered': {
-                'gold_only': self._generate_and_evaluate('gold_only'),
-                'gold_random': self._generate_and_evaluate('gold_random'),
-                'gold_distractor': self._generate_and_evaluate('gold_distractor')
-            }
+    def run(self) -> Dict[str, Any]:
+        """
+        Run all clustering evaluations (gold_only, random, adversarial).
+        """
+        results = {
+            "gold_only": self._evaluate(mode="gold_only"),
+            "gold_random": self._evaluate(mode="gold_random"),
+            "gold_adversarial": self._evaluate(mode="gold_adversarial")
         }
-
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        final_path = self.output_dir / "clustered" / f"final_results_{timestamp}.json"
-        (self.output_dir / "clustered").mkdir(parents=True, exist_ok=True)
         
-        with open(final_path, 'w') as f:
-            json.dump(final_results, f, indent=2)
+        # Save final results
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_file = self.output_dir / f"final_results_{timestamp}.json"
+        with open(results_file, "w") as f:
+            json.dump(results, f, indent=2)
+        self.logger.info(f"Saved final results to {results_file}")
+        return results
+    
+    def _get_document_embeddings(self, documents: List[Dict]) -> np.ndarray:
+        """Get embeddings for documents using Contriever"""
+        texts = [doc["text"] for doc in documents]
+        embeddings = []
+        for text in texts:
+            embedding = self.llm.model.generate_embedding(text)
+            embeddings.append(embedding)
+        return np.array(embeddings)
 
-        self.logger.log_step_end("Clustering Experiment")
-        return final_results
-
-    def _select_random_docs(self, corpus: List[Dict], count: int) -> List[Dict]:
-        """
-        Selects random documents from corpus and classifies them.
-        """
-        if isinstance(corpus[0], str):
-            selected = [{'text': doc, 'id': i} for i, doc in enumerate(random.sample(corpus, min(count, len(corpus))))]
-        else:
-            selected = random.sample(corpus, min(count, len(corpus)))
-        return selected
-
-    def _generate_and_evaluate(self, mode: str) -> List[Dict]:
-        mode_dir = self.output_dir / "clustered" / mode
+    def _evaluate(self, mode: str) -> List[Dict]:
+        results = []
+        mode_dir = self.output_dir / mode
         mode_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_dir = mode_dir / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Check for existing checkpoints
-        if checkpoint_dir.exists():
-            self.logger.info(f"Found checkpoint directory for {mode}")
-            existing_results = load_checkpoints(checkpoint_dir)
-            if existing_results:
-                last_batch = get_last_checkpoint_batch(checkpoint_dir)
-                self.logger.info(f"Resuming from checkpoint at batch {last_batch}")
+        # Load existing checkpoint if available
+        results = self._load_checkpoint(checkpoint_dir)
+        processed_queries = {res["query"] for res in results}
+
+        # Load test data and determine remaining examples
+        remaining_examples = [example for example in self.test_data if example["question"] not in processed_queries]
+
+        augment_docs = []
+        if mode == "gold_random":
+            augment_docs = self.random_corpus
+        elif mode == "gold_adversarial":
+            augment_docs = self.adversarial_corpus
+
+        batch_idx = len(results) // self.config.save_every
+
+        for idx, example in enumerate(tqdm(remaining_examples, desc=f"Evaluating {mode}")):
+            try:
+                question = example["question"]
+                gold_answer = example["answers"][0]
                 
-                # Get the last processed example ID
-                processed_ids = {r['example_id'] for r in existing_results}
+                # Create gold document
+                gold_doc = {"text": example["text"], "title": "", "is_gold": True}
+                context_docs = [gold_doc]
                 
-                # Filter test queries to only process remaining examples
-                remaining_queries = [
-                    example for example in self.test_data 
-                    if example['id'] not in processed_ids
-                ]
-                
-                if not remaining_queries:
-                    self.logger.info("All examples already processed, returning existing results")
-                    return existing_results
+                if augment_docs:
+                    # Get random subset of augment docs
+                    num_augment = min(len(augment_docs), self.config.num_documents_in_context - 1)
+                    selected_docs = random.sample(augment_docs, num_augment)
                     
-                self.logger.info(f"Processing remaining {len(remaining_queries)} examples")
-                test_queries = remaining_queries
-                results = existing_results
-            else:
-                test_queries = self.test_data
-                results = []
-        else:
-            test_queries = self.test_data
-            results = []
+                    # Create document clusters
+                    all_docs = context_docs + selected_docs
+                    doc_embeddings = self._get_document_embeddings(all_docs)
+                    clusters = self.doc_classifier.fit_clusters(
+                        embeddings=doc_embeddings,
+                        document_ids=list(range(len(all_docs)))
+                    )
+                    
+                    # Format clustered context
+                    context_docs = []
+                    for cluster_id, doc_ids in clusters.items():
+                        cluster_docs = [all_docs[doc_id] for doc_id in doc_ids]
+                        context_docs.extend(cluster_docs)
 
-        gold_docs = self.corpus_manager.get_gold_documents()
-        
-        with tqdm(total=len(test_queries), desc=f"Processing {mode}") as pbar:
-            for example in test_queries:
-                try:
-                    question = example['question']
-                    gold_answer = example['answers'][0]
+                prompt = _format_prompt(question, context_docs, gold_answer)
+                generated_answer = self.llm.generate(prompt, max_new_tokens=self.config.max_new_tokens)[0]
+                evaluation = self.llm_evaluator.evaluate_answer(
+                    question=question,
+                    generated_answer=generated_answer,
+                    gold_answer=gold_answer
+                )
 
-                    # Find gold document
-                    gold_doc = None
-                    for doc in gold_docs:
-                        if doc.get('id') == example.get('id') or self._contains_answer(doc['text'], gold_answer):
-                            gold_doc = doc
-                            break
+                results.append({
+                    "query": question,
+                    "gold_answer": gold_answer,
+                    "generated_answer": generated_answer,
+                    "evaluation": evaluation,
+                    "context": [doc.get("text", "") for doc in context_docs],
+                    "clusters": clusters if augment_docs else None,
+                    "example_id": example["id"]
+                })
 
-                    if not gold_doc:
-                        self.logger.experiment_logger.warning(f"No gold document found for question: {question}")
-                        pbar.update(1)
-                        continue
+                if (idx + 1) % self.config.save_every == 0:
+                    batch_idx += 1
+                    self._save_checkpoint(results, checkpoint_dir, batch_idx)
 
-                    from src.cluster_utils import get_top_k_docs_from_cluster
-                    top_k = self.config.num_clusters
+            except Exception as e:
+                self.logger.experiment_logger.error(f"Error evaluating example: {str(e)}")
+                continue
 
-                    if mode == 'gold_only':
-                        top_docs = [gold_doc] + get_top_k_docs_from_cluster(
-                            question, gold_answer, self.cluster_model, top_k - 1
-                        )
-                    elif mode == 'gold_random':
-                        random_docs = self._select_random_docs(self.random_corpus, top_k - 1)
-                        top_docs = [gold_doc] + random_docs
-                    else:  # gold_distractor
-                        distractor_indices, _ = self.distractor_results[example['id']]
-                        distractor_docs = [self.base_corpus[idx] for idx in distractor_indices[:top_k-1]]
-                        d_cat = self.doc_classifier.classify_documents(distractor_docs, question, gold_answer)
-                        distractors = [d for d in d_cat['random'] + d_cat['distracting'] if d['category'] != 'gold']
-                        top_docs = [gold_doc] + distractors[:top_k-1]
-
-                    prompt = _format_prompt(question, top_docs, gold_answer)
-                    if self._validate_prompt(prompt):
-                        generated_answer = self.llm.generate(prompt, max_new_tokens=self.config.max_new_tokens)[0]
-
-                        eval_result = self.llm_evaluator.evaluate_answer(
-                            question=question,
-                            generated_answer=generated_answer,
-                            gold_answer=gold_answer,
-                            context=self._build_context(
-                                [d.get('id') for d in top_docs],
-                                [d.get('category', 'gold' if d == gold_doc else 'other') for d in top_docs],
-                                list(range(len(top_docs))),
-                                question,
-                                gold_answer
-                            )
-                        )
-
-                        result = {
-                            'query': question,
-                            'generated_answer': generated_answer,
-                            'llm_evaluation': eval_result,
-                            'document_indices': [d.get('id') for d in top_docs],
-                            'document_categories': ['gold' if d == gold_doc else d.get('category', 'other') for d in top_docs],
-                            'example_id': example['id'],
-                            'gold_answer': gold_answer,
-                            'mode': mode
-                        }
-                        results.append(result)
-
-                    pbar.update(1)
-
-                    if len(results) % self.config.save_every == 0:
-                        save_checkpoint(results, len(results), mode_dir)
-
-                except Exception as e:
-                    self.logger.experiment_logger.error(f"Error processing example {example.get('id')}: {str(e)}")
-                    pbar.update(1)
-                    continue
-
-        save_checkpoint(results, 'final', mode_dir)
+        # Save final checkpoint
+        self._save_checkpoint(results, checkpoint_dir, "final")
         return results
 
-    def _validate_prompt(self, prompt: str) -> bool:
-        try:
-            _ = self.llm.generate(prompt, max_new_tokens=1)
-            return True
-        except Exception as e:
-            self.logger.experiment_logger.warning(f"Invalid prompt: {prompt}")
-            return False
 
-    def _build_context(self, indices, categories, positions, question, gold_answer) -> str:
-        docs = []
-        for idx, cat, pos in zip(indices, categories, positions):
-            doc = self.base_corpus[idx]
-            doc_text = f"Document [{pos}]: {doc['text']}"
-            if _contains_answer(doc['text'], gold_answer):
-                doc_text = f"[GOLD] {doc_text}"
-            docs.append(doc_text)
-        return "\n\n".join(docs)
-        
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run clustering-based retrieval experiments")
-    parser.add_argument('--output_dir', type=str, default="experiments/experiment1_clustering/results", help="Output directory")
-    return parser.parse_known_args()[0]
+    parser.add_argument("--train_path", type=str, default="data/10k_train_dataset.json", help="Path to train dataset.")
+    parser.add_argument("--test_path", type=str, default="data/test_dataset.json", help="Path to test dataset.")
+    parser.add_argument("--results_dir", type=str, default="experiments/experiment1_clustering/results", help="Results directory.")
+    parser.add_argument("--base_corpus_size", type=int, default=1000, help="Number of documents in base corpus.")
+    parser.add_argument("--num_random_docs", type=int, default=1000, help="Number of random documents.")
+    parser.add_argument("--num_adversarial_docs", type=int, default=1000, help="Number of adversarial documents.")
+    parser.add_argument("--max_new_tokens", type=int, default=15, help="Maximum tokens for generation.")
+    parser.add_argument("--random_seed", type=int, default=42, help="Seed for random sampling.")
+    parser.add_argument("--adversarial_seed", type=int, default=42, help="Seed for adversarial sampling.")
+    parser.add_argument("--save_every", type=int, default=100, help="Save checkpoint every N examples.")
+    return parser.parse_args()
+
 
 def main():
-    seed_everything(10)
-    try:
-        config = ClusteringConfig()
-        corpus_manager = CorpusManager(str(config.corpus_path))
-        llm_evaluator = LLMEvaluator(api_key=os.getenv("GEMINI_TOKEN"))
-        experiment = ClusteringExperiment(config, corpus_manager, llm_evaluator)
-        return experiment.run()
-    except Exception as e:
-        logging.error(f"Error in clustering experiment: {str(e)}")
-        return None
+    args = parse_arguments()
+    seed_everything(42)
+    config = ClusteringConfig(**vars(args))
+    corpus_manager = CorpusManager(config.corpus_path)
+    llm_evaluator = LLMEvaluator(api_key=os.getenv("GEMINI_TOKEN"))
 
-if __name__ == "__main__":  
-    seed_everything(10)
+    experiment = ClusteringExperiment(config, corpus_manager, llm_evaluator)
+    experiment.run()
+
+
+if __name__ == "__main__":
     main()

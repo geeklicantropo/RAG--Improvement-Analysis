@@ -57,49 +57,32 @@ class LLM:
         return logger
 
     @rate_limit
-    def generate_with_retry(
-        self,
-        prompt: str,
-        max_retries: int = 3,
-        retry_delay: float = 1.0
-    ) -> Optional[str]:
-        """Generate text with retry logic for handling API errors."""
-        self.stats["total_calls"] += 1
-
-        # Check cache first
+    def generate_with_retry(self, prompt: str, max_retries: int = 3) -> Optional[str]:
+        """Generate text with retry logic."""
         cache_key = self._get_cache_key(prompt)
-        cached_response = self._check_cache(cache_key)
-        if cached_response:
+        cached = self._check_cache(cache_key)
+        if cached:
             self.stats["cache_hits"] += 1
-            return cached_response
+            return cached
 
         for attempt in range(max_retries):
             try:
                 response = self.model.generate_content(prompt)
-                
-                # Check if response has valid text
-                if hasattr(response, 'text') and response.text:
-                    self.stats["successful_calls"] += 1
-                    # Cache successful response
+                if response.text:
                     self._save_to_cache(cache_key, response.text)
                     return response.text
-                    
-                # If no text but no error, try slight prompt modification
-                modified_prompt = self._modify_prompt(prompt, attempt)
+                
+                modified_prompt = f"Respond with a specific answer based on the context: {prompt}"
                 response = self.model.generate_content(modified_prompt)
                 
-                if hasattr(response, 'text') and response.text:
-                    self.stats["successful_calls"] += 1
-                    self.stats["retries"] += 1
+                if response.text:
                     self._save_to_cache(cache_key, response.text)
                     return response.text
 
             except Exception as e:
                 self.logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
-                self.stats["retries"] += 1
-                time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                time.sleep(1)
 
-        self.stats["failures"] += 1
         return None
 
     def _modify_prompt(self, prompt: str, attempt: int) -> str:
@@ -116,15 +99,27 @@ class LLM:
 
     @rate_limit
     def generate(self, prompts: Union[str, List[str]], max_new_tokens: int = 15) -> List[str]:
-        """Generate responses for one or multiple prompts."""
+        """Generate responses for prompts."""
         if isinstance(prompts, str):
             prompts = [prompts]
             
         results = []
         for prompt in prompts:
-            result = self.generate_with_retry(prompt)
-            results.append(result if result is not None else "")
-                
+            augmented_prompt = f"""You are an expert at answering questions using provided context. 
+    Rules:
+    - Use ONLY information from the given context
+    - If the answer is in the context, provide it directly and concisely
+    - If uncertain about context information, point out the specific ambiguity
+    - If the answer isn't in the context, briefly explain which information is missing
+
+    Context and Question:
+    {prompt}
+
+    Provide a direct answer based on the context above:"""
+
+            result = self.generate_with_retry(augmented_prompt)
+            results.append(result if result else "")
+                    
         return results
 
     @rate_limit

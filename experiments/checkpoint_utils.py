@@ -37,7 +37,7 @@ def load_checkpoints(checkpoint_dir: Path) -> List[Dict]:
         return []
     
     checkpoints = sorted(
-        checkpoint_dir.glob("results_checkpoint_batch_*.json"),
+        checkpoint_dir.glob("checkpoint_batch_*.json"),
         key=lambda p: int(p.stem.split('_')[3])
     )
     

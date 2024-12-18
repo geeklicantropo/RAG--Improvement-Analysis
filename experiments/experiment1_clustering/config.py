@@ -80,7 +80,7 @@ class ClusteringConfig:
     max_batch_size: int = 64
     batch_size_reduction_factor: float = 0.5
     clustering_batch_size: int = 1000
-    save_every: int = 100
+    save_every: int = 10000
     memory_usage_check_interval: int = 10
 
     @property

@@ -103,7 +103,7 @@ def read_corpus_json(data_path: str, batch_size: int = 1000) -> List[Dict]:
 
     try:
         with open(data_path, "rb") as f:
-            # Count total lines for progress bar
+            # Count total lines for progress bar 
             total_lines = sum(1 for _ in f)
             f.seek(0)
             
@@ -111,27 +111,19 @@ def read_corpus_json(data_path: str, batch_size: int = 1000) -> List[Dict]:
             batch = []
 
             for line in tqdm(mm, total=total_lines, desc="Loading corpus in batches"):
-                try:
-                    if line.strip():
-                        doc = json.loads(line)
-                        batch.append(doc)
+                if line.strip():
+                    doc = json.loads(line)
+                    batch.append(doc)
                         
-                        if len(batch) >= batch_size:
-                            corpus.extend(batch)
-                            batch = []
-                            clear_memory()
+                    if len(batch) >= batch_size:
+                        corpus.extend(batch)
+                        batch = []
+                        clear_memory()
 
-                except json.JSONDecodeError:
-                    logger.warning("Skipping invalid JSON line")
-                    continue
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON line encountered: {str(e)}")
+        raise
 
-            if batch:
-                corpus.extend(batch)
-                
-            mm.close()
-
-        logger.info(f"Loaded {len(corpus)} documents.")
-        return corpus
     except Exception as e:
         logger.error(f"Error reading corpus from {data_path}: {str(e)}")
         raise

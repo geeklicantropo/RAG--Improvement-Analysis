@@ -15,6 +15,7 @@ import gc
 from src.llm import LLM
 from src.llm_evaluator import LLMEvaluator
 from src.experiment_logger import ExperimentLogger
+from src.utils.file_utils import read_pickle, read_corpus_json
 
 class ResultsEvaluator:
     def __init__(self, api_key: str, output_dir: Path, logger: ExperimentLogger):
@@ -31,7 +32,11 @@ class ResultsEvaluator:
             batch = results[batch_start:batch_start + batch_size]
             
             for result in batch:
-                context = self._get_context(result['document_indices'], result.get('corpus', {}))
+                context = self._get_context(
+                    result['document_indices'], 
+                    result.get('corpus', {}),
+                    gold_position=result.get("gold_position", 0)
+                )
                 eval_result = self.evaluator.evaluate_answer(
                     question=result['query'],
                     generated_answer=result['generated_answer'],
@@ -43,12 +48,21 @@ class ResultsEvaluator:
 
         return self._compute_metrics(evaluated_results)
 
-    def _get_context(self, doc_ids: List[int], corpus: Dict[int, Dict]) -> str:
+    def _get_context(self, doc_ids: List[int], corpus: Dict[int, Dict], gold_position: int = 0) -> str:
+        """
+        Creates a context string using document IDs and their content from the corpus.
+        Gold documents are placed at the specified gold_position.
+        """
+        documents = [corpus[doc_id] for doc_id in doc_ids if doc_id in corpus]
+        gold_doc = next((doc for doc in documents if doc.get("is_gold", False)), None)
+
         context = []
-        for idx, doc_id in enumerate(doc_ids):
-            if doc_id in corpus:
-                doc = corpus[doc_id]
+        if gold_doc:
+            context.insert(gold_position, f"[GOLD] {gold_doc['text']}")
+        for idx, doc in enumerate(documents):
+            if doc != gold_doc:
                 context.append(f"Document [{idx+1}]: {doc.get('text', '')}")
+        
         return "\n\n".join(context)
 
     def _compute_metrics(self, results: List[Dict]) -> Dict[str, Any]:
@@ -135,6 +149,10 @@ def parse_arguments() -> argparse.Namespace:
                       help='Directory for saving evaluation results')
     parser.add_argument('--batch_size', type=int, default=32,
                       help='Batch size for LLM evaluation')
+    parser.add_argument('--random_docs_path', type=str, default='data/processed/corpus_with_random_50_words.pkl')
+    parser.add_argument('--adv_docs_path', type=str, default='data/processed/reddit_corpus.pkl')
+    parser.add_argument('--gold_position', type=int, default=0)
+    parser.add_argument('--num_documents_in_context', type=int, default=7)
     args = parser.parse_args()
     return args
 
