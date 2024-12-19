@@ -120,6 +120,9 @@ class DocumentClusterer:
     document_ids: Optional[List[int]] = None,
     use_batches: bool = True
     ) -> Dict[int, List[int]]:
+        """
+        Fit clusters to embeddings.
+        """
         try:
             self._initialize_clusterer()
 
@@ -132,7 +135,6 @@ class DocumentClusterer:
                 document_ids if document_ids else range(len(embeddings))
             )
 
-            # Add rate limiting for Gemini evaluation calls
             for cluster_id, docs in clusters.items():
                 time.sleep(0.1)  # Rate limit
                 self.evaluate_cluster_quality(docs)
@@ -140,7 +142,8 @@ class DocumentClusterer:
             return clusters
 
         except Exception as e:
-            self.logger.log_error(e, "Error during clustering")
+            if self.logger:
+                self.logger.log_error(e, "Error during clustering")
             raise
 
     def evaluate_clusters(self, embeddings: np.ndarray, noise_ratio: float = 0.0) -> Dict[str, float]:
@@ -221,15 +224,12 @@ class DocumentClusterer:
             self.logger.experiment_logger.error(f"Error in batch processing: {str(e)}")
             raise
 
-    def _labels_to_clusters(
-        self,
-        labels: List[int],
-        document_ids: Union[List[int], range]
-    ) -> Dict[int, List[int]]:
+    def _labels_to_clusters(self, labels: List[int], doc_ids: List[int]) -> Dict[int, List[int]]:
+        """Convert cluster labels to dictionary mapping cluster IDs to document IDs."""
         clusters = defaultdict(list)
-        for idx, label in enumerate(labels):
-            if label != -1:  # Exclude noise points from DBSCAN
-                clusters[label].append(document_ids[idx])
+        for doc_id, label in zip(doc_ids, labels):
+            if label != -1:  # Exclude noise points
+                clusters[label].append(doc_id)
         return dict(clusters)
 
     def save_clusters(self, output_path: str, include_metrics: bool = True):
@@ -283,34 +283,6 @@ class DocumentClusterer:
         }
         
         return summary
-
-def fit_clusters(
-    embeddings: np.ndarray, 
-    num_clusters: int, 
-    method: str = ClusteringMethod.KMEANS, 
-    random_seed: int = 42, 
-    use_scaler: bool = True,
-    min_cluster_size: int = 2,
-    batch_size: int = 1000,
-    api_key: Optional[str] = None
-) -> Dict[int, List[int]]:
-    if api_key is None:
-        api_key = os.getenv("GEMINI_TOKEN")
-        if not api_key:
-            raise ValueError("No API key provided for DocumentClusterer and GEMINI_TOKEN not set.")
-    
-    clusterer = DocumentClusterer(
-        api_key=api_key,
-        num_clusters=num_clusters,
-        random_seed=random_seed,
-        use_scaler=use_scaler,
-        min_cluster_size=min_cluster_size,
-        method=method,
-        batch_size=batch_size
-    )
-    
-    clusters = clusterer.fit_clusters(embeddings, use_batches=False)
-    return clusters
 
 def get_top_k_docs_from_cluster(
     clusters: Dict[int, List[int]], 

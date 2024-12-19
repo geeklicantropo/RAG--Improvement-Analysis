@@ -14,10 +14,11 @@ class ClusteringConfig:
     experiment_id: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d_%H%M%S"))
 
     # Model Configuration  
-    llm_id: str = "gemini-pro"
-    embedding_model: str = "gemini-pro"
+    llm_id: str = "gemini-1.5-flash"
+    embedding_model: str = "gemini-1.5-flash"
     model_max_length: int = 30720
     max_new_tokens: int = 1024
+    base_corpus_size: int = 1000
 
     # Encoder configuration 
     encoder_id: str = 'facebook/contriever'
@@ -75,12 +76,12 @@ class ClusteringConfig:
 
     # Processing Configuration
     output_dir: Path = Path("experiments/experiment1_clustering/results")
-    batch_size: int = 32
-    min_batch_size: int = 1
-    max_batch_size: int = 64
+    batch_size: int = 256
+    min_batch_size: int = 8
+    max_batch_size: int = 512
     batch_size_reduction_factor: float = 0.5
-    clustering_batch_size: int = 1000
-    save_every: int = 10000
+    clustering_batch_size: int = 100
+    save_every: int = 100
     memory_usage_check_interval: int = 10
 
     @property

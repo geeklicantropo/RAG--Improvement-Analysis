@@ -70,31 +70,76 @@ class BaselineExperiment:
         return []
 
     def _save_checkpoint(self, results: List[Dict], checkpoint_dir: Path, batch_idx: int):
-        checkpoint_file = checkpoint_dir / f"checkpoint_{batch_idx}.json"
-        with open(checkpoint_file, "w") as f:
-            json.dump(results, f, indent=2)
-        self.logger.info(f"Saved checkpoint to {checkpoint_file}")
+        """Save checkpoint with proper error handling and validation."""
+        try:
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            #checkpoint_file = checkpoint_dir / f"checkpoint_batch_{batch_idx}_{timestamp}.json"
+            checkpoint_file = checkpoint_dir / f"checkpoint_batch_{batch_idx}_{timestamp}.json"
+
+
+            
+            # Validate results before saving
+            if not results:
+                self.logger.experiment_logger.error("Attempting to save empty results")
+                return
+                
+            # Clean results for serialization
+            clean_results = []
+            for result in results:
+                try:
+                    clean_result = {
+                        "query": result.get("query", ""),
+                        "gold_answer": result.get("gold_answer", ""),
+                        "generated_answer": result.get("generated_answer", ""),
+                        "evaluation": result.get("evaluation", {}),
+                        "context": result.get("context", []),
+                        "example_id": result.get("example_id", "")
+                    }
+                    clean_results.append(clean_result)
+                except Exception as e:
+                    self.logger.experiment_logger.error(f"Error cleaning result: {str(e)}")
+                    continue
+
+            with open(checkpoint_file, 'w') as f:
+                json.dump(clean_results, f, indent=2)
+                
+            self.logger.info(f"Saved checkpoint to {checkpoint_file}")
+
+        except Exception as e:
+            self.logger.experiment_logger.error(f"Error saving checkpoint: {str(e)}")
+            raise
 
     def run(self) -> Dict[str, Any]:
-        """
-        Run all baseline evaluations (gold, random, adversarial).
-        """
-        results = {
-            "gold_only": self._evaluate(mode="gold_only"),
-            "gold_random": self._evaluate(mode="gold_random"),
-            "gold_adversarial": self._evaluate(mode="gold_adversarial")
-        }
+        modes = ["gold_only", "gold_random", "gold_adversarial"]
+        results = {}
         
-        # Save final results
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        results_file = self.output_dir / f"final_results_{timestamp}.json"
-        with open(results_file, "w") as f:
-            json.dump(results, f, indent=2)
-        self.logger.info(f"Saved final results to {results_file}")
+        for mode in modes:
+            self.logger.info(f"Running {mode} experiment")
+            augment_docs = None
+            if mode == "gold_random":
+                augment_docs = self.random_corpus[:1000]
+            elif mode == "gold_adversarial":
+                augment_docs = self.adversarial_corpus[:1000]
+                
+            results[mode] = self._evaluate(mode=mode, augment_docs=augment_docs)
+            
+            # Save mode results
+            #mode_dir = self.output_dir / "naive_rag" / mode
+            mode_dir = self.output_dir / mode
+            mode_dir.mkdir(parents=True, exist_ok=True)
+            results_file = mode_dir / f"results_{datetime.now():%Y%m%d_%H%M%S}.json"
+            with open(results_file, 'w') as f:
+                json.dump(results[mode], f, indent=2)
+        
         return results
 
-    def _evaluate(self, mode: str) -> List[Dict]:
-        results = []
+    def _evaluate(self, mode: str, augment_docs: Optional[List[Dict]] = None) -> List[Dict]:
+        """
+        Evaluate the model on the test_data for the given mode.
+        mode: one of "gold_only", "gold_random", or "gold_adversarial".
+        augment_docs: If provided, these documents will be added to the gold doc context.
+        """
         mode_dir = self.output_dir / mode
         mode_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_dir = mode_dir / "checkpoints"
@@ -102,34 +147,34 @@ class BaselineExperiment:
 
         # Load existing checkpoint if available
         results = self._load_checkpoint(checkpoint_dir)
-        processed_queries = {res["query"] for res in results}
+        processed_ids = {res["example_id"] for res in results}
 
         # Determine remaining examples
-        remaining_examples = [example for example in self.test_data if example["question"] not in processed_queries]
-
-        augment_docs = []
-        if mode == "gold_random":
-            augment_docs = self.random_corpus
-        elif mode == "gold_adversarial":
-            augment_docs = self.adversarial_corpus
+        remaining_examples = [example for example in self.test_data if example["example_id"] not in processed_ids]
 
         batch_idx = len(results) // self.config.save_every
 
         for idx, example in enumerate(tqdm(remaining_examples, desc=f"Evaluating {mode}")):
-            try:
-                question = example["question"]
-                gold_answer = example["answers"][0]
-                gold_doc = {"text": example["text"], "title": "", "is_gold": True}
-                context_docs = [gold_doc]
-                
-                if augment_docs:
-                    # Get random subset of augment docs
-                    num_augment = min(len(augment_docs), self.config.num_documents_in_context - 1)
-                    selected_augment = random.sample(augment_docs, num_augment)
-                    context_docs.extend(selected_augment)
+            question = example["question"]
+            gold_answer = example["answers"][0]
+            gold_doc = {"text": example["text"], "title": "", "is_gold": True}
 
+            # Build context docs: always have gold doc
+            context_docs = [gold_doc]
+
+            # If augment_docs is provided (for random or adversarial), add them
+            if augment_docs and len(augment_docs) > 0:
+                num_augment = min(len(augment_docs), self.config.num_documents_in_context - 1)
+                selected_augment = random.sample(augment_docs, num_augment)
+                context_docs.extend(selected_augment)
+
+            try:
                 prompt = _format_prompt(question, context_docs, gold_answer)
-                generated_answer = self.llm.generate(prompt, max_new_tokens=self.config.max_new_tokens)[0]
+                generated_answers = self.llm.generate(prompt, max_new_tokens=self.config.max_new_tokens)
+                if not generated_answers:
+                    raise ValueError("LLM returned empty response.")
+                generated_answer = generated_answers[0]
+
                 evaluation = self.llm_evaluator.evaluate_answer(
                     question=question,
                     generated_answer=generated_answer,
@@ -139,24 +184,33 @@ class BaselineExperiment:
                 results.append({
                     "query": question,
                     "gold_answer": gold_answer,
-                    "generated_answer": generated_answer, 
-                    "evaluation": evaluation,
-                    "context": [doc.get("text", "") for doc in context_docs],
-                    "example_id": example["id"]
+                    "generated_answer": generated_answer,
+                    "llm_evaluation": evaluation,
+                    "context": [d.get("text", "") for d in context_docs],
+                    "example_id": example["example_id"]
                 })
 
-                if (idx + 1) % self.config.save_every == 0:
+                # Save checkpoint periodically
+                if (len(results) % self.config.save_every) == 0:
                     batch_idx += 1
                     self._save_checkpoint(results, checkpoint_dir, batch_idx)
 
             except Exception as e:
-                self.logger.experiment_logger.error(f"Error evaluating example: {str(e)}")
-                continue
+                self.logger.experiment_logger.error(
+                    f"Error evaluating example {example.get('example_id', 'unknown')}: {str(e)}"
+                )
+                raise e
 
-        # Save final checkpoint
+        # After processing all, save final checkpoint
         self._save_checkpoint(results, checkpoint_dir, "final")
-        return results
 
+        # Also save final results file with mode and timestamp
+        final_results_file = mode_dir / f"results_{mode}_{datetime.now():%Y%m%d_%H%M%S}.json"
+        with open(final_results_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        self.logger.info(f"Final results saved to {final_results_file}")
+
+        return results
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run baseline experiments")

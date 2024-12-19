@@ -13,7 +13,7 @@ class BaselineConfig:
     # Model Configuration
     llm_id: str = "gemini-1.5-flash"
     model_max_length: int = 30720  
-    batch_size: int = 4
+    batch_size: int = 256
     max_new_tokens: int = 1024
 
     # Encoder configuration
@@ -29,8 +29,8 @@ class BaselineConfig:
     batch_size_reduction_factor: float = 0.5
     
     # Batch Processing 
-    min_batch_size: int = 1
-    max_batch_size: int = 8
+    min_batch_size: int = 8
+    max_batch_size: int = 512
     dynamic_batch_size: bool = True
     
     # Document Configuration
@@ -50,7 +50,7 @@ class BaselineConfig:
     base_data_dir: Path = Path("data")
     processed_dir: Path = base_data_dir / "processed"
     output_dir: Path = Path("experiments/experiment0_baseline/results")
-    save_every: int = 10000
+    save_every: int = 100
 
     # Corpus Configuration
     base_corpus_size: int = 1000 

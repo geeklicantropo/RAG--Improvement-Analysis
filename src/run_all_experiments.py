@@ -26,7 +26,7 @@ from tqdm import tqdm
 project_root = Path(__file__).parent.parent
 sys.path.extend([str(project_root)])
 
-from src.utils.file_utils import clear_memory, seed_everything
+from src.utils.file_utils import clear_memory, seed_everything, str2bool
 from src.experiment_logger import ExperimentLogger
 from src.llm import LLM
 from src.llm_evaluator import LLMEvaluator
@@ -49,7 +49,7 @@ class OutputController:
     def __init__(self, logger: ExperimentLogger):
         self.logger = logger
         self.output_buffer = []
-        self.buffer_size = 100
+        self.buffer_size = 1000
 
     def write(self, text: str):
         if text.strip():
@@ -95,57 +95,57 @@ class ExperimentPipeline:
         }
 
         self.config = {
-            'base_corpus_size': 1000,
+            'base_corpus_size': 10000,
             'random_corpus_path': 'data/processed/corpus_with_random_50_words.pkl',
             'adversarial_corpus_path': 'data/processed/reddit_corpus.pkl'
         }
 
-    def _compute_comparison_metrics(self, results: Dict[str, Any]) -> Dict[str, Any]:
-        comparison_metrics = {}
-        for exp_type, exp_results in results.items():
-            all_scores = [r['llm_evaluation']['score'] for r in exp_results if 'llm_evaluation' in r]
-            correct = sum(1 for r in exp_results if r['llm_evaluation'].get('correct', False))
-            total = len(exp_results)
-
-            comparison_metrics[exp_type] = {
-                'accuracy': correct / total if total > 0 else 0,
-                'avg_score': np.mean(all_scores) if all_scores else 0,
-                'total_examples': total
-            }
-        return comparison_metrics
-
     def _compute_metrics(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        correct = sum(1 for r in results if r['llm_evaluation'].get('correct', False))
+        correct = sum(1 for r in results if 'llm_evaluation' in r and r['llm_evaluation'].get('correct', False))
         all_scores = [r['llm_evaluation']['score'] for r in results if 'llm_evaluation' in r]
         total = len(results)
 
         return {
             'accuracy': correct / total if total > 0 else 0,
-            'avg_score': np.mean(all_scores) if all_scores else 0,
+            'avg_score': float(np.mean(all_scores)) if all_scores else 0.0,
             'total_examples': total
         }
 
-    def _generate_plots(self, results: Dict[str, Any]):
+    def _generate_plots(self, final_results: Dict[str, Any]):
+        # final_results is something like:
+        # {
+        #   'baseline': { 'gold_only': [...], 'gold_random': [...], 'gold_adversarial': [...] },
+        #   'clustering': { 'gold_only': [...], 'gold_random': [...], 'gold_adversarial': [...] }
+        # }
+        # Flatten results for plotting if needed
+        baseline_results = []
+        if 'baseline' in final_results:
+            for mode_results in final_results['baseline'].values():
+                baseline_results.extend(mode_results)
+
+        clustering_results = []
+        if 'clustering' in final_results:
+            for mode_results in final_results['clustering'].values():
+                clustering_results.extend(mode_results)
+
         plotter = ComparativePlotter(self.results_dir)
-        baseline_results = results.get('baseline', [])
-        clustering_results = results.get('clustering', [])
         plotter.plot_experiment_results(
             baseline_results=baseline_results,
             clustering_results=clustering_results
         )
 
-    def _save_results(self, results: Dict[str, Any]):
-        results_file = self.results_dir / "final_results.json"
-        with open(results_file, 'w') as f:
-            json.dump(results, f, indent=2)
-        self.logger.info(f"Results saved to {results_file}")
-
-    def _load_results(self, exp_dir: Path) -> Dict[str, Any]:
-        results_file = exp_dir / "final_results.json"
-        if results_file.exists():
-            with open(results_file, 'r') as f:
-                return json.load(f)
-        return {}
+    def _save_results(self, results: Dict[str, Any], exp_dir: Path):
+        """
+        Save final experiment results to final_results.json in the specified experiment directory.
+        Results should be a dictionary of {mode: list_of_results}, as returned by the experiment's run() method.
+        """
+        final_path = exp_dir / "final_results.json"
+        try:
+            with open(final_path, 'w') as f:
+                json.dump(results, f, indent=2)
+            self.logger.experiment_logger.info(f"Saved final results to {final_path}")
+        except Exception as e:
+            self.logger.experiment_logger.error(f"Error saving final results: {str(e)}")
 
     def run_pipeline(self):
         self.logger.log_step_start("Running Experiment Pipeline")
@@ -162,12 +162,16 @@ class ExperimentPipeline:
                 try:
                     if experiment_name == 'baseline':
                         config = BaselineConfigFactory.get_config_for_retriever('contriever')
-                        experiment = BaselineExperiment(config, self.corpus_manager, LLMEvaluator(GEMINI_TOKEN))
-                        results = experiment.run()
+                        corpus_manager = CorpusManager(str(config.corpus_path))
+                        llm_evaluator = LLMEvaluator(api_key=GEMINI_TOKEN)
+                        experiment = BaselineExperiment(config, corpus_manager, llm_evaluator)
+                        results = experiment.run()  # returns {mode: [results]}
                     elif experiment_name == 'clustering':
                         config = ClusteringConfig()
-                        experiment = ClusteringExperiment(config, self.corpus_manager, LLMEvaluator(GEMINI_TOKEN))
-                        results = experiment.run()
+                        corpus_manager = CorpusManager(str(config.corpus_path))
+                        llm_evaluator = LLMEvaluator(api_key=GEMINI_TOKEN)
+                        experiment = ClusteringExperiment(config, corpus_manager, llm_evaluator)
+                        results = experiment.run()  # returns {mode: [results]}
                     else:
                         raise ValueError(f"Unknown experiment type: {experiment_name}")
 
@@ -185,19 +189,6 @@ class ExperimentPipeline:
         self.logger.log_step_end("Experiment Pipeline Completed")
 
         return final_results
-    
-    def _load_corpus_data(self) -> Tuple[List[Dict], List[Dict], List[Dict]]:
-        """Load and validate corpus files"""
-        corpus_base = self.corpus_manager.get_random_subset(self.config.base_corpus_size)
-        
-        # Load random and adversarial corpora
-        with open(self.config.random_corpus_path, 'rb') as f:
-            random_docs = [{'text': doc, 'title': ''} for doc in pickle.load(f)]
-            
-        with open(self.config.adversarial_corpus_path, 'rb') as f:
-            adversarial_docs = [{'text': doc, 'title': ''} for doc in pickle.load(f)]
-            
-        return corpus_base, random_docs, adversarial_docs
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run complete experiment pipeline")
