@@ -17,7 +17,10 @@ class CorpusManager:
         self.logger = self._setup_logger()
         self.doc_cache = {}
         self.corpus_variants = {}
-        self.base_corpus = None  # Lazy-loaded when accessed
+        self.base_corpus = None
+        
+        self.random_docs_path = 'data/processed/corpus_with_random_50_words.pkl'
+        self.adversarial_docs_path = 'data/processed/reddit_corpus.pkl'
 
     def to_dict(self) -> Dict:
         """Make CorpusManager JSON-serializable."""
@@ -51,6 +54,10 @@ class CorpusManager:
         logger.addHandler(handler)
         return logger
 
+    def get_corpus(self) -> List[Dict]:
+        """Get the base corpus."""
+        return self._lazy_load_corpus()
+
     def _lazy_load_corpus(self) -> List[Dict]:
         """Lazily load the base corpus."""
         if self.base_corpus is None:
@@ -59,10 +66,8 @@ class CorpusManager:
             try:
                 with open(self.base_corpus_path, "r") as f:
                     if str(self.base_corpus_path).endswith('.pkl'):
-                        # Load pickle files (random and reddit corpus)
                         self.base_corpus = [{'text': doc, 'title': ''} for doc in pickle.load(f)]
                     else:
-                        # Load JSON files (contriever corpus and datasets)
                         self.base_corpus = json.load(f)
                         
                 self.logger.info(f"Loaded {len(self.base_corpus)} documents")
@@ -84,29 +89,50 @@ class CorpusManager:
         """Retrieve multiple documents by their IDs."""
         return [doc for doc_id in doc_ids if (doc := self.get_document(doc_id))]
 
-    def get_random_subset(self, num_docs: int, seed: int = 42) -> List[Dict]:
+    def get_random_subset(
+    self, 
+    corpus_type: str, 
+    num_docs: int, 
+    seed: int = 42
+    ) -> List[Dict]:
         """
-        Retrieve a random subset of documents from the corpus.
-        
+        Retrieve a random subset of documents from the specified corpus.
+
         Args:
-            num_docs (int): Number of documents to retrieve. 
+            corpus_type (str): Type of corpus ('base', 'random', or 'adversarial').
+            num_docs (int): Number of documents to retrieve.
             seed (int): Random seed for reproducibility.
             
         Returns:
-            List[Dict]: Random subset of documents.
+            List[Dict]: Random subset of documents without embeddings.
         """
-        corpus = self._lazy_load_corpus()
+        if corpus_type == 'base':
+            corpus = self._lazy_load_corpus()
+        elif corpus_type == 'random':
+            if not Path(self.random_docs_path).exists():
+                raise ValueError(f"Random docs file not found: {self.random_docs_path}")
+            with open(self.random_docs_path, "rb") as f:
+                corpus = [{'text': doc, 'title': ''} for doc in pickle.load(f)]
+        elif corpus_type == 'adversarial':
+            if not Path(self.adversarial_docs_path).exists():
+                raise ValueError(f"Adversarial docs file not found: {self.adversarial_docs_path}")
+            with open(self.adversarial_docs_path, "rb") as f:
+                corpus = [{'text': doc, 'title': ''} for doc in pickle.load(f)]
+        else:
+            raise ValueError(f"Invalid corpus type: {corpus_type}")
+
         if num_docs > len(corpus):
             self.logger.warning(f"Requested {num_docs} documents, but corpus only contains {len(corpus)}. Returning all documents.")
             return corpus
-        
+
         np.random.seed(seed)
         subset_indices = np.random.choice(len(corpus), size=num_docs, replace=False)
         return [corpus[idx] for idx in subset_indices]
+    
 
     def add_noise_documents(self, noise_ratio: float = 0.2, seed: int = 42) -> List[Dict]:
         """
-        Add noise documents to the corpus.
+            Add noise documents to the corpus.
 
         Args:
             noise_ratio (float): Proportion of documents to add as noise.
@@ -140,11 +166,26 @@ class CorpusManager:
     def get_gold_documents(self) -> List[Dict]:
         """Retrieve gold documents."""
         corpus = self._lazy_load_corpus()
-        # For datasets with gold indicators
-        gold_docs = [doc for doc in corpus if 'answers' in doc]
+        self.logger.info("Searching for gold documents...")
+        
+        # Check multiple possible gold indicators
+        gold_docs = []
+        for doc in corpus:
+            if any([
+                'answers' in doc,
+                'gold_answer' in doc,
+                doc.get('is_gold', False),
+                doc.get('type', '') == 'gold'
+            ]):
+                gold_docs.append(doc)
+        
         if not gold_docs:
-            # For other corpuses, return empty list - they don't contain gold docs
-            self.logger.warning("No gold documents found in corpus")
+            with open('data/10k_train_dataset.json') as f:
+                train_data = json.load(f)
+                gold_docs = [{'text': item['text'], 'answers': item['answers']} 
+                            for item in train_data]
+        
+        self.logger.info(f"Found {len(gold_docs)} gold documents")
         return gold_docs
 
     def clear_cache(self):

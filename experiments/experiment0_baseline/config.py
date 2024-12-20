@@ -46,11 +46,13 @@ class BaselineConfig:
     random_doc_percentage: Optional[float] = None
     noise_ratio: float = 0.2
     
-    # Data Paths 
+    #Data Paths 
     base_data_dir: Path = Path("data")
     processed_dir: Path = base_data_dir / "processed"
     output_dir: Path = Path("experiments/experiment0_baseline/results")
     save_every: int = 100
+    random_docs_path: str = 'data/processed/corpus_with_random_50_words.pkl'
+    adversarial_docs_path: str = 'data/processed/reddit_corpus.pkl'
 
     # Corpus Configuration
     base_corpus_size: int = 1000 

@@ -39,7 +39,7 @@ class ExperimentLogger:
                 'gpu_utilization': []
             }
             
-            # Suppress all warnings
+            #Suppress all warnings
             warnings.filterwarnings('ignore')
             logging.getLogger('transformers').setLevel(logging.ERROR)
             logging.getLogger('pytorch_lightning').setLevel(logging.ERROR)
@@ -323,3 +323,25 @@ class ExperimentLogger:
         self.cleanup_memory() 
         duration = self.get_experiment_duration()
         self.experiment_logger.info(f"Experiment completed in {duration:.2f}s")
+
+    def log_clustering_metric(self, metric_name: str, value: Any):
+        """
+        Log a clustering-related metric.
+        
+        Args:
+            metric_name (str): Name of the clustering metric (e.g., 'silhouette_score').
+            value (Any): Value of the metric to log.
+        """
+        self.metrics[metric_name] = value
+        self.experiment_logger.info(f"{metric_name}: {value}")
+
+    def log_clustering_summary(self, metrics: Dict[str, Any]):
+        """
+        Log a summary of clustering metrics.
+
+        Args:
+            metrics (Dict[str, Any]): Dictionary of clustering metrics to log.
+        """
+        self.experiment_logger.info("Clustering Metrics Summary:")
+        for metric_name, value in metrics.items():
+            self.log_clustering_metric(metric_name, value)

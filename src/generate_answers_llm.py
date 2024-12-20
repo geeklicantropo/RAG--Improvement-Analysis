@@ -68,32 +68,71 @@ def load_corpus_and_documents(args: argparse.Namespace) -> Dict:
 
     return corpus, mapping
 
-def prepare_context(question, gold_doc, random_docs=None, adv_docs=None, gold_position=0, num_docs=7):
+def prepare_context(
+    question: str,
+    gold_doc: Optional[Dict],
+    random_docs: Optional[List[Dict]] = None,
+    adv_docs: Optional[List[Dict]] = None,
+    cluster_docs: Optional[List[Dict]] = None,
+    gold_position: int = 0,
+    num_docs: int = 7
+) -> List[Dict]:
     """
-    Prepares the context by mixing gold, random, and adversarial documents.
+    Prepares the context by combining gold, random, adversarial, and cluster documents.
+
+    Args:
+        question (str): The question to be answered.
+        gold_doc (Optional[Dict]): The gold document, if available.
+        random_docs (Optional[List[Dict]]): Random documents to include in the context.
+        adv_docs (Optional[List[Dict]]): Adversarial documents to include in the context.
+        cluster_docs (Optional[List[Dict]]): Cluster-specific documents to include.
+        gold_position (int): The position to insert the gold document.
+        num_docs (int): Maximum number of documents in the context.
+
+    Returns:
+        List[Dict]: The prepared context of documents.
     """
     context = []
 
+    if cluster_docs:
+        context.extend(random.sample(cluster_docs, min(len(cluster_docs), num_docs - 1)))
+
     if random_docs:
-        context.extend(random.sample(random_docs, num_docs - 1))
+        context.extend(random.sample(random_docs, min(len(random_docs), num_docs - len(context) - 1)))
+
     if adv_docs:
-        context.extend(random.sample(adv_docs, num_docs - 1))
+        context.extend(random.sample(adv_docs, min(len(adv_docs), num_docs - len(context) - 1)))
 
     if gold_doc:
         context.insert(gold_position, gold_doc)
 
     return context[:num_docs]
 
-def _format_prompt(question: str, documents: List[Dict], gold_answer: str) -> str:
+
+def _format_prompt(question: str, documents: List[Dict], gold_answer: Optional[str] = None, cluster_id: Optional[int] = None) -> str:
     """
-    Formats the prompt with the question and a context of documents.
+    Formats the prompt with the question, documents, and optional clustering context.
+
+    Args:
+        question (str): The question to be answered.
+        documents (List[Dict]): List of documents to include in the context.
+        gold_answer (Optional[str]): The gold answer, if available.
+        cluster_id (Optional[int]): ID of the cluster the documents belong to (optional).
+
+    Returns:
+        str: The formatted prompt for the LLM.
     """
     context_parts = [f"Question: {question}\n\nContext:"]
+    if cluster_id is not None:
+        context_parts.append(f"\nCluster ID: {cluster_id}")
+
     for idx, doc in enumerate(documents, 1):
-        prefix = "[GOLD] " if _contains_answer(doc['text'], gold_answer) else ""
-        context_parts.append(f"\nDocument [{idx}] {prefix}:\n{doc['text']}")
+        prefix = "[GOLD] " if gold_answer and _contains_answer(doc.get('text', ''), gold_answer) else ""
+        context_parts.append(f"\nDocument [{idx}] {prefix}:\n{doc.get('text', '')}")
+
     context_parts.append("\nAnswer:")
     return "\n".join(context_parts)
+
 
 def initialize_dataset_and_loader(args: argparse.Namespace):
     """
@@ -183,53 +222,59 @@ def save_checkpoint(results: List[Dict], batch_idx: int, output_dir: Path, llm: 
     with open(checkpoint_path, 'w') as f:
         json.dump(processed_results, f, indent=2)
 
+
 @rate_limit
 def generate_and_save(
-    args: argparse.Namespace, 
-    llm: LLM, 
+    args: argparse.Namespace,
+    llm: LLM,
     prompt_dataloader: DataLoader,
     corpus: List[Dict],
     random_docs: Optional[List[Dict]] = None,
-    adv_docs: Optional[List[Dict]] = None
+    adv_docs: Optional[List[Dict]] = None,
+    cluster_docs: Optional[Dict[int, List[Dict]]] = None
 ):
-    saving_dir = Path(f"{args.output_dir}/{args.llm_id}/{args.split}/naive_rag")
+    """
+    Generate responses and save results, incorporating clustering-specific context.
+
+    Args:
+        args (argparse.Namespace): Parsed arguments.
+        llm (LLM): LLM instance for generating answers.
+        prompt_dataloader (DataLoader): DataLoader for question prompts.
+        corpus (List[Dict]): Full document corpus.
+        random_docs (Optional[List[Dict]]): Random documents for context.
+        adv_docs (Optional[List[Dict]]): Adversarial documents for context.
+        cluster_docs (Optional[Dict[int, List[Dict]]]): Documents grouped by cluster ID.
+    """
+    saving_dir = Path(f"{args.output_dir}/{args.llm_id}/{args.split}/clustered_rag")
     saving_dir.mkdir(parents=True, exist_ok=True)
 
-    answer_string_in_prompt = "### Response:" if 'mpt' in args.llm_id else "Answer:"
     all_results = []
-    
     for idx, prompt_batch in enumerate(tqdm(prompt_dataloader)):
-        if _get_memory_usage()['ram_percent'] > 90:
-            _cleanup_memory()
-
         for item in prompt_batch:
             gold_doc = next((doc for doc in corpus if _contains_answer(doc['text'], item['gold_answer'])), None)
-            if not gold_doc:
-                continue
 
             context = prepare_context(
                 item['query'],
                 gold_doc,
-                random_docs,
-                adv_docs,
-                args.gold_position,
-                args.num_documents_in_context
+                random_docs=random_docs,
+                adv_docs=adv_docs,
+                cluster_docs=cluster_docs.get(item.get('cluster_id')) if cluster_docs else None,
+                gold_position=args.gold_position,
+                num_docs=args.num_documents_in_context
             )
 
-            formatted_prompt = _format_prompt(item['query'], context, item['gold_answer'])
+            formatted_prompt = _format_prompt(
+                item['query'], context, item['gold_answer'], cluster_id=item.get('cluster_id')
+            )
             response = llm.generate([formatted_prompt], max_new_tokens=args.max_new_tokens)[0]
-            
-            # Extract answer using the correct prompt string
-            start = response.find(answer_string_in_prompt) + len(answer_string_in_prompt)
-            generated_answer = response[start:].strip()
 
             result = {
                 'query': item['query'],
                 'example_id': item['example_id'],
-                'generated_answer': generated_answer,
+                'generated_answer': response.strip(),
                 'gold_answer': item['gold_answer'],
                 'context': context,
-                'experiment_type': 'random' if args.use_random else ('adore' if args.use_adore else 'baseline')
+                'experiment_type': 'clustered_rag'
             }
             all_results.append(result)
 
@@ -238,6 +283,7 @@ def generate_and_save(
             all_results = []
 
     save_checkpoint(all_results, "final", saving_dir, llm)
+
 
 '''
 def _load_json_data(path: str) -> Any:

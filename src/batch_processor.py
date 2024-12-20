@@ -7,6 +7,7 @@ import gc
 import google.generativeai as genai
 import time
 from datetime import datetime
+from src.utils.rate_limit import rate_limit
 
 class BatchProcessor:
     def __init__(
@@ -44,6 +45,7 @@ class BatchProcessor:
         logger.addHandler(handler)
         return logger
 
+    @rate_limit
     def evaluate_batch(self, items: List[Dict]) -> List[Dict]:
         """Evaluate a batch of items using LLM"""
         evaluated_items = []

@@ -12,7 +12,7 @@ genai.configure(api_key=GEMINI_TOKEN)
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 import pickle
 from datetime import datetime
 import torch
@@ -22,6 +22,7 @@ import argparse
 import json
 import numpy as np
 from tqdm import tqdm
+from utils.rate_limit import rate_limit
 
 project_root = Path(__file__).parent.parent
 sys.path.extend([str(project_root)])
@@ -44,36 +45,6 @@ from experiments.experiment1_clustering.main import ClusteringExperiment
 import warnings
 warnings.filterwarnings('ignore')
 
-class OutputController:
-    """Controls and filters experiment output."""
-    def __init__(self, logger: ExperimentLogger):
-        self.logger = logger
-        self.output_buffer = []
-        self.buffer_size = 1000
-
-    def write(self, text: str):
-        if text.strip():
-            self.output_buffer.append(text)
-            if len(self.output_buffer) >= self.buffer_size:
-                self.flush()
-
-    def flush(self):
-        if self.output_buffer:
-            output = ''.join(self.output_buffer)
-            self.logger.experiment_logger.info(output)
-            self.output_buffer.clear()
-
-    def __enter__(self):
-        self.old_stdout = sys.stdout
-        self.old_stderr = sys.stderr
-        sys.stdout = self
-        sys.stderr = self
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        sys.stdout = self.old_stdout
-        sys.stderr = self.old_stderr
-        self.flush()
 
 class ExperimentPipeline:
     def __init__(self, base_output_dir: str = "experiments"):
@@ -88,6 +59,7 @@ class ExperimentPipeline:
 
         self.corpus_manager = CorpusManager("data/processed/corpus_with_contriever_at150.json")
         self.llm = LLM(api_key=GEMINI_TOKEN)
+        self.llm_evaluator = LLMEvaluator(api_key=GEMINI_TOKEN)
 
         self.enabled_experiments = {
             'baseline': True,
@@ -100,7 +72,16 @@ class ExperimentPipeline:
             'adversarial_corpus_path': 'data/processed/reddit_corpus.pkl'
         }
 
-    def _compute_metrics(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # Create result directories 
+        for mode in ['baseline', 'clustering']:
+            mode_dir = self.results_dir / mode
+            mode_dir.mkdir(parents=True, exist_ok=True)
+            for submode in ['gold_only', 'gold_random', 'gold_adversarial']:
+                submode_dir = mode_dir / submode
+                submode_dir.mkdir(parents=True, exist_ok=True)
+                (submode_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+
+    def _compute_metrics(self, results: List[Dict]) -> Dict[str, Any]:
         correct = sum(1 for r in results if 'llm_evaluation' in r and r['llm_evaluation'].get('correct', False))
         all_scores = [r['llm_evaluation']['score'] for r in results if 'llm_evaluation' in r]
         total = len(results)
@@ -112,12 +93,6 @@ class ExperimentPipeline:
         }
 
     def _generate_plots(self, final_results: Dict[str, Any]):
-        # final_results is something like:
-        # {
-        #   'baseline': { 'gold_only': [...], 'gold_random': [...], 'gold_adversarial': [...] },
-        #   'clustering': { 'gold_only': [...], 'gold_random': [...], 'gold_adversarial': [...] }
-        # }
-        # Flatten results for plotting if needed
         baseline_results = []
         if 'baseline' in final_results:
             for mode_results in final_results['baseline'].values():
@@ -135,10 +110,6 @@ class ExperimentPipeline:
         )
 
     def _save_results(self, results: Dict[str, Any], exp_dir: Path):
-        """
-        Save final experiment results to final_results.json in the specified experiment directory.
-        Results should be a dictionary of {mode: list_of_results}, as returned by the experiment's run() method.
-        """
         final_path = exp_dir / "final_results.json"
         try:
             with open(final_path, 'w') as f:
@@ -147,48 +118,48 @@ class ExperimentPipeline:
         except Exception as e:
             self.logger.experiment_logger.error(f"Error saving final results: {str(e)}")
 
+    @rate_limit
     def run_pipeline(self):
         self.logger.log_step_start("Running Experiment Pipeline")
 
         final_results = {}
         experiment_names = [name for name, enabled in self.enabled_experiments.items() if enabled]
 
-        with tqdm(total=len(experiment_names), desc="Experiment Pipeline", unit="experiment") as pbar:
-            for experiment_name in experiment_names:
-                exp_dir = self.results_dir / experiment_name
-                exp_dir.mkdir(parents=True, exist_ok=True)
+        for experiment_name in experiment_names:
+            exp_dir = self.results_dir / experiment_name
+            exp_dir.mkdir(parents=True, exist_ok=True)
 
-                self.logger.info(f"Starting {experiment_name} experiment...")
-                try:
-                    if experiment_name == 'baseline':
-                        config = BaselineConfigFactory.get_config_for_retriever('contriever')
-                        corpus_manager = CorpusManager(str(config.corpus_path))
-                        llm_evaluator = LLMEvaluator(api_key=GEMINI_TOKEN)
-                        experiment = BaselineExperiment(config, corpus_manager, llm_evaluator)
-                        results = experiment.run()  # returns {mode: [results]}
-                    elif experiment_name == 'clustering':
-                        config = ClusteringConfig()
-                        corpus_manager = CorpusManager(str(config.corpus_path))
-                        llm_evaluator = LLMEvaluator(api_key=GEMINI_TOKEN)
-                        experiment = ClusteringExperiment(config, corpus_manager, llm_evaluator)
-                        results = experiment.run()  # returns {mode: [results]}
-                    else:
-                        raise ValueError(f"Unknown experiment type: {experiment_name}")
+            self.logger.info(f"Starting {experiment_name} experiment...")
+            try:
+                if experiment_name == 'baseline':
+                    config = BaselineConfigFactory.get_config_for_retriever('contriever')
+                    experiment = BaselineExperiment(config, self.corpus_manager, self.llm_evaluator)
+                    
+                    # Run the experiment
+                    results = experiment.run()
+                    
+                elif experiment_name == 'clustering':
+                    config = ClusteringConfig()
+                    experiment = ClusteringExperiment(config, self.corpus_manager, self.llm_evaluator)
+                    
+                    # Run the experiment
+                    results = experiment.run()
+                else:
+                    raise ValueError(f"Unknown experiment type: {experiment_name}")
 
-                    final_results[experiment_name] = results
-                    self._save_results(results, exp_dir)
-                    self.logger.info(f"Completed {experiment_name} experiment.")
+                final_results[experiment_name] = results
+                self._save_results(results, exp_dir)
+                self.logger.info(f"Completed {experiment_name} experiment.")
 
-                except Exception as e:
-                    self.logger.experiment_logger.error(f"Error in {experiment_name} experiment: {str(e)}")
-                    raise
-                finally:
-                    pbar.update(1)
+            except Exception as e:
+                self.logger.experiment_logger.error(f"Error in {experiment_name} experiment: {str(e)}")
+                raise
 
         self._generate_plots(final_results)
         self.logger.log_step_end("Experiment Pipeline Completed")
 
         return final_results
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run complete experiment pipeline")
@@ -197,6 +168,7 @@ def parse_arguments():
     parser.add_argument('--skip_baseline', action='store_true', help='Skip baseline experiments')
     parser.add_argument('--skip_clustering', action='store_true', help='Skip clustering experiments')
     return parser.parse_args()
+
 
 def main():
     args = parse_arguments()
@@ -209,8 +181,10 @@ def main():
     if args.skip_clustering:
         pipeline.enabled_experiments['clustering'] = False
 
-    results = pipeline.run_pipeline()
-    print("Experiment pipeline completed.", results)
+    with pipeline.logger:
+        results = pipeline.run_pipeline()
+    print("Experiment pipeline completed.")
+
 
 if __name__ == "__main__":
     main()

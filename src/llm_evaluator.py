@@ -360,11 +360,22 @@ class LLMEvaluator:
         return None
 
     def _save_to_cache(self, cache_key: str, data: Dict):
-        self.eval_cache[cache_key] = data
+        """Save evaluation result with metadata to cache."""
+        cache_data = {
+            'evaluation': data,
+            'metadata': {
+                'question': data.get('question', ''),
+                'generated_answer': data.get('generated_answer', ''),
+                'gold_answer': data.get('gold_answer', ''),
+                'timestamp': datetime.now().isoformat()
+            }
+        }
+        
+        self.eval_cache[cache_key] = cache_data
         cache_file = self.cache_dir / f"{cache_key}.json"
         try:
             with open(cache_file, 'w') as f:
-                json.dump(data, f)
+                json.dump(cache_data, f)
         except Exception as e:
             self.logger.error(f"Cache write failed: {str(e)}")
 

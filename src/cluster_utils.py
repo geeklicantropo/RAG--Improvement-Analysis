@@ -114,14 +114,25 @@ class DocumentClusterer:
             self.logger.experiment_logger.error(f"Cluster evaluation failed: {str(e)}")
             return {"coherence_score": 0.0, "error": str(e)}
 
+    @rate_limit
     def fit_clusters(
-    self,
-    embeddings: np.ndarray,
-    document_ids: Optional[List[int]] = None,
-    use_batches: bool = True
+        self,
+        embeddings: np.ndarray,
+        base_corpus: List[Dict],  # Explicitly pass the base corpus
+        document_ids: Optional[List[int]] = None,
+        use_batches: bool = True
     ) -> Dict[int, List[int]]:
         """
-        Fit clusters to embeddings.
+        Fit clusters to embeddings and evaluate cluster quality.
+
+        Args:
+            embeddings (np.ndarray): Embeddings for documents to be clustered.
+            base_corpus (List[Dict]): Full base corpus to evaluate cluster quality.
+            document_ids (Optional[List[int]]): IDs corresponding to embeddings (optional).
+            use_batches (bool): Whether to process embeddings in batches.
+
+        Returns:
+            Dict[int, List[int]]: Cluster ID mapped to document IDs.
         """
         try:
             self._initialize_clusterer()
@@ -129,24 +140,50 @@ class DocumentClusterer:
             if self.use_scaler:
                 embeddings = self.scaler.fit_transform(embeddings)
 
+            # Perform clustering
             labels = self.clusterer.fit_predict(embeddings)
-            clusters = self._labels_to_clusters(
-                labels,
-                document_ids if document_ids else range(len(embeddings))
-            )
+            
+            # Convert cluster labels to dictionary mapping
+            document_ids = document_ids or list(range(len(embeddings)))
+            clusters = self._labels_to_clusters(labels, document_ids)
 
-            for cluster_id, docs in clusters.items():
-                time.sleep(0.1)  # Rate limit
-                self.evaluate_cluster_quality(docs)
+            # Evaluate and log cluster quality
+            for cluster_id, doc_indices in clusters.items():
+                cluster_docs = [base_corpus[idx] for idx in doc_indices]
+                quality_metrics = self.evaluate_cluster_quality(cluster_docs)
+                self.logger.info(f"Cluster {cluster_id}: {quality_metrics}")
+                self.log_cluster_quality(cluster_id, quality_metrics)
 
             return clusters
 
         except Exception as e:
-            if self.logger:
-                self.logger.log_error(e, "Error during clustering")
+            self.logger.experiment_logger.error(f"Error during clustering: {str(e)}")
             raise
 
+    def log_cluster_quality(self, cluster_id: int, quality_metrics: Dict[str, float]):
+        """
+        Log cluster quality metrics.
+
+        Args:
+            cluster_id (int): ID of the cluster being evaluated.
+            quality_metrics (Dict[str, float]): Metrics like coherence_score, avg_doc_length.
+        """
+        self.logger.log_clustering_metric(f"Cluster_{cluster_id}_Coherence", quality_metrics["coherence_score"])
+        self.logger.log_clustering_metric(f"Cluster_{cluster_id}_AvgDocLength", quality_metrics["avg_doc_length"])
+        self.logger.log_clustering_metric(f"Cluster_{cluster_id}_UniqueTerms", quality_metrics["unique_terms"])
+
+
     def evaluate_clusters(self, embeddings: np.ndarray, noise_ratio: float = 0.0) -> Dict[str, float]:
+        """
+        Evaluate cluster performance using various metrics.
+
+        Args:
+            embeddings (np.ndarray): Embeddings to evaluate.
+            noise_ratio (float): Proportion of noise to inject for evaluation.
+
+        Returns:
+            Dict[str, float]: Evaluation metrics (e.g., silhouette score, Davies-Bouldin index).
+        """
         try:
             if self.clusterer is None:
                 raise ValueError("Must fit clusters before evaluation")
@@ -177,7 +214,7 @@ class DocumentClusterer:
                 pbar.update(1)
 
                 self.cluster_metrics = metrics
-                self.logger.log_metrics(metrics)
+                self.logger.log_clustering_summary(metrics)  # Log the clustering summary
                 
             return metrics
 
